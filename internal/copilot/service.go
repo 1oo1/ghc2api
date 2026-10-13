@@ -1,0 +1,294 @@
+package copilot
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+)
+
+const maxRequestBody = 16 << 20
+const maxMetadataBody = 4 << 20
+
+// Service 独立保存一个账号的 session、模型和 Auto 缓存。
+type Service struct {
+	config Config
+	client *http.Client
+
+	sessionMu contextMutex
+	session   session
+	modelsMu  contextMutex
+	models    modelList
+	autoMu    contextMutex
+	autoState sync.Mutex
+	auto      autoSession
+	refusedMu sync.Mutex
+	refused   map[string]time.Time
+}
+
+// New 不发网络请求；凭证的有效性在首次访问上游时检查。
+func New(config Config) (*Service, error) {
+	config.Token = strings.TrimSpace(config.Token)
+	if config.Token == "" {
+		return nil, errors.New("缺少 GitHub/Copilot token，请先登录或配置 GITHUB_TOKEN")
+	}
+	if config.TokenMode == "" {
+		config.TokenMode = "oauth"
+	}
+	if config.TokenMode != "oauth" && config.TokenMode != "cli" {
+		return nil, errors.New("token 模式必须是 oauth 或 cli")
+	}
+	host, err := NormalizeHost(config.Host)
+	if err != nil {
+		return nil, err
+	}
+	config.Host = host
+	return &Service{
+		config: config, client: safeClient(config.Client), refused: make(map[string]time.Time),
+		sessionMu: make(contextMutex, 1), modelsMu: make(contextMutex, 1), autoMu: make(contextMutex, 1),
+	}, nil
+}
+
+// Handler 返回原协议 HTTP 接口，不在三种生成协议之间转换。
+func (s *Service) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	for _, path := range []string{"/models", "/v1/models"} {
+		mux.HandleFunc("GET "+path, s.handleModels)
+	}
+	for _, path := range []string{"/usage", "/v1/usage"} {
+		mux.HandleFunc("GET "+path, s.handleUsage)
+	}
+	for local, upstream := range map[string]string{
+		"/chat/completions": "/chat/completions", "/v1/chat/completions": "/chat/completions",
+		"/responses": "/responses", "/v1/responses": "/responses", "/v1/messages": "/v1/messages",
+	} {
+		mux.HandleFunc("POST "+local, func(w http.ResponseWriter, r *http.Request) {
+			s.handleGeneration(w, r, upstream)
+		})
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/healthz" && s.config.APIKey != "" && !s.authorized(r) {
+			writeError(w, http.StatusUnauthorized, "服务访问密钥无效或缺失")
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+}
+
+func (s *Service) authorized(r *http.Request) bool {
+	expected := sha256.Sum256([]byte(s.config.APIKey))
+	bearer := ""
+	if value := r.Header.Get("Authorization"); strings.HasPrefix(value, "Bearer ") {
+		bearer = strings.TrimPrefix(value, "Bearer ")
+	}
+	for _, value := range []string{bearer, r.Header.Get("X-Api-Key")} {
+		actual := sha256.Sum256([]byte(value))
+		if subtle.ConstantTimeCompare(expected[:], actual[:]) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func writeError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]any{"error": map[string]string{"message": message, "type": "copilot_proxy_error"}})
+}
+
+type upstreamError struct {
+	status int
+	body   []byte
+	header http.Header
+}
+
+func (e *upstreamError) Error() string {
+	return fmt.Sprintf("上游请求失败（HTTP %d）", e.status)
+}
+
+func handleError(w http.ResponseWriter, err error) {
+	var upstream *upstreamError
+	if errors.As(err, &upstream) && upstream.status >= 400 {
+		copyResponseHeaders(w.Header(), upstream.header)
+		w.WriteHeader(upstream.status)
+		_, _ = w.Write(upstream.body)
+		return
+	}
+	writeError(w, http.StatusBadGateway, err.Error())
+}
+
+func readLimited(body io.Reader, limit int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, errors.New("上游响应超过大小限制")
+	}
+	return data, nil
+}
+
+func (s *Service) apiRequest(ctx context.Context, session session, method, path string, body []byte) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, session.API+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	session.setHeaders(req.Header)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return req, nil
+}
+
+func (s *Service) fetchJSON(ctx context.Context, session session, method, path string, body []byte, value any) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	req, err := s.apiRequest(ctx, session, method, path, body)
+	if err != nil {
+		return err
+	}
+	res, err := s.client.Do(req)
+	if err != nil {
+		return errors.New("Copilot 网络请求失败: " + err.Error())
+	}
+	defer res.Body.Close()
+	data, err := readLimited(res.Body, maxMetadataBody)
+	if err != nil {
+		return err
+	}
+	if res.StatusCode/100 != 2 {
+		return &upstreamError{res.StatusCode, data, res.Header}
+	}
+	if value == nil {
+		return nil
+	}
+	if err := json.Unmarshal(data, value); err != nil {
+		return errors.New("Copilot 返回了无效的 JSON")
+	}
+	return nil
+}
+
+func (s *Service) handleUsage(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	res, err := s.githubRequest(ctx, "/copilot_internal/user", true)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	defer res.Body.Close()
+	data, err := readLimited(res.Body, maxMetadataBody)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	copyResponseHeaders(w.Header(), res.Header)
+	w.WriteHeader(res.StatusCode)
+	_, _ = w.Write(data)
+}
+
+func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path string) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBody))
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, "请求体超过 16 MiB")
+		} else {
+			writeError(w, http.StatusBadRequest, "无法读取请求体")
+		}
+		return
+	}
+	var request map[string]json.RawMessage
+	var model string
+	if json.Unmarshal(body, &request) != nil || request == nil ||
+		json.Unmarshal(request["model"], &model) != nil || strings.TrimSpace(model) == "" {
+		writeError(w, http.StatusBadRequest, "请求必须是 JSON 对象，并包含非空字符串 model")
+		return
+	}
+	isAuto := model == "auto"
+	for attempt := 0; attempt < 3; attempt++ {
+		current, err := s.getSession(r.Context())
+		if err != nil {
+			handleError(w, err)
+			return
+		}
+		// 模型列表失败不妨碍手选模型，真正的生成错误仍由上游返回。
+		_, _ = s.getModels(r.Context(), current)
+		outBody := body
+		var pick autoSession
+		if isAuto {
+			pick, err = s.resolveAuto(r.Context(), current, promptFrom(body))
+			if err != nil {
+				handleError(w, err)
+				return
+			}
+			model = pick.Model
+			request["model"], _ = json.Marshal(model)
+			outBody, _ = json.Marshal(request)
+		}
+		s.acceptTerms(r.Context(), current, model)
+		req, err := s.apiRequest(r.Context(), current, http.MethodPost, path, outBody)
+		if err != nil {
+			handleError(w, err)
+			return
+		}
+		req.URL.RawQuery = r.URL.RawQuery
+		copyRequestHeaders(req.Header, r.Header)
+		current.setHeaders(req.Header)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Openai-Intent", "conversation-panel")
+		req.Header.Set("X-Initiator", initiator(body))
+		if hasVision(body) {
+			req.Header.Set("Copilot-Vision-Request", "true")
+		}
+		if pick.Token != "" {
+			req.Header.Set("Copilot-Session-Token", pick.Token)
+		}
+		res, err := s.client.Do(req)
+		if err != nil {
+			handleError(w, errors.New("Copilot 生成请求失败: "+err.Error()))
+			return
+		}
+		// 只在任何响应尚未发给客户端时重试明确的 Auto 拒绝。
+		if res.StatusCode == http.StatusBadRequest {
+			data, readErr := readLimited(res.Body, maxMetadataBody)
+			_ = res.Body.Close()
+			if readErr != nil {
+				handleError(w, readErr)
+				return
+			}
+			refusal := modelRefusal(data)
+			sessionGone := strings.Contains(strings.ToLower(string(data)), "not available for session") && pick.Token != ""
+			if refusal {
+				s.refuse(model)
+			}
+			if isAuto && (refusal || sessionGone) {
+				s.dropAuto(pick)
+				if attempt < 2 {
+					continue
+				}
+			}
+			copyResponseHeaders(w.Header(), res.Header)
+			w.WriteHeader(res.StatusCode)
+			_, _ = w.Write(data)
+			return
+		}
+		streamResponse(w, res)
+		return
+	}
+}
