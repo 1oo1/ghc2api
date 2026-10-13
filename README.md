@@ -1,7 +1,8 @@
 # ghc2api
 
 从 magpie 的 GitHub Copilot provider 提取的独立 Go HTTP 服务，仅依赖标准库。
-参考 `magpie/docs/copilot-provider.md`，并对照源码提交 `250bdd5c` 实现。
+当前实现以 magpie 上游提交 `250bdd5c` 为对照基线；源码定位与后续同步流程见
+[`docs/magpie-copilot-sync.md`](docs/magpie-copilot-sync.md)。
 
 ## 启动
 
