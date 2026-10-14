@@ -32,8 +32,10 @@ type Service struct {
 	modelsCacheTTL time.Duration
 
 	requestSeq atomic.Uint64
-	secretsMu  sync.RWMutex
-	secrets    map[string]struct{}
+	// cooldownUntil 是账号冷却截止时间（UnixNano），0 表示从未冷却，见 pool.go。
+	cooldownUntil atomic.Int64
+	secretsMu     sync.RWMutex
+	secrets       map[string]struct{}
 
 	sessionMu contextMutex
 	session   session
@@ -93,37 +95,77 @@ func New(config Config) (*Service, error) {
 
 // Handler 返回原协议 HTTP 接口，不在三种生成协议之间转换。
 func (s *Service) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+	return withRequestLog(s.logger, &s.requestSeq, s.log, requireAPIKey(s.config.APIKey, s.log, s.routes().mux))
+}
+
+// routeNeed 描述路由访问上游的方式，决定 Pool 如何分发请求。
+type routeNeed int
+
+const (
+	needNone    routeNeed = iota // 不访问上游（健康检查、未注册路由、重定向等）：由 routes[0] 直接处理，不推进轮询
+	needAccount                  // 访问上游但不需要 session（用量）：按轮询选择账号，失败不切换
+	needSession                  // 需要 Copilot session（模型列表、生成请求）：预取 session，失败时切换账号
+)
+
+// routeEntry 登记一条业务路由的路径及其上游访问方式。
+type routeEntry struct {
+	path string
+	need routeNeed
+}
+
+// serviceRoutes 是 Service 的业务路由。entries 以 ServeMux 的 pattern（如 "GET /v1/models"）为键，
+// 与路由注册在同一处登记，避免另外维护一份路由表。
+type serviceRoutes struct {
+	mux     *http.ServeMux
+	entries map[string]routeEntry
+}
+
+// routes 注册业务路由，不含鉴权与请求日志；Pool 复用它在选定账号后分发请求。
+func (s *Service) routes() serviceRoutes {
+	routes := serviceRoutes{mux: http.NewServeMux(), entries: map[string]routeEntry{}}
+	routes.handle("GET", "/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
+	}, needNone)
 	for _, path := range []string{"/models", "/v1/models"} {
-		mux.HandleFunc("GET "+path, s.handleModels)
+		routes.handle("GET", path, s.handleModels, needSession)
 	}
 	for _, path := range []string{"/usage", "/v1/usage"} {
-		mux.HandleFunc("GET "+path, s.handleUsage)
+		routes.handle("GET", path, s.handleUsage, needAccount)
 	}
 	for local, upstream := range map[string]string{
 		"/chat/completions": "/chat/completions", "/v1/chat/completions": "/chat/completions",
 		"/responses": "/responses", "/v1/responses": "/responses", "/v1/messages": "/v1/messages",
 	} {
-		mux.HandleFunc("POST "+local, func(w http.ResponseWriter, r *http.Request) {
+		routes.handle("POST", local, func(w http.ResponseWriter, r *http.Request) {
 			s.handleGeneration(w, r, upstream)
-		})
+		}, needSession)
 	}
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/healthz" && s.config.APIKey != "" && !s.authorized(r) {
-			s.log(r.Context(), slog.LevelWarn, "客户端鉴权失败", "method", r.Method, "path", r.URL.Path)
+	return routes
+}
+
+// handle 注册一条路由并登记其访问上游的方式。
+func (t serviceRoutes) handle(method, path string, handler http.HandlerFunc, need routeNeed) {
+	pattern := method + " " + path
+	t.mux.HandleFunc(pattern, handler)
+	t.entries[pattern] = routeEntry{path: path, need: need}
+}
+
+// requireAPIKey 对除 /healthz 外的请求校验服务访问密钥；apiKey 为空时不鉴权。
+// Service 与 Pool 共用此中间件，未通过时记录告警并返回 401。
+func requireAPIKey(apiKey string, logf logFunc, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/healthz" && apiKey != "" && !authorizedRequest(apiKey, r) {
+			logf(r.Context(), slog.LevelWarn, "客户端鉴权失败", "method", r.Method, "path", r.URL.Path)
 			writeError(w, http.StatusUnauthorized, "服务访问密钥无效或缺失")
 			return
 		}
-		mux.ServeHTTP(w, r)
+		next.ServeHTTP(w, r)
 	})
-	return s.logRequests(handler)
 }
 
-func (s *Service) authorized(r *http.Request) bool {
-	expected := sha256.Sum256([]byte(s.config.APIKey))
+// authorizedRequest 检查请求是否携带与 apiKey 相同的 Bearer 或 X-Api-Key 密钥。
+func authorizedRequest(apiKey string, r *http.Request) bool {
+	expected := sha256.Sum256([]byte(apiKey))
 	bearer := ""
 	if value := r.Header.Get("Authorization"); strings.HasPrefix(value, "Bearer ") {
 		bearer = strings.TrimPrefix(value, "Bearer ")
@@ -163,6 +205,10 @@ func (s *Service) handleError(ctx context.Context, w http.ResponseWriter, err er
 		level := slog.LevelWarn
 		if upstream.status >= http.StatusInternalServerError {
 			level = slog.LevelError
+		}
+		if upstream.status == http.StatusTooManyRequests {
+			// 限流的账号暂停参与轮询；429 原样透传，不在本请求内换账号。
+			s.setCooldown(time.Now().Add(AccountCooldown))
 		}
 		s.log(ctx, level, "Copilot API 返回错误状态", "status", upstream.status)
 		copyResponseHeaders(w.Header(), upstream.header)
@@ -361,6 +407,11 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 			_, _ = w.Write(data)
 			s.log(r.Context(), slog.LevelWarn, "生成请求返回客户端错误", "status", res.StatusCode, "model", model)
 			return
+		}
+		if res.StatusCode == http.StatusTooManyRequests {
+			// 限流的账号暂停参与轮询；429 原样流式透传，不在本请求内换账号。
+			s.setCooldown(time.Now().Add(AccountCooldown))
+			s.log(r.Context(), slog.LevelWarn, "Copilot 生成请求被限流，账号进入冷却", "cooldown", AccountCooldown.String())
 		}
 		s.log(r.Context(), apiStatusLogLevel(res.StatusCode), "生成响应开始返回客户端",
 			"status", res.StatusCode, "model", model)

@@ -37,11 +37,44 @@ func (b *synchronizedBuffer) String() string {
 	return b.buf.String()
 }
 
-func testCredentialFile(t *testing.T, raw string) string {
+// minimalConfig 是只改变凭证目录扫描所需内容的最小配置（YAML 不能为空文档）。
+const minimalConfig = "log_level: info\n"
+
+// accountJSON 返回只包含 oauth_token 的凭证文件内容。
+func accountJSON(token string) string {
+	return fmt.Sprintf(`{"oauth_token":%q}`, token)
+}
+
+// writeConfigWithAccount 在新的临时目录中写入配置文件，并在默认 data_path（配置目录下的 data）
+// 的 credentials 目录中放入 <user>.json，返回配置文件路径。
+func writeConfigWithAccount(t *testing.T, user, raw, contents string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "credentials.json")
-	writeCredentialFile(t, path, raw)
-	return path
+	dir := t.TempDir()
+	writeCredentialFile(t, filepath.Join(dir, "data", "credentials", user+".json"), raw)
+	return writeConfigInDir(t, dir, contents)
+}
+
+// isolatedConfigDir 返回路径中不含测试名的临时目录，避免路径片段意外满足错误信息断言。
+func isolatedConfigDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "ghc2api-config-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+// accountByUser 按用户名查找账号，不依赖账号顺序。
+func accountByUser(t *testing.T, config appConfig, user string) accountConfig {
+	t.Helper()
+	for _, account := range config.Accounts {
+		if account.User == user {
+			return account
+		}
+	}
+	t.Fatalf("缺少用户 %q 的账号，账号数量 = %d", user, len(config.Accounts))
+	return accountConfig{}
 }
 
 func writeCredentialFile(t *testing.T, path, raw string) {
@@ -76,12 +109,9 @@ func writeConfigAt(t *testing.T, dir, name, contents string) string {
 	return path
 }
 
-func appConfigYAML(listen, credentials, host, apiKey, logLevel string) string {
+func appConfigYAML(listen, host, apiKey, logLevel string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "listen: %s\n", strconv.Quote(listen))
-	if credentials != "" {
-		fmt.Fprintf(&b, "credentials: %s\n", strconv.Quote(credentials))
-	}
 	fmt.Fprintf(&b, "host: %s\n", strconv.Quote(host))
 	fmt.Fprintf(&b, "api_key: %s\n", strconv.Quote(apiKey))
 	if logLevel != "" {
@@ -164,7 +194,7 @@ func TestRunAcceptsOnlyConfigOption(t *testing.T) {
 
 func TestRunUsesDefaultConfigYAML(t *testing.T) {
 	dir := t.TempDir()
-	writeCredentialFile(t, filepath.Join(dir, "data", "credentials", "credentials.json"),
+	writeCredentialFile(t, filepath.Join(dir, "data", "credentials", "alice.json"),
 		`{"oauth_token":"default-config-token"}`)
 	configPath := writeConfigInDir(t, dir, "host: evil.example\n")
 	oldWorkingDirectory, err := os.Getwd()
@@ -199,8 +229,8 @@ func TestConfigYAMLUsesDefaultsForOmittedSettings(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "")
 	t.Setenv("GHC2API_API_KEY", "")
 	t.Setenv("COPILOT_HOST", "")
-	credentials := testCredentialFile(t, `{"oauth_token":"default-values-token"}`)
-	configPath := writeConfigFile(t, fmt.Sprintf("credentials: %s\n", strconv.Quote(credentials)))
+	// 只写入必需的最小配置，其余设置都省略并使用默认值。
+	configPath := writeConfigWithAccount(t, "default-values", accountJSON("default-values-token"), minimalConfig)
 	err := runWithCancelledContext([]string{"-c", configPath})
 	if err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("省略可选项时默认配置无效: %v", err)
@@ -211,15 +241,15 @@ func TestLoadConfigUsesDefaultDataAndCredentialsPaths(t *testing.T) {
 	configDir := t.TempDir()
 	configPath := writeConfigInDir(t, configDir, "listen: 127.0.0.1:0\n")
 	dataPath := filepath.Join(configDir, "data")
-	writeCredentialFile(t, filepath.Join(dataPath, "credentials", "credentials.json"),
+	writeCredentialFile(t, filepath.Join(dataPath, "credentials", "alice.json"),
 		`{"oauth_token":"default-data-path-token"}`)
 
 	config, err := loadConfig(configPath)
 	if err != nil {
 		t.Fatalf("loadConfig() with default data_path credentials: %v", err)
 	}
-	if config.Token != "default-data-path-token" {
-		t.Fatalf("token loaded from default credentials = %q", config.Token)
+	if token := singleAccount(t, config).Token; token != "default-data-path-token" {
+		t.Fatalf("token loaded from default credentials = %q", token)
 	}
 	assertResolvedDataAndLogPaths(t, config, dataPath, filepath.Join(configDir, "logs"))
 	if got := configIntField(t, config, "LogMaxSizeMB", "logMaxSizeMB"); got <= 0 {
@@ -235,54 +265,328 @@ func TestLoadConfigResolvesRelativeDataAndCredentialsPaths(t *testing.T) {
 	configDir := filepath.Join(root, "config")
 	dataPath := filepath.Join(root, "state")
 	configPath := writeConfigInDir(t, configDir, "data_path: ../state\n")
-	writeCredentialFile(t, filepath.Join(dataPath, "credentials", "credentials.json"),
+	writeCredentialFile(t, filepath.Join(dataPath, "credentials", "alice.json"),
 		`{"oauth_token":"relative-data-path-token"}`)
 
 	config, err := loadConfig(configPath)
 	if err != nil {
 		t.Fatalf("loadConfig() with relative data_path: %v", err)
 	}
-	if config.Token != "relative-data-path-token" {
-		t.Fatalf("token loaded from relative data_path = %q", config.Token)
+	if token := singleAccount(t, config).Token; token != "relative-data-path-token" {
+		t.Fatalf("token loaded from relative data_path = %q", token)
 	}
 	assertResolvedDataAndLogPaths(t, config, dataPath, filepath.Join(configDir, "logs"))
 }
 
-func TestLoadConfigResolvesRelativeCredentialsUnderDataPath(t *testing.T) {
-	configDir := t.TempDir()
-	configPath := writeConfigInDir(t, configDir, "data_path: state\ncredentials: work.json\n")
-	writeCredentialFile(t, filepath.Join(configDir, "state", "credentials", "work.json"),
-		`{"oauth_token":"relative-credentials-token"}`)
-
-	config, err := loadConfig(configPath)
-	if err != nil {
-		t.Fatalf("loadConfig() with relative credentials path: %v", err)
+// singleAccount 返回唯一的账号配置；数量不符时立即失败，避免断言时越界。
+func singleAccount(t *testing.T, config appConfig) accountConfig {
+	t.Helper()
+	if len(config.Accounts) != 1 {
+		t.Fatalf("accounts = %d, want 1", len(config.Accounts))
 	}
-	if config.Token != "relative-credentials-token" {
-		t.Fatalf("token loaded from relative credentials path = %q", config.Token)
-	}
-	assertResolvedDataAndLogPaths(t, config, filepath.Join(configDir, "state"), filepath.Join(configDir, "logs"))
+	return config.Accounts[0]
 }
 
-func TestLoadConfigKeepsAbsoluteCredentialsOutsideDataPath(t *testing.T) {
-	credentialPath := testCredentialFile(t, `{"oauth_token":"absolute-credentials-token"}`)
-	configPath := writeConfigFile(t, fmt.Sprintf("data_path: local-state\ncredentials: %s\n",
-		strconv.Quote(credentialPath)))
+// TestLoadConfigScansCredentialsUnderCustomDataPath 覆盖相对与绝对 data_path 下的凭证目录扫描。
+func TestLoadConfigScansCredentialsUnderCustomDataPath(t *testing.T) {
+	root := t.TempDir()
+	relativeData := filepath.Join(root, "config", "state")
+	parentData := filepath.Join(root, "shared")
+	absoluteData := filepath.Join(root, "absolute-state")
+	for _, tc := range []struct{ name, dataPath, wantData, user, token string }{
+		{"relative-under-config-dir", "state", relativeData, "rel-user", "rel-token"},
+		{"relative-parent-directory", "../shared", parentData, "parent-user", "parent-token"},
+		{"absolute", absoluteData, absoluteData, "abs-user", "abs-token"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			file := filepath.Join(tc.wantData, "credentials", tc.user+".json")
+			writeCredentialFile(t, file, accountJSON(tc.token))
+			configPath := writeConfigInDir(t, filepath.Join(root, "config"),
+				fmt.Sprintf("data_path: %s\n", strconv.Quote(tc.dataPath)))
+			config, err := loadConfig(configPath)
+			if err != nil {
+				t.Fatalf("loadConfig() error = %v", err)
+			}
+			if got := configStringField(t, config, "DataPath", "dataPath"); got != tc.wantData {
+				t.Errorf("data_path = %q, want %q", got, tc.wantData)
+			}
+			account := singleAccount(t, config)
+			if account.User != tc.user || account.Token != tc.token || account.credentialFile != file {
+				t.Errorf("账号 user=%q file=%q, want user=%q file=%q", account.User, account.credentialFile, tc.user, file)
+			}
+		})
+	}
+}
 
+// TestLoadConfigScansAccountsSortedByFileName 账号顺序与文件名排序一致，User 保持文件名原有大小写。
+func TestLoadConfigScansAccountsSortedByFileName(t *testing.T) {
+	configDir := t.TempDir()
+	dataPath := filepath.Join(configDir, "data")
+	for name, token := range map[string]string{
+		"work.json": "sorted-work-token", "alpha.json": "sorted-alpha-token", "Team-Bot.json": "sorted-team-token",
+	} {
+		writeCredentialFile(t, filepath.Join(dataPath, "credentials", name), accountJSON(token))
+	}
+	config, err := loadConfig(writeConfigInDir(t, configDir, minimalConfig))
+	if err != nil {
+		t.Fatalf("loadConfig() error = %v", err)
+	}
+	want := []struct{ user, token string }{
+		{"Team-Bot", "sorted-team-token"},
+		{"alpha", "sorted-alpha-token"},
+		{"work", "sorted-work-token"},
+	}
+	if len(config.Accounts) != len(want) {
+		t.Fatalf("accounts = %d, want %d", len(config.Accounts), len(want))
+	}
+	for i, w := range want {
+		account := config.Accounts[i]
+		file := filepath.Join(dataPath, "credentials", w.user+".json")
+		if account.User != w.user || account.Token != w.token || account.credentialFile != file {
+			t.Errorf("account %d = user %q file %q, want user %q file %q",
+				i, account.User, account.credentialFile, w.user, file)
+		}
+	}
+}
+
+// TestLoadConfigIgnoresHiddenNonJSONFilesAndSubdirectories 隐藏文件、非 .json 文件、子目录（含子目录中的 .json）都被忽略；
+// 这些忽略项的内容都是无效凭证，若被读取则加载会失败。
+func TestLoadConfigIgnoresHiddenNonJSONFilesAndSubdirectories(t *testing.T) {
+	configDir := t.TempDir()
+	credentials := filepath.Join(configDir, "data", "credentials")
+	writeCredentialFile(t, filepath.Join(credentials, "work.json"), accountJSON("ignore-work-token"))
+	for _, name := range []string{".hidden.json", ".ghc2api-credential-123", "notes.txt", "backup.json.bak", "README"} {
+		writeCredentialFile(t, filepath.Join(credentials, name), "not json")
+	}
+	writeCredentialFile(t, filepath.Join(credentials, "nested", "inner.json"), "not json")
+	if err := os.Mkdir(filepath.Join(credentials, "folder.json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config, err := loadConfig(writeConfigInDir(t, configDir, minimalConfig))
+	if err != nil {
+		t.Fatalf("被忽略的条目不应导致加载失败: %v", err)
+	}
+	if account := singleAccount(t, config); account.User != "work" || account.Token != "ignore-work-token" {
+		t.Fatalf("账号 user=%q, want 仅 work", account.User)
+	}
+}
+
+// TestLoadConfigFollowsSymlinkToRegularFileOnly 指向普通文件的符号链接会被加载；指向目录的符号链接被忽略。
+func TestLoadConfigFollowsSymlinkToRegularFileOnly(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 下创建符号链接需要额外权限")
+	}
+	configDir := t.TempDir()
+	credentials := filepath.Join(configDir, "data", "credentials")
+	if err := os.MkdirAll(credentials, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "outside.json")
+	writeCredentialFile(t, target, accountJSON("symlink-user-token"))
+	if err := os.Symlink(target, filepath.Join(credentials, "linked.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(credentials, "dirlink.json")); err != nil {
+		t.Fatal(err)
+	}
+	config, err := loadConfig(writeConfigInDir(t, configDir, minimalConfig))
+	if err != nil {
+		t.Fatalf("loadConfig() error = %v", err)
+	}
+	account := singleAccount(t, config)
+	if account.User != "linked" || account.Token != "symlink-user-token" {
+		t.Fatalf("账号 user=%q, want linked", account.User)
+	}
+}
+
+// TestLoadConfigRejectsInvalidGitHubUserNames 文件名去掉 .json 后必须是合法的 GitHub 用户名，错误信息包含文件名。
+func TestLoadConfigRejectsInvalidGitHubUserNames(t *testing.T) {
+	for _, name := range []string{
+		"-bad.json", "bad-.json", "a--b.json", "bad_name.json", "bad name.json", strings.Repeat("a", 40) + ".json",
+	} {
+		t.Run(name, func(t *testing.T) {
+			configDir := isolatedConfigDir(t)
+			writeCredentialFile(t, filepath.Join(configDir, "data", "credentials", name), accountJSON("invalid-name-token"))
+			_, err := loadConfig(writeConfigInDir(t, configDir, minimalConfig))
+			if err == nil {
+				t.Fatalf("非法用户名文件 %q 未被拒绝", name)
+			}
+			if !strings.Contains(err.Error(), name) {
+				t.Fatalf("错误信息应包含文件名 %q: %v", name, err)
+			}
+		})
+	}
+}
+
+// TestLoadConfigAcceptsValidGitHubUserNameBoundaries 合法的边界用户名（1 个字符、39 个字符、单个连字符）可以加载。
+func TestLoadConfigAcceptsValidGitHubUserNameBoundaries(t *testing.T) {
+	names := []string{"a", "a-b", strings.Repeat("a", 39), "A1-b2-C3"}
+	configDir := t.TempDir()
+	for i, name := range names {
+		writeCredentialFile(t, filepath.Join(configDir, "data", "credentials", name+".json"),
+			accountJSON(fmt.Sprintf("valid-name-token-%d", i)))
+	}
+	config, err := loadConfig(writeConfigInDir(t, configDir, minimalConfig))
+	if err != nil {
+		t.Fatalf("合法用户名应被接受: %v", err)
+	}
+	if len(config.Accounts) != len(names) {
+		t.Fatalf("accounts = %d, want %d", len(config.Accounts), len(names))
+	}
+	for _, name := range names {
+		accountByUser(t, config, name)
+	}
+}
+
+// TestLoadConfigChecksUserFieldAgainstFileName 凭证中的 user 为空或与文件名（忽略大小写）一致时通过，不一致时报错。
+func TestLoadConfigChecksUserFieldAgainstFileName(t *testing.T) {
+	t.Run("matches-ignoring-case", func(t *testing.T) {
+		configDir := t.TempDir()
+		writeCredentialFile(t, filepath.Join(configDir, "data", "credentials", "Alice.json"),
+			`{"oauth_token":"user-match-token","user":"alice"}`)
+		config, err := loadConfig(writeConfigInDir(t, configDir, minimalConfig))
+		if err != nil {
+			t.Fatalf("user 与文件名仅大小写不同时应通过: %v", err)
+		}
+		if got := singleAccount(t, config).User; got != "Alice" {
+			t.Fatalf("User = %q, want 保持文件名大小写 Alice", got)
+		}
+	})
+	t.Run("empty-user-allowed", func(t *testing.T) {
+		configDir := t.TempDir()
+		writeCredentialFile(t, filepath.Join(configDir, "data", "credentials", "carol.json"),
+			`{"oauth_token":"user-empty-token","user":""}`)
+		if _, err := loadConfig(writeConfigInDir(t, configDir, minimalConfig)); err != nil {
+			t.Fatalf("空 user 字段应被接受: %v", err)
+		}
+	})
+	t.Run("mismatch-rejected", func(t *testing.T) {
+		configDir := t.TempDir()
+		writeCredentialFile(t, filepath.Join(configDir, "data", "credentials", "bob.json"),
+			`{"oauth_token":"user-mismatch-token","user":"alice"}`)
+		_, err := loadConfig(writeConfigInDir(t, configDir, minimalConfig))
+		if err == nil {
+			t.Fatal("user 与文件名不一致未被拒绝")
+		}
+		if !strings.Contains(err.Error(), "bob.json") {
+			t.Fatalf("错误信息应包含文件名 bob.json: %v", err)
+		}
+	})
+}
+
+// TestLoadConfigRejectsMissingOrEmptyCredentialsDirectory 目录不存在、为空或只有被忽略的条目时报错，错误信息包含 credentials。
+func TestLoadConfigRejectsMissingOrEmptyCredentialsDirectory(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, credentials string)
+	}{
+		{"missing-directory", func(t *testing.T, credentials string) {}},
+		{"empty-directory", func(t *testing.T, credentials string) {
+			if err := os.MkdirAll(credentials, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"only-ignored-entries", func(t *testing.T, credentials string) {
+			writeCredentialFile(t, filepath.Join(credentials, ".hidden.json"), accountJSON("ignored-token"))
+			writeCredentialFile(t, filepath.Join(credentials, "notes.txt"), accountJSON("ignored-token"))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			configDir := isolatedConfigDir(t)
+			tc.setup(t, filepath.Join(configDir, "data", "credentials"))
+			_, err := loadConfig(writeConfigInDir(t, configDir, minimalConfig))
+			if err == nil {
+				t.Fatal("没有凭证文件时未被拒绝")
+			}
+			// 错误必须指出 credentials；同时不能是旧的默认文件 credentials.json 缺失错误，否则说明仍在读取旧字段。
+			if !strings.Contains(err.Error(), "credentials") || strings.Contains(err.Error(), "credentials.json") {
+				t.Fatalf("错误信息应指出 credentials 目录而不是默认文件: %v", err)
+			}
+		})
+	}
+}
+
+// TestLoadConfigRejectsDuplicateAccountAcrossFiles 两个文件规范化后 host+token 相同时报错。
+func TestLoadConfigRejectsDuplicateAccountAcrossFiles(t *testing.T) {
+	configDir := t.TempDir()
+	credentials := filepath.Join(configDir, "data", "credentials")
+	writeCredentialFile(t, filepath.Join(credentials, "a.json"), accountJSON("duplicate-token"))
+	writeCredentialFile(t, filepath.Join(credentials, "b.json"), `{"oauth_token":"duplicate-token","host":"github.com"}`)
+	_, err := loadConfig(writeConfigInDir(t, configDir, minimalConfig))
+	if err == nil {
+		t.Fatal("重复账号未被拒绝")
+	}
+	if !strings.Contains(err.Error(), "账号与之前的账号重复") {
+		t.Fatalf("错误信息应指出重复账号: %v", err)
+	}
+}
+
+// TestLoadConfigAllowsSameTokenOnDifferentHosts 同一 token 在不同 host 上是不同账号，允许共存。
+func TestLoadConfigAllowsSameTokenOnDifferentHosts(t *testing.T) {
+	configDir := t.TempDir()
+	credentials := filepath.Join(configDir, "data", "credentials")
+	writeCredentialFile(t, filepath.Join(credentials, "github.json"), accountJSON("shared-token"))
+	writeCredentialFile(t, filepath.Join(credentials, "acme.json"), `{"oauth_token":"shared-token","host":"acme.ghe.com"}`)
+	config, err := loadConfig(writeConfigInDir(t, configDir, minimalConfig))
+	if err != nil {
+		t.Fatalf("同一 token 在不同 host 上应被接受: %v", err)
+	}
+	if len(config.Accounts) != 2 {
+		t.Fatalf("accounts = %d, want 2", len(config.Accounts))
+	}
+	if h := accountByUser(t, config, "github").Host; h != "" {
+		t.Fatalf("github host = %q, want 空", h)
+	}
+	if h := accountByUser(t, config, "acme").Host; h != "acme.ghe.com" {
+		t.Fatalf("acme host = %q, want acme.ghe.com", h)
+	}
+}
+
+// TestLoadConfigTopLevelHostOverridesEveryAccount 顶层 host 覆盖所有凭证文件中的 host，并保留去空白后的原值。
+func TestLoadConfigTopLevelHostOverridesEveryAccount(t *testing.T) {
+	configDir := t.TempDir()
+	credentials := filepath.Join(configDir, "data", "credentials")
+	writeCredentialFile(t, filepath.Join(credentials, "work.json"), accountJSON("host-work-token"))
+	writeCredentialFile(t, filepath.Join(credentials, "team.json"), `{"oauth_token":"host-team-token","host":"github.com"}`)
+	configPath := writeConfigInDir(t, configDir, "host: \"  acme.ghe.com  \"\n")
 	config, err := loadConfig(configPath)
 	if err != nil {
-		t.Fatalf("loadConfig() with absolute credentials path: %v", err)
+		t.Fatalf("loadConfig() error = %v", err)
 	}
-	if config.Token != "absolute-credentials-token" {
-		t.Fatalf("token loaded from absolute credentials path = %q", config.Token)
+	if config.Host != "acme.ghe.com" {
+		t.Fatalf("top-level host = %q, want trimmed acme.ghe.com", config.Host)
+	}
+	if len(config.Accounts) != 2 {
+		t.Fatalf("accounts = %d, want 2", len(config.Accounts))
+	}
+	for i, account := range config.Accounts {
+		if account.Host != "acme.ghe.com" {
+			t.Errorf("account %d host = %q, want 顶层 host acme.ghe.com", i, account.Host)
+		}
+	}
+}
+
+// TestLoadConfigRejectsRemovedCredentialsField 配置中仍出现 credentials 字段时报错（不做兼容）。
+func TestLoadConfigRejectsRemovedCredentialsField(t *testing.T) {
+	for _, value := range []string{"work", "[work.json]", `""`} {
+		t.Run(value, func(t *testing.T) {
+			configPath := writeConfigWithAccount(t, "work", accountJSON("removed-field-token"),
+				"credentials: "+value+"\n")
+			_, err := loadConfig(configPath)
+			if err == nil {
+				t.Fatalf("已移除的 credentials 字段 %s 未被拒绝", value)
+			}
+			// 必须是 YAML 解析阶段（KnownFields）拒绝字段，而不是之后加载凭证失败时的 credentials 错误。
+			if !strings.Contains(err.Error(), "不是有效 YAML") || !strings.Contains(err.Error(), "credentials") {
+				t.Fatalf("错误信息应由 YAML 解析阶段指出 credentials 字段: %v", err)
+			}
+		})
 	}
 }
 
 func TestLogRotationConfigValuesAndValidation(t *testing.T) {
-	credentials := testCredentialFile(t, `{"oauth_token":"log-rotation-config-token"}`)
-	configPath := writeConfigFile(t, fmt.Sprintf(
-		"credentials: %s\nlog_max_size_mb: 1\nlog_max_backups: 2\n",
-		strconv.Quote(credentials)))
+	configPath := writeConfigWithAccount(t, "log-rotation", accountJSON("log-rotation-config-token"),
+		"log_max_size_mb: 1\nlog_max_backups: 2\n")
 	config, err := loadConfig(configPath)
 	if err != nil {
 		t.Fatalf("loadConfig() with log rotation settings: %v", err)
@@ -306,8 +610,7 @@ func TestLogRotationConfigValuesAndValidation(t *testing.T) {
 		{name: "non-integer-backups", fields: "log_max_backups: invalid\n", field: "log_max_backups"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			invalidConfigPath := writeConfigFile(t, fmt.Sprintf("credentials: %s\n%s",
-				strconv.Quote(credentials), tc.fields))
+			invalidConfigPath := writeConfigWithAccount(t, "log-rotation", accountJSON("log-rotation-config-token"), tc.fields)
 			_, err := loadConfig(invalidConfigPath)
 			if err == nil {
 				t.Fatalf("无效的 %s 未被拒绝", tc.field)
@@ -333,7 +636,6 @@ func assertResolvedDataAndLogPaths(t *testing.T, config appConfig, dataPath, log
 }
 
 func TestModelsCacheTTLConfig(t *testing.T) {
-	credentials := testCredentialFile(t, `{"oauth_token":"models-cache-config-token"}`)
 	for _, tc := range []struct {
 		name    string
 		value   string
@@ -347,12 +649,11 @@ func TestModelsCacheTTLConfig(t *testing.T) {
 		{name: "negative", value: "-1s", wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var contents strings.Builder
-			fmt.Fprintf(&contents, "credentials: %s\n", strconv.Quote(credentials))
+			contents := minimalConfig
 			if tc.value != "" {
-				fmt.Fprintf(&contents, "models_cache_ttl: %s\n", strconv.Quote(tc.value))
+				contents += fmt.Sprintf("models_cache_ttl: %s\n", strconv.Quote(tc.value))
 			}
-			configPath := writeConfigFile(t, contents.String())
+			configPath := writeConfigWithAccount(t, "models-cache", accountJSON("models-cache-config-token"), contents)
 			config, err := loadConfig(configPath)
 			if tc.wantErr {
 				if err == nil {
@@ -375,9 +676,8 @@ func TestRunWarnsWhenConfigPermissionsAreTooBroad(t *testing.T) {
 		t.Skip("Windows 不支持 Unix 配置文件权限检查")
 	}
 
-	credentials := testCredentialFile(t, `{"oauth_token":"permission-warning-oauth-token"}`)
-	configPath := writeConfigFile(t, fmt.Sprintf("credentials: %s\nlog_level: info\n",
-		strconv.Quote(credentials)))
+	configPath := writeConfigWithAccount(t, "config-permission", accountJSON("permission-warning-oauth-token"),
+		"log_level: info\n")
 	if err := os.Chmod(configPath, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -415,7 +715,9 @@ func TestRunWarnsWhenCredentialPermissionsAreTooBroad(t *testing.T) {
 		t.Skip("Windows 不支持 Unix 凭证文件权限检查")
 	}
 
-	credentialPath := testCredentialFile(t, `{"oauth_token":"credential-permission-warning-token"}`)
+	configDir := t.TempDir()
+	credentialPath := filepath.Join(configDir, "data", "credentials", "permission-warning.json")
+	writeCredentialFile(t, credentialPath, accountJSON("credential-permission-warning-token"))
 	if err := os.Chmod(credentialPath, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -427,7 +729,7 @@ func TestRunWarnsWhenCredentialPermissionsAreTooBroad(t *testing.T) {
 		t.Fatalf("credentials file mode = %04o, want 0644", got)
 	}
 
-	configPath := writeConfigFile(t, appConfigYAML("127.0.0.1:0", credentialPath, "", "", "info"))
+	configPath := writeConfigInDir(t, configDir, appConfigYAML("127.0.0.1:0", "", "", "info"))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var stdout, stderr bytes.Buffer
@@ -447,12 +749,63 @@ func TestRunWarnsWhenCredentialPermissionsAreTooBroad(t *testing.T) {
 	t.Fatalf("startup logs have no permission warning for the 0644 credentials file: %s", stderr.String())
 }
 
+func TestRunWarnsForEachCredentialFileWithBroadPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 不支持 Unix 凭证文件权限检查")
+	}
+
+	configDir := t.TempDir()
+	dataPath := filepath.Join(configDir, "data")
+	modes := map[string]os.FileMode{"strict.json": 0o600, "open.json": 0o644, "group.json": 0o640}
+	for name, mode := range modes {
+		path := filepath.Join(dataPath, "credentials", name)
+		writeCredentialFile(t, path, accountJSON("permission-"+strings.TrimSuffix(name, ".json")))
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	configPath := writeConfigInDir(t, configDir, minimalConfig)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var stdout, stderr bytes.Buffer
+	err := run(ctx, []string{"-c", configPath}, &stdout, &stderr)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("run with cancelled context = %v, want context.Canceled", err)
+	}
+
+	warnings := map[string]int{}
+	for _, line := range strings.Split(stderr.String(), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("invalid JSON log line %q: %v", line, err)
+		}
+		if entry["level"] != "WARN" || entry["msg"] != "凭证文件权限过宽，建议执行 chmod 600" {
+			continue
+		}
+		file, _ := entry["credential_file"].(string)
+		warnings[file]++
+	}
+	// 每个权限过宽的凭证文件各一条告警；0600 的文件不告警。
+	for _, name := range []string{"open.json", "group.json"} {
+		path := filepath.Join(dataPath, "credentials", name)
+		if warnings[path] != 1 {
+			t.Errorf("%s 权限过宽告警 %d 条, want 1; stderr=%s", name, warnings[path], stderr.String())
+		}
+	}
+	if warnings[filepath.Join(dataPath, "credentials", "strict.json")] != 0 || len(warnings) != 2 {
+		t.Errorf("告警文件集合 = %v, want 仅 open.json 与 group.json", warnings)
+	}
+}
+
 func TestRunLoadsYAMLServiceSettings(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "")
 	t.Setenv("GHC2API_API_KEY", "")
 	t.Setenv("COPILOT_HOST", "")
 	t.Setenv("COPILOT_TOKEN_MODE", "cli")
-	credentials := testCredentialFile(t, `{"oauth_token":"yaml-oauth-token"}`)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -463,7 +816,8 @@ func TestRunLoadsYAMLServiceSettings(t *testing.T) {
 	}
 
 	const apiKey = "yaml-api-key-secret"
-	configPath := writeConfigFile(t, appConfigYAML(addr, credentials, "acme.ghe.com", apiKey, "info"))
+	configPath := writeConfigWithAccount(t, "yaml-service", accountJSON("yaml-oauth-token"),
+		appConfigYAML(addr, "acme.ghe.com", apiKey, "info"))
 	ctx, cancel := context.WithCancel(context.Background())
 	var stdout, stderr synchronizedBuffer
 	done := make(chan struct{})
@@ -551,7 +905,6 @@ func TestRunLoadsYAMLServiceSettings(t *testing.T) {
 }
 
 func TestLoadConfigRejectsLegacyCredentialFields(t *testing.T) {
-	credentials := testCredentialFile(t, `{"oauth_token":"legacy-field-probe-token"}`)
 	for _, tc := range []struct {
 		field string
 		value string
@@ -560,8 +913,7 @@ func TestLoadConfigRejectsLegacyCredentialFields(t *testing.T) {
 		{field: "editor_config", value: "legacy-editor-path"},
 	} {
 		t.Run(tc.field, func(t *testing.T) {
-			contents := fmt.Sprintf("credentials: %s\n%s: %s\n",
-				strconv.Quote(credentials), tc.field, strconv.Quote(tc.value))
+			contents := fmt.Sprintf("%s: %s\n", tc.field, strconv.Quote(tc.value))
 			configPath := writeConfigFile(t, contents)
 			_, err := loadConfig(configPath)
 			if err == nil {
@@ -585,7 +937,7 @@ func TestRunWritesLogToDefaultAndRelativeLogsPaths(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			configDir := t.TempDir()
-			writeCredentialFile(t, filepath.Join(configDir, "data", "credentials", "credentials.json"),
+			writeCredentialFile(t, filepath.Join(configDir, "data", "credentials", "alice.json"),
 				`{"oauth_token":"log-path-token"}`)
 			configPath := writeConfigInDir(t, configDir, tc.config+"listen: 127.0.0.1:0\n")
 
@@ -621,7 +973,7 @@ func TestRunWritesLogToDefaultAndRelativeLogsPaths(t *testing.T) {
 
 func TestRunRotatesLogsAndRetainsConfiguredBackups(t *testing.T) {
 	configPath, configDir := writeLongConfigFile(t, "log_max_size_mb: 1\nlog_max_backups: 2\n")
-	writeCredentialFile(t, filepath.Join(configDir, "data", "credentials", "credentials.json"),
+	writeCredentialFile(t, filepath.Join(configDir, "data", "credentials", "alice.json"),
 		`{"oauth_token":"log-rotation-token"}`)
 
 	args := []string{"-c", configPath}
@@ -819,10 +1171,10 @@ func TestRunAcceptsSupportedLogLevels(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "")
 	t.Setenv("GHC2API_API_KEY", "")
 	t.Setenv("COPILOT_HOST", "")
-	credentials := testCredentialFile(t, `{"oauth_token":"log-level-token"}`)
 	for _, level := range []string{"debug", "info", "warn", "error"} {
 		t.Run(level, func(t *testing.T) {
-			configPath := writeConfigFile(t, appConfigYAML("0.0.0.0:0", credentials, "", "test-api-key", level))
+			configPath := writeConfigWithAccount(t, "log-level", accountJSON("log-level-token"),
+				appConfigYAML("0.0.0.0:0", "", "test-api-key", level))
 			err := runWithCancelledContext([]string{"-c", configPath})
 			if err != nil && !errors.Is(err, context.Canceled) {
 				t.Fatalf("日志级别 %q 未被接受: %v", level, err)
@@ -835,21 +1187,19 @@ func TestRunRejectsInvalidYAMLAndSettings(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "")
 	t.Setenv("GHC2API_API_KEY", "")
 	t.Setenv("COPILOT_HOST", "")
-	credentials := testCredentialFile(t, `{"oauth_token":"config-validation-token"}`)
 	for _, tc := range []struct {
 		name   string
 		config string
 	}{
 		{"malformed-yaml", "listen: [\n"},
-		{"invalid-log-level", appConfigYAML("127.0.0.1:0", credentials, "", "", "trace")},
-		{"invalid-host", appConfigYAML("127.0.0.1:0", credentials, "evil.example", "", "info")},
-		{"legacy-cli-token-mode", appConfigYAML("127.0.0.1:0", credentials, "", "", "info") + "token_mode: cli\n"},
-		{"invalid-listen-address", appConfigYAML("not-a-listener", credentials, "", "", "info")},
-		{"non-local-listen-requires-api-key", appConfigYAML("0.0.0.0:0", credentials, "", "", "info")},
-		{"missing-credential-source", "listen: 127.0.0.1:0\n"},
+		{"invalid-log-level", appConfigYAML("127.0.0.1:0", "", "", "trace")},
+		{"invalid-host", appConfigYAML("127.0.0.1:0", "evil.example", "", "info")},
+		{"legacy-cli-token-mode", appConfigYAML("127.0.0.1:0", "", "", "info") + "token_mode: cli\n"},
+		{"invalid-listen-address", appConfigYAML("not-a-listener", "", "", "info")},
+		{"non-local-listen-requires-api-key", appConfigYAML("0.0.0.0:0", "", "", "info")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			configPath := writeConfigFile(t, tc.config)
+			configPath := writeConfigWithAccount(t, "validation", accountJSON("config-validation-token"), tc.config)
 			err := runWithCancelledContext([]string{"-c", configPath})
 			if err == nil || errors.Is(err, context.Canceled) {
 				t.Fatalf("无效配置未被拒绝: %v", err)
@@ -860,5 +1210,41 @@ func TestRunRejectsInvalidYAMLAndSettings(t *testing.T) {
 				t.Fatalf("配置文件没有被解析，错误来自参数处理: %v", err)
 			}
 		})
+	}
+}
+
+// TestLoadConfigIgnoresUppercaseJSONExtension 扩展名大小写不同（如 Alice.JSON）不是凭证文件，目录里只有它时报没有凭证文件。
+func TestLoadConfigIgnoresUppercaseJSONExtension(t *testing.T) {
+	configDir := isolatedConfigDir(t)
+	writeCredentialFile(t, filepath.Join(configDir, "data", "credentials", "Alice.JSON"), accountJSON("uppercase-ext-token"))
+	_, err := loadConfig(writeConfigInDir(t, configDir, minimalConfig))
+	if err == nil {
+		t.Fatal("仅有 Alice.JSON 时未报错，扩展名应区分大小写")
+	}
+	if !strings.Contains(err.Error(), "没有凭证文件") {
+		t.Fatalf("错误信息应指出没有凭证文件: %v", err)
+	}
+}
+
+// TestLoadConfigRejectsUserNamesDifferingOnlyByCase 两个文件的用户名只有大小写不同（Alice.json 与 alice.json）时，
+// 它们是同一个 GitHub 用户名，不能同时作为两个账号加载。
+// 该场景需要大小写敏感的文件系统才能同时创建两个文件；macOS 默认文件系统不区分大小写，此时跳过。
+func TestLoadConfigRejectsUserNamesDifferingOnlyByCase(t *testing.T) {
+	probeDir := isolatedConfigDir(t)
+	writeCredentialFile(t, filepath.Join(probeDir, "a.json"), accountJSON("case-probe-token"))
+	if _, err := os.Stat(filepath.Join(probeDir, "A.json")); err == nil {
+		t.Skip("文件系统不区分大小写（例如 macOS 默认），无法同时创建 Alice.json 与 alice.json")
+	}
+	configDir := isolatedConfigDir(t)
+	credentials := filepath.Join(configDir, "data", "credentials")
+	writeCredentialFile(t, filepath.Join(credentials, "Alice.json"), accountJSON("case-alice-token"))
+	writeCredentialFile(t, filepath.Join(credentials, "alice.json"), accountJSON("case-alice-other-token"))
+	_, err := loadConfig(writeConfigInDir(t, configDir, minimalConfig))
+	if err == nil {
+		t.Fatal("仅大小写不同的重复用户名未被拒绝")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "重复") || (!strings.Contains(message, "Alice.json") && !strings.Contains(message, "alice.json")) {
+		t.Fatalf("错误信息应指出重复并包含文件名: %v", err)
 	}
 }

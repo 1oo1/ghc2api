@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -35,19 +36,20 @@ func (s *Service) addSecret(value string) {
 	s.secretsMu.Unlock()
 }
 
-func (s *Service) logRequests(next http.Handler) http.Handler {
+// logFunc 输出请求级日志；实现必须对敏感值脱敏。
+type logFunc func(ctx context.Context, level slog.Level, message string, args ...any)
+
+// withRequestLog 为每个客户端请求分配 request_id（取自 seq 递增），把绑定该 ID 的日志器写入上下文，
+// 记录收到与完成日志后调用 next。Service 与 Pool 共用此包装，只在日志器、序号和输出函数上不同。
+func withRequestLog(logger *slog.Logger, seq *atomic.Uint64, logf logFunc, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestID := s.requestSeq.Add(1)
-		ctx := r.Context()
-		if s.logger != nil {
-			ctx = context.WithValue(ctx, requestLoggerContextKey{}, s.logger.With("request_id", requestID))
-		}
+		ctx := bindRequestLogger(r.Context(), logger.With("request_id", seq.Add(1)))
 		r = r.WithContext(ctx)
 		writer := &statusResponseWriter{ResponseWriter: w, status: http.StatusOK}
 		started := time.Now()
-		s.log(ctx, slog.LevelInfo, "收到客户端请求", "method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
+		logf(ctx, slog.LevelInfo, "收到客户端请求", "method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
 		next.ServeHTTP(writer, r)
-		s.log(ctx, slog.LevelInfo, "客户端请求处理完成", "method", r.Method, "path", r.URL.Path,
+		logf(ctx, slog.LevelInfo, "客户端请求处理完成", "method", r.Method, "path", r.URL.Path,
 			"status", writer.status, "duration_ms", time.Since(started).Milliseconds())
 	})
 }
@@ -78,11 +80,22 @@ func (w *statusResponseWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
 
-func (s *Service) requestLogger(ctx context.Context) *slog.Logger {
+// bindRequestLogger 把已带 request_id（及可选 account）的日志器写入请求上下文，
+// 之后 Service.log 会使用该日志器输出，Pool 选定账号后的日志也经由此处生效。
+func bindRequestLogger(ctx context.Context, logger *slog.Logger) context.Context {
+	return context.WithValue(ctx, requestLoggerContextKey{}, logger)
+}
+
+// contextLogger 返回请求上下文中绑定的日志器；没有绑定时使用 fallback。
+func contextLogger(ctx context.Context, fallback *slog.Logger) *slog.Logger {
 	if logger, ok := ctx.Value(requestLoggerContextKey{}).(*slog.Logger); ok && logger != nil {
 		return logger
 	}
-	return s.logger
+	return fallback
+}
+
+func (s *Service) requestLogger(ctx context.Context) *slog.Logger {
+	return contextLogger(ctx, s.logger)
 }
 
 func (s *Service) log(ctx context.Context, level slog.Level, message string, args ...any) {

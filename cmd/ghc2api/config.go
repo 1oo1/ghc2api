@@ -28,7 +28,6 @@ const (
 
 type appConfig struct {
 	Listen              string        `yaml:"listen"`
-	Credentials         string        `yaml:"credentials"`
 	DataPath            string        `yaml:"data_path"`
 	LogsPath            string        `yaml:"logs_path"`
 	Host                string        `yaml:"host"`
@@ -41,13 +40,21 @@ type appConfig struct {
 	LogMaxSizeMB        int64         `yaml:"-"`
 	LogMaxBackups       int           `yaml:"-"`
 
-	Token               string      `yaml:"-"`
 	CacheDir            string      `yaml:"-"`
 	configMode          os.FileMode `yaml:"-"`
 	insecurePermissions bool        `yaml:"-"`
-	credentialFile      string      `yaml:"-"`
-	credentialMode      os.FileMode `yaml:"-"`
-	insecureCredential  bool        `yaml:"-"`
+	// Accounts 按凭证文件名排序，每项对应 credentials 目录中的一个 GitHub Copilot 账号。
+	Accounts []accountConfig `yaml:"-"`
+}
+
+// accountConfig 是一个 GitHub Copilot 账号的凭证及其来源文件信息。
+type accountConfig struct {
+	Token              string
+	Host               string // 规范化后的 host
+	User               string // 凭证文件名去掉 .json 后的 GitHub 用户名，保留原有大小写
+	credentialFile     string
+	credentialMode     os.FileMode
+	insecureCredential bool
 }
 
 // loadConfig 只读取 YAML 中的设置，不读取环境变量或命令行覆盖项。
@@ -101,7 +108,6 @@ func loadConfig(path string) (appConfig, error) {
 		config.LogsPath = "./logs"
 	}
 	config.LogsPath = resolveConfigPath(path, config.LogsPath)
-	config.Credentials = strings.TrimSpace(config.Credentials)
 	config.Host = strings.TrimSpace(config.Host)
 	config.APIKey = strings.TrimSpace(config.APIKey)
 	config.LogLevel = strings.ToLower(strings.TrimSpace(config.LogLevel))
@@ -149,53 +155,27 @@ func loadConfig(path string) (appConfig, error) {
 		return appConfig{}, err
 	}
 
-	credentialPath, err := resolveCredentialPath(config.DataPath, config.Credentials)
+	config.Accounts, err = loadAccounts(filepath.Join(config.DataPath, credentialsDirName), config.Host)
 	if err != nil {
 		return appConfig{}, err
 	}
-	credential, err := copilot.LoadCredential(credentialPath)
-	if err != nil {
-		return appConfig{}, fmt.Errorf("无法加载 credentials %q: %w", credentialPath, err)
-	}
-	if runtime.GOOS != "windows" {
-		info, err := os.Stat(credentialPath)
-		if err != nil {
-			return appConfig{}, fmt.Errorf("无法检查 credentials %q 的权限: %w", credentialPath, err)
-		}
-		config.credentialFile = credentialPath
-		config.credentialMode = info.Mode().Perm()
-		config.insecureCredential = config.credentialMode&0o077 != 0
-	}
-	if config.Host != "" {
-		credential.Host = config.Host
-	}
-	config.Token = credential.Token
-	config.Host, err = copilot.NormalizeHost(credential.Host)
-	if err != nil {
-		return appConfig{}, err
-	}
-	if _, err := copilot.New(copilot.Config{Token: config.Token, Host: config.Host, APIKey: config.APIKey}); err != nil {
+	// 启动前用与 serve 相同的配置校验账号，确保 loadConfig 通过即可创建轮询池。
+	if _, err := copilot.NewPool(config.copilotConfigs(nil)); err != nil {
 		return appConfig{}, err
 	}
 	return config, nil
 }
 
-func resolveCredentialPath(dataPath, value string) (string, error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		value = "credentials.json"
+// copilotConfigs 为每个账号生成 copilot.Config，所有账号共享服务级设置。
+func (c appConfig) copilotConfigs(logger *slog.Logger) []copilot.Config {
+	configs := make([]copilot.Config, 0, len(c.Accounts))
+	for _, account := range c.Accounts {
+		configs = append(configs, copilot.Config{
+			Token: account.Token, Host: account.Host, User: account.User, APIKey: c.APIKey,
+			CacheDir: c.CacheDir, ModelsCacheTTL: c.ModelsCacheTTL, Logger: logger,
+		})
 	}
-	if filepath.IsAbs(value) {
-		return filepath.Clean(value), nil
-	}
-
-	base := filepath.Join(dataPath, "credentials")
-	path := filepath.Join(base, filepath.Clean(value))
-	relative, err := filepath.Rel(base, path)
-	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
-		return "", errors.New("credentials 相对路径必须位于 data_path/credentials 目录中")
-	}
-	return path, nil
+	return configs
 }
 
 func resolveConfigPath(configFile, value string) string {

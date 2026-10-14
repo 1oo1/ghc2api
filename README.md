@@ -7,12 +7,12 @@
 ## 配置与启动
 
 需要 Go 1.23 或更新版本，以及有效的 GitHub Copilot OAuth 订阅。复制示例配置后，
-将 OAuth 凭证 JSON 放到配置文件目录下的 `data/credentials/credentials.json`，或在 `credentials` 中指定文件路径：
+把每个账号的 OAuth 凭证 JSON 放到 `<data_path>/credentials/` 目录下，文件名为 `<GitHub 用户名>.json`：
 
 ```sh
 cp config.example.yaml config.yaml
 mkdir -p data/credentials
-# 将凭证 JSON 写入 data/credentials/credentials.json。
+# 将凭证 JSON 写入 data/credentials/<GitHub 用户名>.json，并执行 chmod 600。
 chmod 600 config.yaml
 # 编辑 config.yaml；真实凭证不要提交到版本库。
 make build
@@ -26,13 +26,26 @@ make build
 
 `config.yaml` 是唯一运行配置来源，不再通过命令行 flag 或环境变量覆盖服务设置。
 `data_path` 和 `logs_path` 的相对路径以配置文件所在目录为基准；默认分别为 `./data` 和 `./logs`。
-`credentials` 的相对路径位于 `<data_path>/credentials` 下，留空时使用
-`<data_path>/credentials/credentials.json`；也可显式指定绝对路径。
 缓存写入 `<data_path>/cache`，并按账号隔离。各字段的用途、默认值和安全要求见
 [`config.example.yaml`](config.example.yaml) 中的中文说明。
 服务只接受 GitHub OAuth token，并通过 OAuth 接口换取 Copilot session；不支持 Copilot CLI token。
-凭证 JSON 只允许 `oauth_token`、`host` 和 `user` 字段；若使用 `credentials` 文件，也应执行
-`chmod 600` 限制文件权限。
+凭证 JSON 只允许 `oauth_token`、`host` 和 `user` 字段；每个凭证文件都应执行
+`chmod 600` 限制文件权限，启动时对权限过宽的文件逐个告警。
+
+### 多账号与凭证目录
+
+每个凭证文件对应一个 GitHub Copilot 账号。服务启动时扫描 `<data_path>/credentials/` 目录，规则如下：
+
+- 只扫描这一层，不递归进入子目录。
+- 文件名为 `<GitHub 用户名>.json`。去掉 `.json` 后必须是合法的 GitHub 用户名：只能包含字母、数字和单个连字符，不能以连字符开头或结尾，不能含连续连字符，长度 1 到 39。不合法时启动失败，错误信息包含完整文件名。
+- 用户名不区分大小写，因此 `Alice.json` 与 `alice.json` 视为重复账号，启动失败（即使两者的 token 不同）。
+- 忽略的条目：以 `.` 开头的隐藏文件和临时文件、扩展名不是 `.json` 的文件、子目录（包括子目录中的 `.json` 文件）、指向目录的符号链接。指向普通文件的符号链接会被读取；悬空的符号链接会导致启动失败。
+- 凭证 JSON 中的 `user` 字段可以省略；若非空，必须与文件名中的用户名相同（忽略大小写），否则启动失败。
+- 账号按文件名的字节序排列，轮询顺序即此顺序。日志中的 `account` 为该下标，`user` 为文件名中的用户名。
+- 目录不存在或其中没有任何凭证文件时启动失败。
+- 同一账号（`host` 与 `oauth_token` 都相同）不能出现在两个文件中，否则启动失败。顶层 `host` 设置后会覆盖所有账号的 `host`。
+- `api_key` 对所有账号生效（它是全局配置，不分账号）。
+- 配置中已移除的 `credentials` 字段会被拒绝，启动时报"不是有效 YAML"。
 
 默认只监听 `127.0.0.1:8080`。监听非本机地址时，必须在配置中设置 `api_key`；
 公网部署还需要反向代理和 TLS。`api_key` 是本服务的客户端访问密钥，不是 GitHub token。
@@ -81,8 +94,19 @@ Anthropic 客户端 base URL 为 `http://127.0.0.1:8080`。
 - 上游的 HTTP 状态、生成响应和 SSE 原样转发；请求取消会传递给上游。生成请求体最大 16 MiB。
 - 三种生成协议不自动互转。请根据 `supported_endpoints` 选择接口；模型列表可用时，服务会在生成前校验模型与上游路径，不匹配时返回 400。旧模型没有该字段时按 Chat Completions 处理；模型列表不可用时，手选模型仍交由上游判断，Auto 会重试读取列表，仍失败则返回错误。
 - 用量接口返回原始 `quota_snapshots`，不把 Business/Enterprise 的共享额度解释成无限可用。
-- 单进程服务一个账号，不包含 magpie 的多账号切换、桌面 UI、WSL 和钥匙串发现。凭证变更后需重启。
-- 不自动尝试其他账号，也不在普通生成请求失败后重新计费重试；仅 Auto 的明确模型/session 拒绝会触发有限重选。
+- 不包含 magpie 的桌面 UI、WSL 和钥匙串发现。凭证目录中的文件增删或内容变更后需重启。
+- 多账号轮询：需要账号的请求按 round-robin 选择一个账号，顺序为凭证文件名的字节序；各账号的 session 与缓存相互独立。`/healthz`、未注册路由（404、405）和重定向不访问上游，由第一个账号的路由直接处理，也不推进轮询。
+- 故障切换：只有模型列表（`GET /v1/models`、`GET /models`）和生成请求（`POST` 的 chat completions、responses、`/v1/messages`）会在账号 session 获取失败（网络错误、上游错误响应或无效 session）时切换账号：该账号冷却 1 分钟，同一请求改用其他未尝试过的账号，已冷却的账号排在最后作为候选；每个账号在同一请求内最多尝试一次，全部失败时返回最后一个账号的错误。
+- `GET /usage` 不需要 session，按轮询落到某个账号；它的失败不会切换账号。
+- 生成请求的请求体校验在 session 获取之后执行，因此所有账号的 session 都失败时，无效请求体会收到 session 错误而不是 400。
+- 模型列表是各账号独立获取的，生成请求不会固定到返回模型列表的那个账号。如果各账号的订阅不同，某个模型可能只在部分账号上可用；请求被轮询到不支持该模型的账号时，服务会返回 400。
+- 限流与冷却：以下情况都会使该账号冷却 1 分钟，且本请求不换号重试：
+  - 生成接口直接返回的 429，原样流式透传给客户端；
+  - 经错误处理路径透传的上游 429，例如 `/v1/models` 的模型列表请求，以及 Auto 的 `/models/session` 返回的 429。
+- Auto 的 `/auto` 返回 429 时，服务会兜底改为请求 `/models/session`。兜底成功时客户端得到正常响应，账号不冷却；只有兜底也返回 429 时才透传并冷却。
+- `GET /usage` 返回的 429 不会使账号冷却，原样返回给客户端。
+- 客户端取消的请求不会使账号冷却。冷却状态只保存在内存中，重启后清空。
+- 普通生成请求失败后不会在其他账号上重新发送；仅 Auto 的明确模型/session 拒绝会触发有限重选。
 - 不转发客户端的认证信息、Cookie 和逐跳头；拒绝重定向以及不在 GitHub/Copilot 白名单内的 session API 地址。
 
 ## Makefile 与验证

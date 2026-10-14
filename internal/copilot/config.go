@@ -17,6 +17,7 @@ const DefaultModelsCacheTTL = 2 * time.Hour
 type Config struct {
 	Token          string
 	Host           string
+	User           string // 账号的 GitHub 用户名，仅用于日志标识，不参与鉴权。
 	APIKey         string
 	CacheDir       string        // 留空时使用系统用户缓存目录；自定义目录应由调用方限制访问权限。
 	ModelsCacheTTL time.Duration // 非正值使用默认的模型列表缓存有效期。

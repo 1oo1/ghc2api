@@ -2,16 +2,20 @@
 listen: "127.0.0.1:8080"
 
 # 程序数据目录；相对路径以本配置文件所在目录为基准，默认 ./data。
-# credentials 和缓存分别放在 credentials/、cache/ 子目录中。
+# 凭证放在 credentials/，缓存放在 cache/ 子目录中。
 data_path: "./data"
 
-# OAuth 凭证 JSON 文件路径；相对路径位于 data_path/credentials 下。
-# 留空时默认使用 credentials/credentials.json；绝对路径可指定 data_path 之外的文件。
+# 凭证目录规则（启动时扫描 data_path/credentials/，只扫描这一层）：
+# - 每个凭证文件对应一个账号，文件名为 <GitHub 用户名>.json，例如 alice.json。
+#   文件名去掉 .json 后必须是合法的 GitHub 用户名（字母、数字和单个连字符，不以连字符开头或结尾，长度 1 到 39）。
+# - 忽略隐藏文件（以 . 开头）、非 .json 文件、子目录和指向目录的符号链接。
+# - 凭证中的 user 字段可省略；若填写，必须与文件名中的用户名一致（忽略大小写）。
+# - 账号按文件名排序，轮询顺序即此顺序；host 与 oauth_token 都相同的两个账号会导致启动失败。
 # 格式示例：{"oauth_token":"...","host":"acme.ghe.com","user":"alice"}
-# 请将凭证文件权限设为 0600（chmod 600）。
-credentials: "credentials.json"
+# 请将每个凭证文件权限设为 0600（chmod 600）。
 
-# 可选的 GitHub Enterprise Cloud 登录域名；留空时使用凭证中的 host 或 github.com。
+# 可选的 GitHub Enterprise Cloud 登录域名；设置后覆盖所有凭证文件中的 host。
+# 留空时各账号使用凭证中的 host，缺省为 github.com。
 host: ""
 
 # 本服务的访问密钥，不是 GitHub token。非本机监听地址必须设置。

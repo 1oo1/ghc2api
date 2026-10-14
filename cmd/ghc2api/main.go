@@ -51,9 +51,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (runErr e
 		logger.WarnContext(ctx, "配置文件权限过宽，建议执行 chmod 600", "config_file", configPath,
 			"mode", fmt.Sprintf("%04o", config.configMode))
 	}
-	if config.insecureCredential {
-		logger.WarnContext(ctx, "凭证文件权限过宽，建议执行 chmod 600", "credential_file", config.credentialFile,
-			"mode", fmt.Sprintf("%04o", config.credentialMode))
+	for _, account := range config.Accounts {
+		if account.insecureCredential {
+			logger.WarnContext(ctx, "凭证文件权限过宽，建议执行 chmod 600", "credential_file", account.credentialFile,
+				"mode", fmt.Sprintf("%04o", account.credentialMode))
+		}
 	}
 	return serve(ctx, config, logger)
 }
@@ -73,10 +75,7 @@ func serve(ctx context.Context, config appConfig, logger *slog.Logger) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	service, err := copilot.New(copilot.Config{
-		Token: config.Token, Host: config.Host, APIKey: config.APIKey,
-		CacheDir: config.CacheDir, ModelsCacheTTL: config.ModelsCacheTTL, Logger: logger,
-	})
+	pool, err := copilot.NewPool(config.copilotConfigs(logger))
 	if err != nil {
 		return err
 	}
@@ -87,7 +86,7 @@ func serve(ctx context.Context, config appConfig, logger *slog.Logger) error {
 	defer listener.Close()
 
 	server := &http.Server{
-		Handler: service.Handler(), ReadHeaderTimeout: 10 * time.Second,
+		Handler: pool.Handler(), ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout: 30 * time.Second, IdleTimeout: time.Minute,
 		ErrorLog: log.New(slogWriter{logger: logger}, "", 0),
 		BaseContext: func(net.Listener) context.Context {
