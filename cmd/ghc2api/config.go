@@ -19,19 +19,30 @@ import (
 )
 
 const maxConfigSize = 1 << 20
+const (
+	defaultLogMaxSizeMB = 10
+	defaultLogBackups   = 5
+	maxLogMaxSizeMB     = 1 << 20
+	maxLogBackups       = 100
+)
 
 type appConfig struct {
 	Listen              string        `yaml:"listen"`
-	GitHubToken         string        `yaml:"github_token"`
 	Credentials         string        `yaml:"credentials"`
-	EditorConfig        string        `yaml:"editor_config"`
+	DataPath            string        `yaml:"data_path"`
+	LogsPath            string        `yaml:"logs_path"`
 	Host                string        `yaml:"host"`
 	APIKey              string        `yaml:"api_key"`
 	LogLevel            string        `yaml:"log_level"`
 	ModelsCacheTTLValue string        `yaml:"models_cache_ttl"`
 	ModelsCacheTTL      time.Duration `yaml:"-"`
+	LogMaxSizeMBValue   *string       `yaml:"log_max_size_mb"` // 保留原值以便报告字段级校验错误。
+	LogMaxBackupsValue  *string       `yaml:"log_max_backups"` // 显式解析以区分缺省值和非法输入。
+	LogMaxSizeMB        int64         `yaml:"-"`
+	LogMaxBackups       int           `yaml:"-"`
 
 	Token               string      `yaml:"-"`
+	CacheDir            string      `yaml:"-"`
 	configMode          os.FileMode `yaml:"-"`
 	insecurePermissions bool        `yaml:"-"`
 	credentialFile      string      `yaml:"-"`
@@ -79,7 +90,18 @@ func loadConfig(path string) (appConfig, error) {
 	if config.Listen == "" {
 		config.Listen = "127.0.0.1:8080"
 	}
-	config.GitHubToken = strings.TrimSpace(config.GitHubToken)
+	config.DataPath = strings.TrimSpace(config.DataPath)
+	if config.DataPath == "" {
+		config.DataPath = "./data"
+	}
+	config.DataPath = resolveConfigPath(path, config.DataPath)
+	config.CacheDir = filepath.Join(config.DataPath, "cache")
+	config.LogsPath = strings.TrimSpace(config.LogsPath)
+	if config.LogsPath == "" {
+		config.LogsPath = "./logs"
+	}
+	config.LogsPath = resolveConfigPath(path, config.LogsPath)
+	config.Credentials = strings.TrimSpace(config.Credentials)
 	config.Host = strings.TrimSpace(config.Host)
 	config.APIKey = strings.TrimSpace(config.APIKey)
 	config.LogLevel = strings.ToLower(strings.TrimSpace(config.LogLevel))
@@ -88,6 +110,32 @@ func loadConfig(path string) (appConfig, error) {
 	}
 	if _, err := logLevel(config.LogLevel); err != nil {
 		return appConfig{}, err
+	}
+	if config.LogMaxSizeMBValue == nil {
+		config.LogMaxSizeMB = defaultLogMaxSizeMB
+	} else {
+		value, err := strconv.ParseInt(strings.TrimSpace(*config.LogMaxSizeMBValue), 10, 64)
+		if err != nil {
+			return appConfig{}, fmt.Errorf("无效的 log_max_size_mb %q", *config.LogMaxSizeMBValue)
+		}
+		config.LogMaxSizeMB = value
+		if config.LogMaxSizeMB < 1 || config.LogMaxSizeMB > maxLogMaxSizeMB {
+			return appConfig{}, fmt.Errorf("无效的 log_max_size_mb %d，必须是 1 到 %d 之间的整数",
+				config.LogMaxSizeMB, maxLogMaxSizeMB)
+		}
+	}
+	if config.LogMaxBackupsValue == nil {
+		config.LogMaxBackups = defaultLogBackups
+	} else {
+		value, err := strconv.Atoi(strings.TrimSpace(*config.LogMaxBackupsValue))
+		if err != nil {
+			return appConfig{}, fmt.Errorf("无效的 log_max_backups %q", *config.LogMaxBackupsValue)
+		}
+		config.LogMaxBackups = value
+		if config.LogMaxBackups < 0 || config.LogMaxBackups > maxLogBackups {
+			return appConfig{}, fmt.Errorf("无效的 log_max_backups %d，必须是 0 到 %d 之间的整数",
+				config.LogMaxBackups, maxLogBackups)
+		}
 	}
 	config.ModelsCacheTTL = copilot.DefaultModelsCacheTTL
 	if value := strings.TrimSpace(config.ModelsCacheTTLValue); value != "" {
@@ -101,33 +149,22 @@ func loadConfig(path string) (appConfig, error) {
 		return appConfig{}, err
 	}
 
-	credential := copilot.Credential{}
-	switch {
-	case config.GitHubToken != "":
-		credential.Token = config.GitHubToken
-	case strings.TrimSpace(config.Credentials) != "":
-		credentialPath := resolveConfigPath(path, config.Credentials)
-		credential, err = copilot.LoadCredential(credentialPath)
+	credentialPath, err := resolveCredentialPath(config.DataPath, config.Credentials)
+	if err != nil {
+		return appConfig{}, err
+	}
+	credential, err := copilot.LoadCredential(credentialPath)
+	if err != nil {
+		return appConfig{}, fmt.Errorf("无法加载 credentials %q: %w", credentialPath, err)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(credentialPath)
 		if err != nil {
-			return appConfig{}, fmt.Errorf("无法加载 credentials %q: %w", credentialPath, err)
+			return appConfig{}, fmt.Errorf("无法检查 credentials %q 的权限: %w", credentialPath, err)
 		}
-		if runtime.GOOS != "windows" {
-			info, err := os.Stat(credentialPath)
-			if err != nil {
-				return appConfig{}, fmt.Errorf("无法检查 credentials %q 的权限: %w", credentialPath, err)
-			}
-			config.credentialFile = credentialPath
-			config.credentialMode = info.Mode().Perm()
-			config.insecureCredential = config.credentialMode&0o077 != 0
-		}
-	case strings.TrimSpace(config.EditorConfig) != "":
-		editorPath := resolveConfigPath(path, config.EditorConfig)
-		credential, err = copilot.DiscoverEditor(editorPath)
-		if err != nil {
-			return appConfig{}, fmt.Errorf("无法从 editor_config %q 读取 OAuth 凭证: %w", editorPath, err)
-		}
-	default:
-		return appConfig{}, errors.New("必须设置 github_token、credentials 或 editor_config 之一")
+		config.credentialFile = credentialPath
+		config.credentialMode = info.Mode().Perm()
+		config.insecureCredential = config.credentialMode&0o077 != 0
 	}
 	if config.Host != "" {
 		credential.Host = config.Host
@@ -141,6 +178,24 @@ func loadConfig(path string) (appConfig, error) {
 		return appConfig{}, err
 	}
 	return config, nil
+}
+
+func resolveCredentialPath(dataPath, value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		value = "credentials.json"
+	}
+	if filepath.IsAbs(value) {
+		return filepath.Clean(value), nil
+	}
+
+	base := filepath.Join(dataPath, "credentials")
+	path := filepath.Join(base, filepath.Clean(value))
+	relative, err := filepath.Rel(base, path)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+		return "", errors.New("credentials 相对路径必须位于 data_path/credentials 目录中")
+	}
+	return path, nil
 }
 
 func resolveConfigPath(configFile, value string) string {

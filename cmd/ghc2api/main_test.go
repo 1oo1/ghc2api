@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -38,42 +40,47 @@ func (b *synchronizedBuffer) String() string {
 func testCredentialFile(t *testing.T, raw string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "credentials.json")
-	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeCredentialFile(t, path, raw)
 	return path
 }
 
-func testEditorConfig(t *testing.T) string {
+func writeCredentialFile(t *testing.T, path, raw string) {
 	t.Helper()
-	dir := t.TempDir()
-	editorDir := filepath.Join(dir, "github-copilot")
-	if err := os.MkdirAll(editorDir, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(editorDir, "apps.json"), []byte(`{"github.com":{"oauth_token":"editor-oauth-token"}}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return dir
 }
 
 func writeConfigFile(t *testing.T, contents string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "config.yaml")
+	return writeConfigInDir(t, t.TempDir(), contents)
+}
+
+func writeConfigInDir(t *testing.T, dir, contents string) string {
+	t.Helper()
+	return writeConfigAt(t, dir, "config.yaml", contents)
+}
+
+func writeConfigAt(t *testing.T, dir, name, contents string) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return path
 }
 
-func appConfigYAML(listen, credentials, editorConfig, host, apiKey, logLevel string) string {
+func appConfigYAML(listen, credentials, host, apiKey, logLevel string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "listen: %s\n", strconv.Quote(listen))
 	if credentials != "" {
 		fmt.Fprintf(&b, "credentials: %s\n", strconv.Quote(credentials))
-	}
-	if editorConfig != "" {
-		fmt.Fprintf(&b, "editor_config: %s\n", strconv.Quote(editorConfig))
 	}
 	fmt.Fprintf(&b, "host: %s\n", strconv.Quote(host))
 	fmt.Fprintf(&b, "api_key: %s\n", strconv.Quote(apiKey))
@@ -81,6 +88,38 @@ func appConfigYAML(listen, credentials, editorConfig, host, apiKey, logLevel str
 		fmt.Fprintf(&b, "log_level: %s\n", strconv.Quote(logLevel))
 	}
 	return b.String()
+}
+
+func configStringField(t *testing.T, config appConfig, names ...string) string {
+	t.Helper()
+	value := reflect.ValueOf(config)
+	for _, name := range names {
+		field := value.FieldByName(name)
+		if field.IsValid() && field.Kind() == reflect.String {
+			return field.String()
+		}
+	}
+	t.Fatalf("appConfig 缺少字符串字段之一: %s", strings.Join(names, ", "))
+	return ""
+}
+
+func configIntField(t *testing.T, config appConfig, names ...string) int64 {
+	t.Helper()
+	value := reflect.ValueOf(config)
+	for _, name := range names {
+		field := value.FieldByName(name)
+		if !field.IsValid() {
+			continue
+		}
+		switch field.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			return field.Int()
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			return int64(field.Uint())
+		}
+	}
+	t.Fatalf("appConfig 缺少整数值字段之一: %s", strings.Join(names, ", "))
+	return 0
 }
 
 func runWithCancelledContext(args []string) error {
@@ -125,12 +164,9 @@ func TestRunAcceptsOnlyConfigOption(t *testing.T) {
 
 func TestRunUsesDefaultConfigYAML(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "credentials.json"), []byte(`{"oauth_token":"default-config-token"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("credentials: credentials.json\nhost: evil.example\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeCredentialFile(t, filepath.Join(dir, "data", "credentials", "credentials.json"),
+		`{"oauth_token":"default-config-token"}`)
+	configPath := writeConfigInDir(t, dir, "host: evil.example\n")
 	oldWorkingDirectory, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -151,6 +187,9 @@ func TestRunUsesDefaultConfigYAML(t *testing.T) {
 	if err == nil || errors.Is(err, context.Canceled) {
 		t.Fatalf("默认 config.yaml 未读取其中的非法 host: %v", err)
 	}
+	if !strings.Contains(err.Error(), "host") && !strings.Contains(err.Error(), "域名") {
+		t.Fatalf("默认凭证路径未生效，错误不是非法 host: %v (config=%s)", err, configPath)
+	}
 	if strings.Contains(err.Error(), "未知子命令") || strings.Contains(strings.ToLower(err.Error()), "unknown command") {
 		t.Fatalf("默认配置路径未被解析: %v", err)
 	}
@@ -168,7 +207,133 @@ func TestConfigYAMLUsesDefaultsForOmittedSettings(t *testing.T) {
 	}
 }
 
+func TestLoadConfigUsesDefaultDataAndCredentialsPaths(t *testing.T) {
+	configDir := t.TempDir()
+	configPath := writeConfigInDir(t, configDir, "listen: 127.0.0.1:0\n")
+	dataPath := filepath.Join(configDir, "data")
+	writeCredentialFile(t, filepath.Join(dataPath, "credentials", "credentials.json"),
+		`{"oauth_token":"default-data-path-token"}`)
+
+	config, err := loadConfig(configPath)
+	if err != nil {
+		t.Fatalf("loadConfig() with default data_path credentials: %v", err)
+	}
+	if config.Token != "default-data-path-token" {
+		t.Fatalf("token loaded from default credentials = %q", config.Token)
+	}
+	assertResolvedDataAndLogPaths(t, config, dataPath, filepath.Join(configDir, "logs"))
+	if got := configIntField(t, config, "LogMaxSizeMB", "logMaxSizeMB"); got <= 0 {
+		t.Fatalf("default log_max_size_mb = %d, want a positive value", got)
+	}
+	if got := configIntField(t, config, "LogMaxBackups", "logMaxBackups"); got <= 0 {
+		t.Fatalf("default log_max_backups = %d, want a positive value", got)
+	}
+}
+
+func TestLoadConfigResolvesRelativeDataAndCredentialsPaths(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "config")
+	dataPath := filepath.Join(root, "state")
+	configPath := writeConfigInDir(t, configDir, "data_path: ../state\n")
+	writeCredentialFile(t, filepath.Join(dataPath, "credentials", "credentials.json"),
+		`{"oauth_token":"relative-data-path-token"}`)
+
+	config, err := loadConfig(configPath)
+	if err != nil {
+		t.Fatalf("loadConfig() with relative data_path: %v", err)
+	}
+	if config.Token != "relative-data-path-token" {
+		t.Fatalf("token loaded from relative data_path = %q", config.Token)
+	}
+	assertResolvedDataAndLogPaths(t, config, dataPath, filepath.Join(configDir, "logs"))
+}
+
+func TestLoadConfigResolvesRelativeCredentialsUnderDataPath(t *testing.T) {
+	configDir := t.TempDir()
+	configPath := writeConfigInDir(t, configDir, "data_path: state\ncredentials: work.json\n")
+	writeCredentialFile(t, filepath.Join(configDir, "state", "credentials", "work.json"),
+		`{"oauth_token":"relative-credentials-token"}`)
+
+	config, err := loadConfig(configPath)
+	if err != nil {
+		t.Fatalf("loadConfig() with relative credentials path: %v", err)
+	}
+	if config.Token != "relative-credentials-token" {
+		t.Fatalf("token loaded from relative credentials path = %q", config.Token)
+	}
+	assertResolvedDataAndLogPaths(t, config, filepath.Join(configDir, "state"), filepath.Join(configDir, "logs"))
+}
+
+func TestLoadConfigKeepsAbsoluteCredentialsOutsideDataPath(t *testing.T) {
+	credentialPath := testCredentialFile(t, `{"oauth_token":"absolute-credentials-token"}`)
+	configPath := writeConfigFile(t, fmt.Sprintf("data_path: local-state\ncredentials: %s\n",
+		strconv.Quote(credentialPath)))
+
+	config, err := loadConfig(configPath)
+	if err != nil {
+		t.Fatalf("loadConfig() with absolute credentials path: %v", err)
+	}
+	if config.Token != "absolute-credentials-token" {
+		t.Fatalf("token loaded from absolute credentials path = %q", config.Token)
+	}
+}
+
+func TestLogRotationConfigValuesAndValidation(t *testing.T) {
+	credentials := testCredentialFile(t, `{"oauth_token":"log-rotation-config-token"}`)
+	configPath := writeConfigFile(t, fmt.Sprintf(
+		"credentials: %s\nlog_max_size_mb: 1\nlog_max_backups: 2\n",
+		strconv.Quote(credentials)))
+	config, err := loadConfig(configPath)
+	if err != nil {
+		t.Fatalf("loadConfig() with log rotation settings: %v", err)
+	}
+	if got := configIntField(t, config, "LogMaxSizeMB", "logMaxSizeMB"); got != 1 {
+		t.Fatalf("log_max_size_mb = %d, want 1", got)
+	}
+	if got := configIntField(t, config, "LogMaxBackups", "logMaxBackups"); got != 2 {
+		t.Fatalf("log_max_backups = %d, want 2", got)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		fields string
+		field  string
+	}{
+		{name: "zero-size", fields: "log_max_size_mb: 0\n", field: "log_max_size_mb"},
+		{name: "negative-size", fields: "log_max_size_mb: -1\n", field: "log_max_size_mb"},
+		{name: "non-integer-size", fields: "log_max_size_mb: invalid\n", field: "log_max_size_mb"},
+		{name: "negative-backups", fields: "log_max_backups: -1\n", field: "log_max_backups"},
+		{name: "non-integer-backups", fields: "log_max_backups: invalid\n", field: "log_max_backups"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			invalidConfigPath := writeConfigFile(t, fmt.Sprintf("credentials: %s\n%s",
+				strconv.Quote(credentials), tc.fields))
+			_, err := loadConfig(invalidConfigPath)
+			if err == nil {
+				t.Fatalf("无效的 %s 未被拒绝", tc.field)
+			}
+			if !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(tc.field)) {
+				t.Fatalf("错误未指出无效字段 %s: %v", tc.field, err)
+			}
+		})
+	}
+}
+
+func assertResolvedDataAndLogPaths(t *testing.T, config appConfig, dataPath, logsPath string) {
+	t.Helper()
+	if got := configStringField(t, config, "DataPath", "dataPath"); got != dataPath {
+		t.Errorf("data_path = %q, want %q", got, dataPath)
+	}
+	if got := configStringField(t, config, "CacheDir", "CachePath", "cacheDir", "cachePath"); got != filepath.Join(dataPath, "cache") {
+		t.Errorf("cache root = %q, want %q", got, filepath.Join(dataPath, "cache"))
+	}
+	if got := configStringField(t, config, "LogsPath", "logsPath"); got != logsPath {
+		t.Errorf("logs_path = %q, want %q", got, logsPath)
+	}
+}
+
 func TestModelsCacheTTLConfig(t *testing.T) {
+	credentials := testCredentialFile(t, `{"oauth_token":"models-cache-config-token"}`)
 	for _, tc := range []struct {
 		name    string
 		value   string
@@ -183,7 +348,7 @@ func TestModelsCacheTTLConfig(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var contents strings.Builder
-			contents.WriteString("github_token: models-cache-config-token\n")
+			fmt.Fprintf(&contents, "credentials: %s\n", strconv.Quote(credentials))
 			if tc.value != "" {
 				fmt.Fprintf(&contents, "models_cache_ttl: %s\n", strconv.Quote(tc.value))
 			}
@@ -210,7 +375,9 @@ func TestRunWarnsWhenConfigPermissionsAreTooBroad(t *testing.T) {
 		t.Skip("Windows 不支持 Unix 配置文件权限检查")
 	}
 
-	configPath := writeConfigFile(t, "github_token: permission-warning-oauth-token\nlog_level: info\n")
+	credentials := testCredentialFile(t, `{"oauth_token":"permission-warning-oauth-token"}`)
+	configPath := writeConfigFile(t, fmt.Sprintf("credentials: %s\nlog_level: info\n",
+		strconv.Quote(credentials)))
 	if err := os.Chmod(configPath, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +427,7 @@ func TestRunWarnsWhenCredentialPermissionsAreTooBroad(t *testing.T) {
 		t.Fatalf("credentials file mode = %04o, want 0644", got)
 	}
 
-	configPath := writeConfigFile(t, appConfigYAML("127.0.0.1:0", credentialPath, "", "", "", "info"))
+	configPath := writeConfigFile(t, appConfigYAML("127.0.0.1:0", credentialPath, "", "", "info"))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var stdout, stderr bytes.Buffer
@@ -296,7 +463,7 @@ func TestRunLoadsYAMLServiceSettings(t *testing.T) {
 	}
 
 	const apiKey = "yaml-api-key-secret"
-	configPath := writeConfigFile(t, appConfigYAML(addr, credentials, "", "acme.ghe.com", apiKey, "info"))
+	configPath := writeConfigFile(t, appConfigYAML(addr, credentials, "acme.ghe.com", apiKey, "info"))
 	ctx, cancel := context.WithCancel(context.Background())
 	var stdout, stderr synchronizedBuffer
 	done := make(chan struct{})
@@ -383,16 +550,269 @@ func TestRunLoadsYAMLServiceSettings(t *testing.T) {
 	}
 }
 
-func TestRunLoadsEditorConfigFromYAML(t *testing.T) {
-	t.Setenv("GITHUB_TOKEN", "")
-	t.Setenv("GHC2API_API_KEY", "")
-	t.Setenv("COPILOT_HOST", "")
-	editorConfig := testEditorConfig(t)
-	configPath := writeConfigFile(t, appConfigYAML("127.0.0.1:0", "", editorConfig, "", "", "info"))
-	err := runWithCancelledContext([]string{"-c", configPath})
-	if err != nil && !errors.Is(err, context.Canceled) {
-		t.Fatalf("editor_config 未从 YAML 读取: %v", err)
+func TestLoadConfigRejectsLegacyCredentialFields(t *testing.T) {
+	credentials := testCredentialFile(t, `{"oauth_token":"legacy-field-probe-token"}`)
+	for _, tc := range []struct {
+		field string
+		value string
+	}{
+		{field: "github_token", value: "legacy-inline-token"},
+		{field: "editor_config", value: "legacy-editor-path"},
+	} {
+		t.Run(tc.field, func(t *testing.T) {
+			contents := fmt.Sprintf("credentials: %s\n%s: %s\n",
+				strconv.Quote(credentials), tc.field, strconv.Quote(tc.value))
+			configPath := writeConfigFile(t, contents)
+			_, err := loadConfig(configPath)
+			if err == nil {
+				t.Fatalf("旧凭证字段 %q 未被 KnownFields 拒绝", tc.field)
+			}
+			if !strings.Contains(err.Error(), tc.field) {
+				t.Fatalf("错误未指出不支持的字段 %q: %v", tc.field, err)
+			}
+		})
 	}
+}
+
+func TestRunWritesLogToDefaultAndRelativeLogsPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		config   string
+		logsPath string
+	}{
+		{name: "default", logsPath: "logs"},
+		{name: "relative", config: "logs_path: runtime-logs\n", logsPath: "runtime-logs"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			configDir := t.TempDir()
+			writeCredentialFile(t, filepath.Join(configDir, "data", "credentials", "credentials.json"),
+				`{"oauth_token":"log-path-token"}`)
+			configPath := writeConfigInDir(t, configDir, tc.config+"listen: 127.0.0.1:0\n")
+
+			err := runWithCancelledContext([]string{"-c", configPath})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("run with cancelled context = %v, want context.Canceled", err)
+			}
+
+			logsDir := filepath.Join(configDir, tc.logsPath)
+			logPath := filepath.Join(logsDir, "ghc2api.log")
+			dirInfo, err := os.Stat(logsDir)
+			if err != nil {
+				t.Fatalf("stat logs directory %q: %v", logsDir, err)
+			}
+			fileInfo, err := os.Stat(logPath)
+			if err != nil {
+				t.Fatalf("stat log file %q: %v", logPath, err)
+			}
+			if fileInfo.Size() == 0 {
+				t.Fatalf("log file %q is empty", logPath)
+			}
+			if runtime.GOOS != "windows" {
+				if got := dirInfo.Mode().Perm(); got != 0o700 {
+					t.Errorf("logs directory permissions = %04o, want 0700", got)
+				}
+				if got := fileInfo.Mode().Perm(); got != 0o600 {
+					t.Errorf("log file permissions = %04o, want 0600", got)
+				}
+			}
+		})
+	}
+}
+
+func TestRunRotatesLogsAndRetainsConfiguredBackups(t *testing.T) {
+	configPath, configDir := writeLongConfigFile(t, "log_max_size_mb: 1\nlog_max_backups: 2\n")
+	writeCredentialFile(t, filepath.Join(configDir, "data", "credentials", "credentials.json"),
+		`{"oauth_token":"log-rotation-token"}`)
+
+	args := []string{"-c", configPath}
+	for i := 0; i < 4000; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err := run(ctx, args, io.Discard, io.Discard)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("run %d with cancelled context = %v, want context.Canceled", i, err)
+		}
+	}
+
+	logsDir := filepath.Join(configDir, "logs")
+	entries, err := os.ReadDir(logsDir)
+	if err != nil {
+		t.Fatalf("read logs directory %q: %v", logsDir, err)
+	}
+	var backups []os.DirEntry
+	for _, entry := range entries {
+		if entry.Name() != "ghc2api.log" && strings.HasPrefix(entry.Name(), "ghc2api.log") {
+			backups = append(backups, entry)
+		}
+	}
+	if len(backups) != 2 {
+		t.Fatalf("retained log backups = %d, want 2; files=%v", len(backups), entries)
+	}
+	for _, backup := range backups {
+		info, err := backup.Info()
+		if err != nil {
+			t.Fatalf("stat log backup %q: %v", backup.Name(), err)
+		}
+		if info.Size() == 0 {
+			t.Errorf("log backup %q is empty", backup.Name())
+		}
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+			t.Errorf("log backup %q permissions = %04o, want 0600", backup.Name(), info.Mode().Perm())
+		}
+	}
+	currentInfo, err := os.Stat(filepath.Join(logsDir, "ghc2api.log"))
+	if err != nil {
+		t.Fatalf("stat current log file: %v", err)
+	}
+	if currentInfo.Size() > 1<<20 {
+		t.Errorf("current log file size = %d, want at most 1 MiB", currentInfo.Size())
+	}
+}
+
+func TestNewRotatingLogWriterCleansBackupsExceedingRetention(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		maxBackups  int
+		wantBackups int
+	}{
+		{name: "retain-one", maxBackups: 1, wantBackups: 1},
+		{name: "retain-none", maxBackups: 0, wantBackups: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logPath := filepath.Join(t.TempDir(), "ghc2api.log")
+			for index := 1; index <= 3; index++ {
+				backupPath := fmt.Sprintf("%s.%d", logPath, index)
+				if err := os.WriteFile(backupPath, []byte(fmt.Sprintf("backup-%d", index)), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			writer, err := newRotatingLogWriter(logPath, 64, tc.maxBackups)
+			if err != nil {
+				t.Fatalf("newRotatingLogWriter() error = %v", err)
+			}
+			t.Cleanup(func() { _ = writer.Close() })
+
+			for index := 1; index <= 3; index++ {
+				backupPath := fmt.Sprintf("%s.%d", logPath, index)
+				_, err := os.Stat(backupPath)
+				if index <= tc.wantBackups {
+					if err != nil {
+						t.Errorf("retained backup %q is missing: %v", backupPath, err)
+					}
+				} else if !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("backup %q should be removed at initialization; stat error = %v", backupPath, err)
+				}
+			}
+		})
+	}
+}
+
+func TestNewRotatingLogWriterTruncatesIncompleteTrailingJSONL(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "ghc2api.log")
+	completeRecord := []byte("{\"level\":\"INFO\",\"msg\":\"complete\"}\n")
+	truncatedRecord := []byte("{\"level\":\"INFO\",\"msg\":\"interrupted")
+	initialContents := append(append([]byte(nil), completeRecord...), truncatedRecord...)
+	if err := os.WriteFile(logPath, initialContents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	writer, err := newRotatingLogWriter(logPath, 1<<20, 1)
+	if err != nil {
+		t.Fatalf("newRotatingLogWriter() error = %v", err)
+	}
+	t.Cleanup(func() { _ = writer.Close() })
+
+	got, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read recovered log file: %v", err)
+	}
+	if !bytes.Equal(got, completeRecord) {
+		t.Fatalf("log after recovery = %q, want complete prefix %q", got, completeRecord)
+	}
+
+	nextRecord := []byte("{\"level\":\"INFO\",\"msg\":\"after-restart\"}\n")
+	if n, err := writer.Write(nextRecord); err != nil || n != len(nextRecord) {
+		t.Fatalf("Write() = %d, %v; want %d bytes and no error", n, err, len(nextRecord))
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close rotating log writer: %v", err)
+	}
+
+	got, err = os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log file after append: %v", err)
+	}
+	want := append(append([]byte(nil), completeRecord...), nextRecord...)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("log after append = %q, want %q", got, want)
+	}
+	for index, line := range bytes.Split(bytes.TrimSuffix(got, []byte{'\n'}), []byte{'\n'}) {
+		if !json.Valid(line) {
+			t.Errorf("JSONL record %d is invalid after recovery and append: %q", index, line)
+		}
+	}
+}
+
+func TestRotatingLogWriterKeepsOversizedSingleWriteWithinLimit(t *testing.T) {
+	const maxSize = 8
+	logPath := filepath.Join(t.TempDir(), "ghc2api.log")
+	writer, err := newRotatingLogWriter(logPath, maxSize, 1)
+	if err != nil {
+		t.Fatalf("newRotatingLogWriter() error = %v", err)
+	}
+	t.Cleanup(func() { _ = writer.Close() })
+
+	record := []byte("123456789")
+	n, writeErr := writer.Write(record)
+	if n < len(record) && writeErr == nil {
+		t.Fatalf("Write() = %d, nil; partial writes must return an error", n)
+	}
+
+	info, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatalf("stat active log file: %v", err)
+	}
+	if info.Size() > maxSize {
+		t.Fatalf("active log size = %d, want at most %d", info.Size(), maxSize)
+	}
+}
+
+func TestConfiguredLoggerWritesStderrWhenFileWriteFails(t *testing.T) {
+	stderr := &bytes.Buffer{}
+	logger, file, err := newConfiguredLogger(appConfig{
+		LogsPath: t.TempDir(), LogLevel: "info", LogMaxSizeMB: 1, LogMaxBackups: 1,
+	}, stderr)
+	if err != nil {
+		t.Fatalf("newConfiguredLogger() error = %v", err)
+	}
+	t.Cleanup(func() { _ = file.Close() })
+
+	// 关闭底层文件但保留 writer 状态，模拟日志文件在运行中写入失败。
+	if err := file.file.Close(); err != nil {
+		t.Fatalf("close underlying log file: %v", err)
+	}
+	logger.Info("stderr-fallback-probe")
+	if !strings.Contains(stderr.String(), "stderr-fallback-probe") {
+		t.Fatalf("stderr was not written after file failure: %s", stderr.String())
+	}
+}
+
+func writeLongConfigFile(t *testing.T, contents string) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	name := strings.Repeat("c", 160) + ".yaml"
+	for len(filepath.Join(dir, name)) < 820 {
+		next := filepath.Join(dir, strings.Repeat("d", 160))
+		if len(filepath.Join(next, name)) > 940 {
+			break
+		}
+		if err := os.Mkdir(next, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		dir = next
+	}
+	return writeConfigAt(t, dir, name, contents), dir
 }
 
 func TestRunAcceptsSupportedLogLevels(t *testing.T) {
@@ -402,7 +822,7 @@ func TestRunAcceptsSupportedLogLevels(t *testing.T) {
 	credentials := testCredentialFile(t, `{"oauth_token":"log-level-token"}`)
 	for _, level := range []string{"debug", "info", "warn", "error"} {
 		t.Run(level, func(t *testing.T) {
-			configPath := writeConfigFile(t, appConfigYAML("0.0.0.0:0", credentials, "", "", "test-api-key", level))
+			configPath := writeConfigFile(t, appConfigYAML("0.0.0.0:0", credentials, "", "test-api-key", level))
 			err := runWithCancelledContext([]string{"-c", configPath})
 			if err != nil && !errors.Is(err, context.Canceled) {
 				t.Fatalf("日志级别 %q 未被接受: %v", level, err)
@@ -421,11 +841,11 @@ func TestRunRejectsInvalidYAMLAndSettings(t *testing.T) {
 		config string
 	}{
 		{"malformed-yaml", "listen: [\n"},
-		{"invalid-log-level", appConfigYAML("127.0.0.1:0", credentials, "", "", "", "trace")},
-		{"invalid-host", appConfigYAML("127.0.0.1:0", credentials, "", "evil.example", "", "info")},
-		{"legacy-cli-token-mode", appConfigYAML("127.0.0.1:0", credentials, "", "", "", "info") + "token_mode: cli\n"},
-		{"invalid-listen-address", appConfigYAML("not-a-listener", credentials, "", "", "", "info")},
-		{"non-local-listen-requires-api-key", appConfigYAML("0.0.0.0:0", credentials, "", "", "", "info")},
+		{"invalid-log-level", appConfigYAML("127.0.0.1:0", credentials, "", "", "trace")},
+		{"invalid-host", appConfigYAML("127.0.0.1:0", credentials, "evil.example", "", "info")},
+		{"legacy-cli-token-mode", appConfigYAML("127.0.0.1:0", credentials, "", "", "info") + "token_mode: cli\n"},
+		{"invalid-listen-address", appConfigYAML("not-a-listener", credentials, "", "", "info")},
+		{"non-local-listen-requires-api-key", appConfigYAML("0.0.0.0:0", credentials, "", "", "info")},
 		{"missing-credential-source", "listen: 127.0.0.1:0\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

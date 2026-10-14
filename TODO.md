@@ -1,3 +1,3 @@
-- [x] getModels 里的模型缓存到内存和磁盘，以减少频繁的上游请求。缓存有效期默认 2 小时，可通过配置调整。
-- [x] getSession 里的会话缓存到内存和磁盘，以减少频繁的上游请求。缓存有效期按照 session 的实际过期时间。
-- [x] handleGeneration 里的 path 应该再和 model list 做一次校验，确保所选模型在该 path 下是可用的。
+- [x] 移除 github_token 和 editor_config 的配置及相关代码，只保留 credentials，不做旧配置兼容
+- [x] 添加 data_path 配置，默认 `./data`，credentials 和其他相关缓存数据都按类别放置到这里
+- [x] 添加 logs_path 配置，默认 `./logs`，所有日志文件都存放到该路径下，单文件大小和滚动策略可配置

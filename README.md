@@ -7,10 +7,12 @@
 ## 配置与启动
 
 需要 Go 1.23 或更新版本，以及有效的 GitHub Copilot OAuth 订阅。复制示例配置后，
-填写 `github_token`、`credentials` 或 `editor_config` 其中一种凭证来源：
+将 OAuth 凭证 JSON 放到配置文件目录下的 `data/credentials/credentials.json`，或在 `credentials` 中指定文件路径：
 
 ```sh
 cp config.example.yaml config.yaml
+mkdir -p data/credentials
+# 将凭证 JSON 写入 data/credentials/credentials.json。
 chmod 600 config.yaml
 # 编辑 config.yaml；真实凭证不要提交到版本库。
 make build
@@ -23,7 +25,11 @@ make build
 ```
 
 `config.yaml` 是唯一运行配置来源，不再通过命令行 flag 或环境变量覆盖服务设置。
-各字段的用途、默认值和安全要求见 [`config.example.yaml`](config.example.yaml) 中的中文说明。
+`data_path` 和 `logs_path` 的相对路径以配置文件所在目录为基准；默认分别为 `./data` 和 `./logs`。
+`credentials` 的相对路径位于 `<data_path>/credentials` 下，留空时使用
+`<data_path>/credentials/credentials.json`；也可显式指定绝对路径。
+缓存写入 `<data_path>/cache`，并按账号隔离。各字段的用途、默认值和安全要求见
+[`config.example.yaml`](config.example.yaml) 中的中文说明。
 服务只接受 GitHub OAuth token，并通过 OAuth 接口换取 Copilot session；不支持 Copilot CLI token。
 凭证 JSON 只允许 `oauth_token`、`host` 和 `user` 字段；若使用 `credentials` 文件，也应执行
 `chmod 600` 限制文件权限。
@@ -31,7 +37,10 @@ make build
 默认只监听 `127.0.0.1:8080`。监听非本机地址时，必须在配置中设置 `api_key`；
 公网部署还需要反向代理和 TLS。`api_key` 是本服务的客户端访问密钥，不是 GitHub token。
 
-日志以 JSON 格式写入标准错误，支持 `debug`、`info`、`warn`、`error` 四级。
+日志以 JSON 格式写入 `<logs_path>/ghc2api.log`，并同步输出到标准错误，支持
+`debug`、`info`、`warn`、`error` 四级。默认单文件上限为 10 MiB，最多保留 5 个滚动备份；
+可通过 `log_max_size_mb` 和 `log_max_backups` 调整（备份数设为 `0` 时不保留旧文件）。
+同一个 `logs_path` 只应由一个进程使用，避免多进程同时滚动日志。
 `debug` 会记录脱敏后的完整上游 API 请求和响应正文，适合排查问题，但会增加内存和日志占用；
 正文可能包含提示词、生成内容等业务数据，应限制日志访问并在排障后恢复为 `info`。
 认证头、凭证字段和已知 token 值会脱敏。
@@ -85,7 +94,9 @@ make test-race
 make vet
 ```
 
-缓存文件保存在系统用户缓存目录下的 `ghc2api` 子目录中。Unix 下目录和文件权限分别设为 `0700`、`0600`；Windows 使用缓存目录继承的默认 ACL，程序不显式修改 DACL。自定义缓存目录的调用方需自行确保其访问权限。
+缓存文件保存在 `<data_path>/cache`，凭证文件默认保存在 `<data_path>/credentials`。
+缓存目录和缓存文件权限分别设为 `0700`、`0600`；日志目录仅在新建时设为 `0700`，
+日志文件设为 `0600`。Windows 使用目录继承的默认 ACL，程序不显式修改 DACL。
 
 自动化测试使用本地模拟 GitHub/Copilot，不需要真实凭证。
 真实 GitHub 登录、订阅和各模型可用性需要使用自己的账号验证。

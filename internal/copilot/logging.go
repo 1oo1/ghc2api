@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // maxDebugBodySize 是回归测试使用的历史边界；debug 正文现在不设截断上限。
@@ -156,14 +157,7 @@ func (s *Service) doAPI(ctx context.Context, req *http.Request) (*http.Response,
 	s.log(ctx, slog.LevelInfo, "上游 API 请求开始", "method", req.Method, "url", safeURL)
 	if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
 		body, bodyErr := requestBodyForLog(req)
-		detail := map[string]any{
-			"method": req.Method, "url": safeURL, "headers": s.redactHeaders(req.Header),
-			"body": s.redactBody(body),
-		}
-		if bodyErr != nil {
-			detail["body_error"] = s.redactString(bodyErr.Error())
-		}
-		logger.DebugContext(ctx, "上游 API 请求详情", "request", detail)
+		s.logAPIRequestDetail(ctx, logger, req, safeURL, body, bodyErr)
 	}
 
 	started := time.Now()
@@ -239,6 +233,48 @@ func requestBodyForLog(req *http.Request) ([]byte, error) {
 	}
 	defer body.Close()
 	return io.ReadAll(body)
+}
+
+func (s *Service) logAPIRequestDetail(
+	ctx context.Context, logger *slog.Logger, req *http.Request, safeURL string, body []byte, bodyErr error,
+) {
+	safeBody := s.redactBody(body)
+	detail := map[string]any{
+		"method": req.Method, "url": safeURL, "headers": s.redactHeaders(req.Header),
+	}
+	if bodyErr != nil {
+		detail["body_error"] = s.redactString(bodyErr.Error())
+	}
+	if len(safeBody) <= debugLogChunkSize {
+		detail["body"] = safeBody
+		logger.DebugContext(ctx, "上游 API 请求详情", "request", detail)
+		return
+	}
+
+	detail["body_bytes"] = len(safeBody)
+	logger.DebugContext(ctx, "上游 API 请求详情", "request", detail)
+	for start, index := 0, 1; start < len(safeBody); index++ {
+		end := safeLogStringCut(safeBody, start, debugLogChunkSize)
+		chunk := safeBody[start:end]
+		logger.DebugContext(ctx, "上游 API 请求正文块",
+			"method", req.Method, "url", safeURL, "chunk_index", index,
+			"body", chunk, "body_bytes", len(chunk))
+		start = end
+	}
+}
+
+func safeLogStringCut(value string, start, limit int) int {
+	end := min(start+limit, len(value))
+	if end == len(value) {
+		return end
+	}
+	for end > start && !utf8.RuneStart(value[end]) {
+		end--
+	}
+	if end == start {
+		return min(start+limit, len(value))
+	}
+	return end
 }
 
 type debugResponseBody struct {
@@ -577,6 +613,18 @@ func (b *debugResponseBody) redactOversizedKnownSecretLocked(limit int) ([][]byt
 
 func (b *debugResponseBody) logBody(data []byte, complete bool) {
 	body := b.service.redactBody(data)
+	if len(body) > debugLogChunkSize {
+		for start, index := 0, 1; start < len(body); index++ {
+			end := safeLogStringCut(body, start, debugLogChunkSize)
+			chunk := body[start:end]
+			b.logger.DebugContext(b.ctx, "上游 API 响应正文块",
+				"method", b.method, "url", b.url, "status", b.status,
+				"chunk_index", index, "body", chunk, "body_bytes", len(chunk),
+				"body_complete", complete)
+			start = end
+		}
+		return
+	}
 	b.logger.DebugContext(b.ctx, "上游 API 响应正文", "method", b.method, "url", b.url,
 		"status", b.status, "body", body, "body_bytes", len(body), "body_complete", complete)
 }

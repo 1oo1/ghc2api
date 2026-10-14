@@ -607,6 +607,117 @@ func TestGenerationUpstreamFailureStatusesAreLoggedAtFailureLevel(t *testing.T) 
 	}
 }
 
+func TestDebugLogsCompleteLargeAPIRequestInBoundedEvents(t *testing.T) {
+	const endpoint = "/debug/request-body"
+	const tailMarker = "debug-request-body-tail-marker"
+	const maxLogEventSize = 1 << 20
+	requestBody := `{"payload":"` + strings.Repeat("x", 2<<20) + `","tail":"` + tailMarker + `"}`
+	if !json.Valid([]byte(requestBody)) {
+		t.Fatal("large request body is not valid JSON")
+	}
+
+	logs := &bytes.Buffer{}
+	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	client := &http.Client{Transport: testTransport(func(r *http.Request) (*http.Response, error) {
+		got, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		if !bytes.Equal(got, []byte(requestBody)) {
+			t.Errorf("transport received %d request bytes, want %d", len(got), len(requestBody))
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       http.NoBody,
+			Request:    r,
+		}, nil
+	})}
+	s := testService(t, Config{Token: "github-secret", Client: client, Logger: logger})
+
+	request, err := http.NewRequest(http.MethodPost,
+		"https://api.githubcopilot.com"+endpoint, strings.NewReader(requestBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := s.doAPI(context.Background(), request)
+	if err != nil {
+		t.Fatalf("doAPI() error = %v", err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Errorf("close upstream response body: %v", err)
+	}
+
+	type requestBodyEvent struct {
+		body     string
+		bodySize int64
+	}
+	type logFields struct {
+		URL       string `json:"url"`
+		Body      string `json:"body"`
+		BodyBytes int64  `json:"body_bytes"`
+		Request   struct {
+			URL       string `json:"url"`
+			Body      string `json:"body"`
+			BodyBytes int64  `json:"body_bytes"`
+		} `json:"request"`
+	}
+	var events []requestBodyEvent
+	for _, line := range bytes.Split(logs.Bytes(), []byte{'\n'}) {
+		if len(line) == 0 {
+			continue
+		}
+		var fields logFields
+		if err := json.Unmarshal(line, &fields); err != nil {
+			t.Fatalf("invalid JSON log entry: %v", err)
+		}
+		eventURL := fields.URL
+		if eventURL == "" {
+			eventURL = fields.Request.URL
+		}
+		if !strings.Contains(eventURL, endpoint) {
+			continue
+		}
+		body, bodySize := fields.Body, fields.BodyBytes
+		if body == "" {
+			body, bodySize = fields.Request.Body, fields.Request.BodyBytes
+		}
+		if body == "" {
+			continue
+		}
+		events = append(events, requestBodyEvent{body: body, bodySize: bodySize})
+		if len(line) >= maxLogEventSize {
+			t.Errorf("request body log event is %d bytes, want less than 1 MiB", len(line))
+		}
+		if len(body) >= maxLogEventSize {
+			t.Errorf("request body chunk is %d bytes, want less than 1 MiB", len(body))
+		}
+	}
+	if len(events) < 2 {
+		t.Fatalf("large request body should be split across multiple debug log events, got %d", len(events))
+	}
+
+	var loggedBody strings.Builder
+	var totalBytes int64
+	for _, event := range events {
+		totalBytes += event.bodySize
+		loggedBody.WriteString(event.body)
+		if event.bodySize != 0 && event.bodySize != int64(len(event.body)) {
+			t.Errorf("request body event reports %d bytes for a %d-byte chunk", event.bodySize, len(event.body))
+		}
+	}
+	if totalBytes != int64(len(requestBody)) {
+		t.Errorf("request body log chunks total %d bytes, want %d", totalBytes, len(requestBody))
+	}
+	if !strings.Contains(loggedBody.String(), tailMarker) {
+		t.Errorf("reassembled request body is missing tail marker %q", tailMarker)
+	}
+	if loggedBody.String() != requestBody {
+		t.Errorf("reassembled request body differs from all %d input bytes", len(requestBody))
+	}
+}
+
 func TestDebugLogsCompleteLargeAPIResponse(t *testing.T) {
 	logs := captureJSONSlog(t, slog.LevelDebug)
 	const firstMarker = "debug-response-first-marker"
@@ -815,6 +926,96 @@ func TestDebugLogsCompleteOversizedMetadataResponse(t *testing.T) {
 	}
 	if loggedBody.String() != responseBody {
 		t.Fatalf("debug metadata response chunks do not contain all %d bytes", len(responseBody))
+	}
+}
+
+func TestDebugLogsCompleteLargeBufferedMetadataResponseInBoundedEvents(t *testing.T) {
+	const endpoint = "/models"
+	const tailMarker = "buffered-metadata-tail-marker"
+	const maxLogEventSize = 1 << 20
+	responseBody := `{"data":[{"id":"` + strings.Repeat("m", 2<<20) +
+		`"}],"tail":"` + tailMarker + `"}`
+	if !json.Valid([]byte(responseBody)) {
+		t.Fatal("large metadata response is not valid JSON")
+	}
+
+	logs := &bytes.Buffer{}
+	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	client := &http.Client{Transport: testTransport(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != endpoint {
+			return nil, fmt.Errorf("unexpected upstream path %q", r.URL.Path)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(responseBody)),
+			Request:    r,
+		}, nil
+	})}
+	s := testService(t, Config{Token: "github-secret", Client: client, Logger: logger})
+
+	request, err := http.NewRequest(http.MethodGet, "https://api.githubcopilot.com"+endpoint, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := s.doAPI(context.Background(), request)
+	if err != nil {
+		t.Fatalf("doAPI() error = %v", err)
+	}
+	got, readErr := io.ReadAll(response.Body)
+	closeErr := response.Body.Close()
+	if readErr != nil {
+		t.Fatalf("read complete metadata response: %v", readErr)
+	}
+	if closeErr != nil {
+		t.Fatalf("close metadata response: %v", closeErr)
+	}
+	if !bytes.Equal(got, []byte(responseBody)) {
+		t.Fatalf("metadata response was not fully consumed: got %d bytes, want %d", len(got), len(responseBody))
+	}
+
+	events := debugBodyLogEvents(t, logs.Bytes(), endpoint)
+	if len(events) < 2 {
+		t.Errorf("large buffered metadata body should be split across debug log events, got %d", len(events))
+	}
+	for _, event := range events {
+		if event.BodyBytes >= maxLogEventSize {
+			t.Errorf("metadata body event contains %d bytes, want less than 1 MiB", event.BodyBytes)
+		}
+		if len(event.Body) >= maxLogEventSize {
+			t.Errorf("metadata body chunk is %d bytes, want less than 1 MiB", len(event.Body))
+		}
+	}
+	for _, line := range bytes.Split(logs.Bytes(), []byte{'\n'}) {
+		if len(line) == 0 {
+			continue
+		}
+		var fields struct {
+			URL       string `json:"url"`
+			BodyBytes int64  `json:"body_bytes"`
+		}
+		if err := json.Unmarshal(line, &fields); err != nil {
+			t.Fatalf("invalid JSON log entry: %v", err)
+		}
+		if strings.Contains(fields.URL, endpoint) && fields.BodyBytes > 0 && len(line) >= maxLogEventSize {
+			t.Errorf("metadata JSONL event is %d bytes, want less than 1 MiB", len(line))
+		}
+	}
+
+	var loggedBody strings.Builder
+	var totalBytes int64
+	for _, event := range events {
+		totalBytes += event.BodyBytes
+		loggedBody.WriteString(event.Body)
+	}
+	if totalBytes != int64(len(responseBody)) {
+		t.Errorf("metadata body log chunks total %d bytes, want %d", totalBytes, len(responseBody))
+	}
+	if !strings.Contains(loggedBody.String(), tailMarker) {
+		t.Errorf("reassembled metadata body is missing tail marker %q", tailMarker)
+	}
+	if loggedBody.String() != responseBody {
+		t.Errorf("reassembled metadata body differs from all %d response bytes", len(responseBody))
 	}
 }
 

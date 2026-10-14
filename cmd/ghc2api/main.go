@@ -28,7 +28,7 @@ func main() {
 	}
 }
 
-func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+func run(ctx context.Context, args []string, stdout, stderr io.Writer) (runErr error) {
 	configPath, err := configPath(args)
 	if err != nil {
 		return err
@@ -37,10 +37,15 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	logger, err := newLogger(config.LogLevel, stderr)
+	logger, logFile, err := newConfiguredLogger(config, stderr)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if err := logFile.Close(); err != nil && runErr == nil {
+			runErr = fmt.Errorf("关闭日志文件失败: %w", err)
+		}
+	}()
 	logger.InfoContext(ctx, "配置加载完成", "config_file", configPath, "log_level", config.LogLevel)
 	if config.insecurePermissions {
 		logger.WarnContext(ctx, "配置文件权限过宽，建议执行 chmod 600", "config_file", configPath,
@@ -70,7 +75,7 @@ func serve(ctx context.Context, config appConfig, logger *slog.Logger) error {
 	}
 	service, err := copilot.New(copilot.Config{
 		Token: config.Token, Host: config.Host, APIKey: config.APIKey,
-		ModelsCacheTTL: config.ModelsCacheTTL, Logger: logger,
+		CacheDir: config.CacheDir, ModelsCacheTTL: config.ModelsCacheTTL, Logger: logger,
 	})
 	if err != nil {
 		return err
