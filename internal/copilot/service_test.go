@@ -1054,6 +1054,63 @@ func TestInfoLogsRequestStagesWithoutDebugBodies(t *testing.T) {
 	}
 }
 
+// clientHeaderSecret 是服务访问密钥，同时放在 Authorization 与 X-Api-Key 中，供请求头日志测试使用。
+const clientHeaderSecret = "local-header-secret"
+
+// sendClientHeaderRequest 发送带普通头与敏感头的请求。路径未注册且密钥正确，因此不访问上游，
+// 返回 404 表示鉴权已通过。
+func sendClientHeaderRequest(h http.Handler) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(http.MethodGet, "/no-such-route", nil)
+	r.Header.Set("User-Agent", "test-agent")
+	r.Header.Set("X-Custom", "hello")
+	r.Header.Set("Authorization", "Bearer "+clientHeaderSecret)
+	r.Header.Set("X-Api-Key", clientHeaderSecret)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	return w
+}
+
+// assertClientRequestHeadersLogged 检查"收到客户端请求"日志的 headers 字段：普通头原样记录，
+// 敏感头的值为单元素列表 ["[REDACTED]"]，且访问密钥原文不出现在任何日志中。
+func assertClientRequestHeadersLogged(t *testing.T, output []byte) {
+	t.Helper()
+	var headers map[string]any
+	for _, entry := range jsonLogEntries(t, output) {
+		if entry["msg"] == "收到客户端请求" {
+			headers, _ = entry["headers"].(map[string]any)
+			break
+		}
+	}
+	if headers == nil {
+		t.Fatalf("收到客户端请求的日志缺少 headers 对象: %s", output)
+	}
+	want := map[string]any{
+		"User-Agent":    []any{"test-agent"},
+		"X-Custom":      []any{"hello"},
+		"Authorization": []any{"[REDACTED]"},
+		"X-Api-Key":     []any{"[REDACTED]"},
+	}
+	for name, value := range want {
+		if got := headers[name]; !reflect.DeepEqual(got, value) {
+			t.Errorf("headers[%q] = %v, want %v", name, got, value)
+		}
+	}
+	if strings.Contains(string(output), clientHeaderSecret) {
+		t.Errorf("日志包含访问密钥原文: %s", output)
+	}
+}
+
+// TestServiceLogsClientRequestHeadersWithSensitiveRedacted 单账号 Service 的"收到客户端请求"日志应记录请求头，
+// 其中 Authorization 与 X-Api-Key 必须脱敏。
+func TestServiceLogsClientRequestHeadersWithSensitiveRedacted(t *testing.T) {
+	logs := captureJSONSlog(t, slog.LevelInfo)
+	s := testService(t, Config{Token: "github-secret", APIKey: clientHeaderSecret})
+	if w := sendClientHeaderRequest(s.Handler()); w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", w.Code, w.Body.String())
+	}
+	assertClientRequestHeadersLogged(t, logs.Bytes())
+}
+
 func TestTermsAcceptedBeforeGenerationAndFailureDoesNotBlock(t *testing.T) {
 	for _, policyStatus := range []int{200, 403} {
 		t.Run(fmt.Sprint(policyStatus), func(t *testing.T) {

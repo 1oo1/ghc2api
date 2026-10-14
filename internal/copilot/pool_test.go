@@ -761,6 +761,21 @@ func TestPoolLogsRedactAccountTokensFromRequestPath(t *testing.T) {
 	}
 }
 
+// TestPoolLogsClientRequestHeadersWithSensitiveRedacted Pool 的"收到客户端请求"日志与单账号 Service 一致，
+// 同样记录请求头并对 Authorization、X-Api-Key 脱敏。
+func TestPoolLogsClientRequestHeadersWithSensitiveRedacted(t *testing.T) {
+	logs := captureJSONSlog(t, slog.LevelInfo)
+	configs := poolConfigs(t, newPoolUpstream(t).client(), "oauth-a", "oauth-b")
+	for i := range configs {
+		configs[i].APIKey = clientHeaderSecret
+	}
+	p := testPool(t, configs)
+	if w := sendClientHeaderRequest(p.Handler()); w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", w.Code, w.Body.String())
+	}
+	assertClientRequestHeadersLogged(t, logs.Bytes())
+}
+
 // setupCooledAccountB 通过 HTTP 请求让账号 B 因生成请求 429 进入冷却，并把轮询游标停在 A 上：
 // 请求 1 轮到 A 并成功，请求 2 轮到 B 并收到 429，请求 3 轮到 C 并成功。随后恢复 B 的生成结果，
 // 之后的请求从 A 开始，依次经过 A、（冷却的）B、C。

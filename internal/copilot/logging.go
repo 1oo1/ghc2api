@@ -47,11 +47,27 @@ func withRequestLog(logger *slog.Logger, seq *atomic.Uint64, logf logFunc, next 
 		r = r.WithContext(ctx)
 		writer := &statusResponseWriter{ResponseWriter: w, status: http.StatusOK}
 		started := time.Now()
-		logf(ctx, slog.LevelInfo, "收到客户端请求", "method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
+		logf(ctx, slog.LevelInfo, "收到客户端请求", "method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr,
+			"headers", clientHeadersForLog(r.Header))
 		next.ServeHTTP(writer, r)
 		logf(ctx, slog.LevelInfo, "客户端请求处理完成", "method", r.Method, "path", r.URL.Path,
 			"status", writer.status, "duration_ms", time.Since(started).Milliseconds())
 	})
+}
+
+// clientHeadersForLog 把客户端请求头转为日志字段：敏感头（鉴权、密钥、cookie 等）整体替换为 [REDACTED]，
+// 其余值原样保留，交由 logFunc 统一做已知密钥与 Bearer/token 文本脱敏。
+// 返回 map[string]any 是为了让 redactLogValue 能递归处理其中的 []string。
+func clientHeadersForLog(headers http.Header) map[string]any {
+	fields := make(map[string]any, len(headers))
+	for name, values := range headers {
+		if isSensitiveName(name) {
+			fields[name] = []string{"[REDACTED]"}
+			continue
+		}
+		fields[name] = append([]string(nil), values...)
+	}
+	return fields
 }
 
 type statusResponseWriter struct {
