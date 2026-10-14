@@ -1,5 +1,6 @@
 /ghc2api
 /.local/
+/config.yaml
 /credentials.json
 /credentials.json.*
 /.env

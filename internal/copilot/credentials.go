@@ -1,8 +1,10 @@
 package copilot
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,19 +16,18 @@ type Credential struct {
 	Token string `json:"oauth_token"`
 	Host  string `json:"host,omitempty"`
 	User  string `json:"user,omitempty"`
-	Mode  string `json:"token_mode,omitempty"`
 }
 
 func validateCredential(c Credential) (Credential, error) {
-	config, err := New(Config{Token: c.Token, TokenMode: c.Mode, Host: c.Host})
+	config, err := New(Config{Token: c.Token, Host: c.Host})
 	if err != nil {
 		return Credential{}, err
 	}
-	c.Token, c.Host, c.Mode = config.config.Token, config.config.Host, config.config.TokenMode
+	c.Token, c.Host = config.config.Token, config.config.Host
 	return c, nil
 }
 
-// LoadCredential 拒绝缺少 token、非法 host 或非法模式的文件。
+// LoadCredential 拒绝缺少 token、非法 host 或含有不支持字段的文件。
 func LoadCredential(path string) (Credential, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -38,8 +39,14 @@ func LoadCredential(path string) (Credential, error) {
 		return Credential{}, err
 	}
 	var c Credential
-	if json.Unmarshal(raw, &c) != nil {
-		return Credential{}, errors.New("凭证文件不是有效 JSON")
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&c); err != nil {
+		return Credential{}, errors.New("凭证文件不是有效的 OAuth JSON")
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return Credential{}, errors.New("凭证文件只能包含一个 JSON 对象")
 	}
 	return validateCredential(c)
 }
@@ -110,7 +117,7 @@ func DiscoverEditor(configDir string) (Credential, error) {
 				continue
 			}
 			c := apps[key]
-			c.Host, c.Mode = normalized, "oauth"
+			c.Host = normalized
 			c, err = validateCredential(c)
 			if err != nil {
 				continue

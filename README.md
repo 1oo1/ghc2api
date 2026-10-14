@@ -1,42 +1,40 @@
 # ghc2api
 
-从 magpie 的 GitHub Copilot provider 提取的独立 Go HTTP 服务，仅依赖标准库。
+从 magpie 的 GitHub Copilot provider 提取的独立 Go HTTP 服务，配置解析使用 `yaml.v3`。
 当前实现以 magpie 上游提交 `250bdd5c` 为对照基线；源码定位与后续同步流程见
 [`docs/magpie-copilot-sync.md`](docs/magpie-copilot-sync.md)。
 
-## 启动
+## 配置与启动
 
-需要 Go 1.23 或更新版本，以及有效的 GitHub Copilot 订阅。
-
-```sh
-go build -o ghc2api ./cmd/ghc2api
-
-# 使用 GitHub device flow 登录；凭证写入当前目录，权限为 0600。
-./ghc2api login --credentials ./credentials.json
-
-# 默认只监听 127.0.0.1:8080。
-GHC2API_API_KEY='自行设置的服务访问密钥' ./ghc2api serve --credentials ./credentials.json
-```
-
-也可以直接配置 token，不进行 device flow：
+需要 Go 1.23 或更新版本，以及有效的 GitHub Copilot OAuth 订阅。复制示例配置后，
+填写 `github_token`、`credentials` 或 `editor_config` 其中一种凭证来源：
 
 ```sh
-GITHUB_TOKEN='GitHub OAuth token' GHC2API_API_KEY='服务访问密钥' ./ghc2api serve
+cp config.example.yaml config.yaml
+chmod 600 config.yaml
+# 编辑 config.yaml；真实凭证不要提交到版本库。
+make build
 
-# Copilot CLI 的 token 必须直接使用，不能交换 session。
-GITHUB_TOKEN='Copilot CLI token' COPILOT_TOKEN_MODE=cli ./ghc2api serve
+# 默认读取当前目录的 config.yaml。
+./bin/ghc2api
 
-# 显式从编辑器的 apps.json / hosts.json 导入；不修改原文件。
-./ghc2api serve --editor-config "$HOME/.config"
+# 启动参数只支持 -c 指定配置文件。
+./bin/ghc2api -c /path/to/config.yaml
 ```
 
-企业账号可增加 `--host acme.ghe.com`，或设置 `COPILOT_HOST`。
-只有 `github.com` 和单层 `<name>.ghe.com` 域名可用于登录。
-CLI token 的系统钥匙串读取不在本服务内，请显式提供 token。
+`config.yaml` 是唯一运行配置来源，不再通过命令行 flag 或环境变量覆盖服务设置。
+各字段的用途、默认值和安全要求见 [`config.example.yaml`](config.example.yaml) 中的中文说明。
+服务只接受 GitHub OAuth token，并通过 OAuth 接口换取 Copilot session；不支持 Copilot CLI token。
+凭证 JSON 只允许 `oauth_token`、`host` 和 `user` 字段；若使用 `credentials` 文件，也应执行
+`chmod 600` 限制文件权限。
 
-配置优先级：显式环境 token、凭证文件、显式指定的编辑器配置目录。
-不要把真实 token 写入命令行参数、提交到版本库或放入日志。
-监听非本机地址时必须设置 `GHC2API_API_KEY`；公网部署还需要反向代理和 TLS。
+默认只监听 `127.0.0.1:8080`。监听非本机地址时，必须在配置中设置 `api_key`；
+公网部署还需要反向代理和 TLS。`api_key` 是本服务的客户端访问密钥，不是 GitHub token。
+
+日志以 JSON 格式写入标准错误，支持 `debug`、`info`、`warn`、`error` 四级。
+`debug` 会记录脱敏后的完整上游 API 请求和响应正文，适合排查问题，但会增加内存和日志占用；
+正文可能包含提示词、生成内容等业务数据，应限制日志访问并在排障后恢复为 `info`。
+认证头、凭证字段和已知 token 值会脱敏。
 
 ## HTTP 接口
 
@@ -67,8 +65,8 @@ Anthropic 客户端 base URL 为 `http://127.0.0.1:8080`。
 
 ## 行为与边界
 
-- OAuth token 换取短期 session，剩余有效期超过 2 分钟时复用；CLI token 直接使用，端点信息缓存 30 分钟。
-- 使用 magpie 的 VS Code/Copilot CLI 身份头和 API 版本，按最后一条输入区分用户与工具轮次，并识别图片请求。
+- OAuth token 换取短期 session，剩余有效期超过 2 分钟时复用。
+- 使用 magpie 的 VS Code Copilot Chat 身份头和 API 版本，按最后一条输入区分用户与工具轮次，并识别图片请求。
 - 模型列表缓存 5 分钟；过滤内部和不可使用的模型，首次使用有条款的模型时尝试接受。
 - `auto` 优先请求 `/auto`，再尝试 `/models/session`；若均不可用则选择账号可手动使用的模型。Auto 缓存最多 1 小时，拒绝后最多进行 3 次生成尝试。
 - 上游的 HTTP 状态、生成响应和 SSE 原样转发；请求取消会传递给上游。生成请求体最大 16 MiB。
@@ -78,12 +76,13 @@ Anthropic 客户端 base URL 为 `http://127.0.0.1:8080`。
 - 不自动尝试其他账号，也不在普通生成请求失败后重新计费重试；仅 Auto 的明确模型/session 拒绝会触发有限重选。
 - 不转发客户端的认证信息、Cookie 和逐跳头；拒绝重定向以及不在 GitHub/Copilot 白名单内的 session API 地址。
 
-## 验证
+## Makefile 与验证
 
 ```sh
-go test -race ./...
-go vet ./...
-go build ./cmd/ghc2api
+make build
+make test
+make test-race
+make vet
 ```
 
 自动化测试使用本地模拟 GitHub/Copilot，不需要真实凭证。

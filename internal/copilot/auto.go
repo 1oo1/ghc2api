@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -43,7 +44,7 @@ func (s *Service) autoRequest(ctx context.Context, current session, path, versio
 		return autoWire{}, err
 	}
 	req.Header.Set("X-GitHub-Api-Version", version)
-	res, err := s.client.Do(req)
+	res, err := s.doAPI(ctx, req)
 	if err != nil {
 		return autoWire{}, err
 	}
@@ -59,6 +60,7 @@ func (s *Service) autoRequest(ctx context.Context, current session, path, versio
 	if json.Unmarshal(data, &wire) != nil || wire.Token == "" {
 		return autoWire{}, errors.New("Copilot Auto 未返回有效的 session")
 	}
+	s.addSecret(wire.Token)
 	return wire, nil
 }
 
@@ -74,6 +76,7 @@ func (s *Service) holdAuto(wire autoWire, model string) autoSession {
 }
 
 func (s *Service) resolveAuto(ctx context.Context, current session, prompt string) (autoSession, error) {
+	s.log(ctx, slog.LevelDebug, "检查 Auto session 缓存")
 	if err := s.autoMu.lock(ctx); err != nil {
 		return autoSession{}, err
 	}
@@ -82,6 +85,7 @@ func (s *Service) resolveAuto(ctx context.Context, current session, prompt strin
 	cached := s.auto
 	s.autoState.Unlock()
 	if cached.Model != "" && time.Until(time.Unix(cached.ExpiresAt, 0)) > 2*time.Minute && !s.isRefused(cached.Model) {
+		s.log(ctx, slog.LevelInfo, "复用缓存的 Auto 模型", "model", cached.Model, "expires_at", cached.ExpiresAt)
 		return cached, nil
 	}
 	body, _ := json.Marshal(map[string]string{"prompt": prompt, "tier": "balance"})
@@ -89,6 +93,7 @@ func (s *Service) resolveAuto(ctx context.Context, current session, prompt strin
 	if err == nil {
 		if model := selectedModel(wire.Selected); model != "" {
 			if !s.isRefused(model) {
+				s.log(ctx, slog.LevelInfo, "Copilot Auto 选择模型", "model", model)
 				return s.holdAuto(wire, model), nil
 			}
 			// 新 Auto 已经明确选出被拒模型，不再用旧会话重复同一个选择。
@@ -123,6 +128,7 @@ func (s *Service) resolveAuto(ctx context.Context, current session, prompt strin
 			}
 		}
 		if model != "" {
+			s.log(ctx, slog.LevelInfo, "Copilot Auto 兼容接口选择模型", "model", model)
 			return s.holdAuto(wire, model), nil
 		}
 	} else {
@@ -137,6 +143,7 @@ func (s *Service) resolveAuto(ctx context.Context, current session, prompt strin
 
 // 调用方持有 autoMu；手选 fallback 不发送 Copilot-Session-Token。
 func (s *Service) manualFallback(ctx context.Context, current session) (autoSession, error) {
+	s.log(ctx, slog.LevelWarn, "Auto 接口不可用，尝试选择手动模型")
 	list, err := s.getModels(ctx, current)
 	if err != nil {
 		return autoSession{}, err
@@ -147,6 +154,7 @@ func (s *Service) manualFallback(ctx context.Context, current session) (autoSess
 			s.auto = autoSession{Model: id, ExpiresAt: time.Now().Add(10 * time.Minute).Unix()}
 			pick := s.auto
 			s.autoState.Unlock()
+			s.log(ctx, slog.LevelInfo, "Auto 已回退到手动模型", "model", id)
 			return pick, nil
 		}
 	}

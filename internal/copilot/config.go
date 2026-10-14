@@ -2,6 +2,7 @@ package copilot
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -11,11 +12,11 @@ import (
 
 // Config 配置单个 Copilot 账号；APIKey 是本服务密钥，不是 GitHub token。
 type Config struct {
-	Token     string
-	TokenMode string
-	Host      string
-	APIKey    string
-	Client    *http.Client
+	Token  string
+	Host   string
+	APIKey string
+	Client *http.Client
+	Logger *slog.Logger
 }
 
 var enterpriseLabel = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)

@@ -3,6 +3,7 @@ package copilot
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -46,12 +47,15 @@ func (s *Service) getModels(ctx context.Context, current session) (modelList, er
 	}
 	defer s.modelsMu.unlock()
 	if !s.models.At.IsZero() && time.Since(s.models.At) < 5*time.Minute {
+		s.log(ctx, slog.LevelDebug, "复用缓存的 Copilot 模型列表", "model_count", len(s.models.Data))
 		return s.models, nil
 	}
+	s.log(ctx, slog.LevelInfo, "开始刷新 Copilot 模型列表")
 	var wire struct {
 		Data []json.RawMessage `json:"data"`
 	}
 	if err := s.fetchJSON(ctx, current, http.MethodGet, "/models", nil, &wire); err != nil {
+		s.log(ctx, slog.LevelWarn, "刷新 Copilot 模型列表失败", "error", s.redactString(err.Error()))
 		return modelList{}, err
 	}
 	list := modelList{Data: []json.RawMessage{}, Known: map[string]bool{}, Waiting: map[string]bool{}, At: time.Now()}
@@ -96,18 +100,20 @@ func (s *Service) getModels(ctx context.Context, current session) (modelList, er
 	}
 	sort.SliceStable(list.Picks, func(i, j int) bool { return rank[list.Picks[i]] < rank[list.Picks[j]] })
 	s.models = list
+	s.log(ctx, slog.LevelInfo, "Copilot 模型列表刷新完成", "visible_count", len(list.Data), "selectable_count", len(list.Picks))
 	return list, nil
 }
 
 func (s *Service) handleModels(w http.ResponseWriter, r *http.Request) {
+	s.log(r.Context(), slog.LevelInfo, "开始查询 Copilot 模型列表")
 	current, err := s.getSession(r.Context())
 	if err != nil {
-		handleError(w, err)
+		s.handleError(r.Context(), w, err)
 		return
 	}
 	list, err := s.getModels(r.Context(), current)
 	if err != nil {
-		handleError(w, err)
+		s.handleError(r.Context(), w, err)
 		return
 	}
 	data := make([]json.RawMessage, 0, len(list.Data)+1)
@@ -120,6 +126,7 @@ func (s *Service) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 	data = append(data, json.RawMessage(`{"id":"auto","name":"Auto","object":"model","owned_by":"github-copilot"}`))
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+	s.log(r.Context(), slog.LevelInfo, "Copilot 模型列表已返回", "visible_count", len(data))
 }
 
 func (s *Service) acceptTerms(ctx context.Context, current session, model string) {
@@ -130,9 +137,13 @@ func (s *Service) acceptTerms(ctx context.Context, current session, model string
 	if !s.models.Waiting[model] {
 		return
 	}
+	s.log(ctx, slog.LevelInfo, "开始接受模型使用条款", "model", model)
 	if s.fetchJSON(ctx, current, http.MethodPost, "/models/"+url.PathEscape(model)+"/policy",
 		[]byte(`{"state":"enabled"}`), nil) == nil {
 		delete(s.models.Waiting, model)
+		s.log(ctx, slog.LevelInfo, "模型使用条款已接受", "model", model)
+	} else {
+		s.log(ctx, slog.LevelWarn, "接受模型使用条款失败", "model", model)
 	}
 }
 

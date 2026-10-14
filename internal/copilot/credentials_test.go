@@ -33,7 +33,7 @@ func TestNormalizeHost(t *testing.T) {
 func TestCredentialSaveLoadAndPrivatePermissions(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nested", "credential.json")
-	want := Credential{Token: "oauth-secret", Host: "acme.ghe.com", User: "alice", Mode: "oauth"}
+	want := Credential{Token: "oauth-secret", Host: "acme.ghe.com", User: "alice"}
 	if err := SaveCredential(path, want); err != nil {
 		t.Fatal(err)
 	}
@@ -53,8 +53,14 @@ func TestCredentialSaveLoadAndPrivatePermissions(t *testing.T) {
 	if err := json.Unmarshal(bytes, &raw); err != nil {
 		t.Fatal(err)
 	}
-	if raw["oauth_token"] != "oauth-secret" || raw["token_mode"] != "oauth" || raw["host"] != "acme.ghe.com" || raw["user"] != "alice" {
+	if raw["oauth_token"] != "oauth-secret" || raw["host"] != "acme.ghe.com" || raw["user"] != "alice" {
 		t.Fatalf("credential JSON fields = %v", raw)
+	}
+	if _, ok := raw["token_mode"]; ok {
+		t.Fatalf("credential JSON still stores token_mode: %v", raw)
+	}
+	if _, ok := reflect.TypeOf(Credential{}).FieldByName("Mode"); ok {
+		t.Fatal("Credential must not expose a token mode")
 	}
 	// 覆盖已有的宽松权限文件时也必须收紧，不能把 token 留成全局可读。
 	if err := os.Chmod(path, 0o644); err != nil {
@@ -71,7 +77,13 @@ func TestCredentialSaveLoadAndPrivatePermissions(t *testing.T) {
 }
 
 func TestCredentialsRejectInvalidInput(t *testing.T) {
-	for _, raw := range []string{`broken-json`, `{}`, `{"oauth_token":""}`, `{"oauth_token":"t","host":"evil.example"}`, `{"oauth_token":"t","token_mode":"invalid"}`} {
+	for _, raw := range []string{
+		`broken-json`,
+		`{}`,
+		`{"oauth_token":""}`,
+		`{"oauth_token":"t","host":"evil.example"}`,
+		`{"oauth_token":"t","token_mode":"cli"}`,
+	} {
 		t.Run(raw, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "credential.json")
 			if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
@@ -82,7 +94,7 @@ func TestCredentialsRejectInvalidInput(t *testing.T) {
 			}
 		})
 	}
-	for _, c := range []Credential{{}, {Token: "t", Host: "evil.example"}, {Token: "t", Mode: "invalid"}} {
+	for _, c := range []Credential{{}, {Token: "t", Host: "evil.example"}} {
 		if err := SaveCredential(filepath.Join(t.TempDir(), "credential.json"), c); err == nil {
 			t.Fatalf("SaveCredential(%+v) should reject", c)
 		}

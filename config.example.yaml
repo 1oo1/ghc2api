@@ -1,0 +1,27 @@
+# HTTP 监听地址；省略或留空时使用 127.0.0.1:8080。
+listen: "127.0.0.1:8080"
+
+# GitHub OAuth token。若为空，则依次使用 credentials 或 editor_config。
+# 请勿填写 Copilot CLI token；服务只支持 OAuth token 换取 Copilot session。
+github_token: ""
+
+# 可选的凭证 JSON 文件路径，相对路径以本配置文件所在目录为基准。
+# 格式示例：{"oauth_token":"...","host":"acme.ghe.com","user":"alice"}
+# 使用该文件时也请将其权限设为 0600（chmod 600）。
+credentials: ""
+
+# 可选的 VS Code/Copilot 编辑器配置目录，目录中应包含 github-copilot/apps.json
+# 或 hosts.json。credentials 有值时优先使用 credentials。
+editor_config: ""
+
+# 可选的 GitHub Enterprise Cloud 登录域名；留空时使用凭证中的 host 或 github.com。
+host: ""
+
+# 本服务的访问密钥，不是 GitHub token。非本机监听地址必须设置。
+api_key: ""
+
+# 日志级别：debug、info、warn 或 error。debug 会记录脱敏后的完整上游 API 正文，
+# 会增加内存和日志占用；日志中也可能包含提示词和生成内容等业务数据。
+log_level: "info"
+
+# 配置文件含有凭证时请将实际 config.yaml 权限设为 0600（chmod 600）。

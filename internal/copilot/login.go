@@ -159,7 +159,7 @@ func finishLogin(ctx context.Context, client *http.Client, host, path, token str
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := SaveCredential(path, Credential{Token: token, User: user.Login, Host: host, Mode: "oauth"}); err != nil {
+	if err := SaveCredential(path, Credential{Token: token, User: user.Login, Host: host}); err != nil {
 		return err
 	}
 	_, err := fmt.Fprintf(out, "账号 %s 登录成功，凭证已写入 %s\n", user.Login, path)

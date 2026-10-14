@@ -91,7 +91,7 @@ func TestLoginDeviceFlowSavesValidatedCredential(t *testing.T) {
 				t.Fatal(err)
 			}
 			c, err := LoadCredential(path)
-			if err != nil || c.Token != "new-oauth-secret" || c.User != "alice" || c.Host != host || (c.Mode != "" && c.Mode != "oauth") {
+			if err != nil || c.Token != "new-oauth-secret" || c.User != "alice" || c.Host != host {
 				t.Fatalf("saved credential = %+v, %v", c, err)
 			}
 			if !strings.Contains(output.String(), "ABCD-EFGH") || !strings.Contains(output.String(), "/login/device") || strings.Contains(output.String(), "new-oauth-secret") {

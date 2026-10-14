@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,6 +24,11 @@ const maxMetadataBody = 4 << 20
 type Service struct {
 	config Config
 	client *http.Client
+	logger *slog.Logger
+
+	requestSeq atomic.Uint64
+	secretsMu  sync.RWMutex
+	secrets    map[string]struct{}
 
 	sessionMu contextMutex
 	session   session
@@ -38,23 +45,24 @@ type Service struct {
 func New(config Config) (*Service, error) {
 	config.Token = strings.TrimSpace(config.Token)
 	if config.Token == "" {
-		return nil, errors.New("缺少 GitHub/Copilot token，请先登录或配置 GITHUB_TOKEN")
-	}
-	if config.TokenMode == "" {
-		config.TokenMode = "oauth"
-	}
-	if config.TokenMode != "oauth" && config.TokenMode != "cli" {
-		return nil, errors.New("token 模式必须是 oauth 或 cli")
+		return nil, errors.New("缺少 GitHub OAuth token")
 	}
 	host, err := NormalizeHost(config.Host)
 	if err != nil {
 		return nil, err
 	}
 	config.Host = host
-	return &Service{
+	if config.Logger == nil {
+		config.Logger = slog.Default()
+	}
+	service := &Service{
 		config: config, client: safeClient(config.Client), refused: make(map[string]time.Time),
+		logger: config.Logger, secrets: make(map[string]struct{}),
 		sessionMu: make(contextMutex, 1), modelsMu: make(contextMutex, 1), autoMu: make(contextMutex, 1),
-	}, nil
+	}
+	service.addSecret(config.Token)
+	service.addSecret(config.APIKey)
+	return service, nil
 }
 
 // Handler 返回原协议 HTTP 接口，不在三种生成协议之间转换。
@@ -77,13 +85,15 @@ func (s *Service) Handler() http.Handler {
 			s.handleGeneration(w, r, upstream)
 		})
 	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/healthz" && s.config.APIKey != "" && !s.authorized(r) {
+			s.log(r.Context(), slog.LevelWarn, "客户端鉴权失败", "method", r.Method, "path", r.URL.Path)
 			writeError(w, http.StatusUnauthorized, "服务访问密钥无效或缺失")
 			return
 		}
 		mux.ServeHTTP(w, r)
 	})
+	return s.logRequests(handler)
 }
 
 func (s *Service) authorized(r *http.Request) bool {
@@ -121,14 +131,20 @@ func (e *upstreamError) Error() string {
 	return fmt.Sprintf("上游请求失败（HTTP %d）", e.status)
 }
 
-func handleError(w http.ResponseWriter, err error) {
+func (s *Service) handleError(ctx context.Context, w http.ResponseWriter, err error) {
 	var upstream *upstreamError
 	if errors.As(err, &upstream) && upstream.status >= 400 {
+		level := slog.LevelWarn
+		if upstream.status >= http.StatusInternalServerError {
+			level = slog.LevelError
+		}
+		s.log(ctx, level, "Copilot API 返回错误状态", "status", upstream.status)
 		copyResponseHeaders(w.Header(), upstream.header)
 		w.WriteHeader(upstream.status)
 		_, _ = w.Write(upstream.body)
 		return
 	}
+	s.log(ctx, slog.LevelError, "请求处理失败", "error", s.redactString(err.Error()))
 	writeError(w, http.StatusBadGateway, err.Error())
 }
 
@@ -162,7 +178,7 @@ func (s *Service) fetchJSON(ctx context.Context, session session, method, path s
 	if err != nil {
 		return err
 	}
-	res, err := s.client.Do(req)
+	res, err := s.doAPI(ctx, req)
 	if err != nil {
 		return errors.New("Copilot 网络请求失败: " + err.Error())
 	}
@@ -186,20 +202,23 @@ func (s *Service) fetchJSON(ctx context.Context, session session, method, path s
 func (s *Service) handleUsage(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
+	s.log(ctx, slog.LevelInfo, "开始查询 Copilot 用量")
 	res, err := s.githubRequest(ctx, "/copilot_internal/user", true)
 	if err != nil {
-		handleError(w, err)
+		s.handleError(ctx, w, err)
 		return
 	}
 	defer res.Body.Close()
 	data, err := readLimited(res.Body, maxMetadataBody)
 	if err != nil {
-		handleError(w, err)
+		s.handleError(ctx, w, err)
 		return
 	}
 	copyResponseHeaders(w.Header(), res.Header)
 	w.WriteHeader(res.StatusCode)
 	_, _ = w.Write(data)
+	s.log(ctx, apiStatusLogLevel(res.StatusCode), "Copilot 用量响应已返回",
+		"status", res.StatusCode, "bytes", len(data))
 }
 
 func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path string) {
@@ -207,8 +226,10 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
+			s.log(r.Context(), slog.LevelWarn, "生成请求体超过大小限制", "limit_bytes", maxRequestBody)
 			writeError(w, http.StatusRequestEntityTooLarge, "请求体超过 16 MiB")
 		} else {
+			s.log(r.Context(), slog.LevelWarn, "读取生成请求体失败", "error", err)
 			writeError(w, http.StatusBadRequest, "无法读取请求体")
 		}
 		return
@@ -217,34 +238,40 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 	var model string
 	if json.Unmarshal(body, &request) != nil || request == nil ||
 		json.Unmarshal(request["model"], &model) != nil || strings.TrimSpace(model) == "" {
+		s.log(r.Context(), slog.LevelWarn, "生成请求 JSON 或 model 字段无效", "bytes", len(body))
 		writeError(w, http.StatusBadRequest, "请求必须是 JSON 对象，并包含非空字符串 model")
 		return
 	}
 	isAuto := model == "auto"
+	s.log(r.Context(), slog.LevelInfo, "开始处理生成请求", "model", model, "upstream_path", path, "request_bytes", len(body))
 	for attempt := 0; attempt < 3; attempt++ {
 		current, err := s.getSession(r.Context())
 		if err != nil {
-			handleError(w, err)
+			s.handleError(r.Context(), w, err)
 			return
 		}
 		// 模型列表失败不妨碍手选模型，真正的生成错误仍由上游返回。
-		_, _ = s.getModels(r.Context(), current)
+		if _, err := s.getModels(r.Context(), current); err != nil {
+			s.log(r.Context(), slog.LevelWarn, "读取模型列表失败，继续尝试指定模型", "error", s.redactString(err.Error()))
+		}
 		outBody := body
 		var pick autoSession
 		if isAuto {
+			s.log(r.Context(), slog.LevelInfo, "开始解析 Auto 模型", "attempt", attempt+1)
 			pick, err = s.resolveAuto(r.Context(), current, promptFrom(body))
 			if err != nil {
-				handleError(w, err)
+				s.handleError(r.Context(), w, err)
 				return
 			}
 			model = pick.Model
+			s.log(r.Context(), slog.LevelInfo, "Auto 模型已解析", "model", model)
 			request["model"], _ = json.Marshal(model)
 			outBody, _ = json.Marshal(request)
 		}
 		s.acceptTerms(r.Context(), current, model)
 		req, err := s.apiRequest(r.Context(), current, http.MethodPost, path, outBody)
 		if err != nil {
-			handleError(w, err)
+			s.handleError(r.Context(), w, err)
 			return
 		}
 		req.URL.RawQuery = r.URL.RawQuery
@@ -259,9 +286,9 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 		if pick.Token != "" {
 			req.Header.Set("Copilot-Session-Token", pick.Token)
 		}
-		res, err := s.client.Do(req)
+		res, err := s.doAPI(r.Context(), req)
 		if err != nil {
-			handleError(w, errors.New("Copilot 生成请求失败: "+err.Error()))
+			s.handleError(r.Context(), w, errors.New("Copilot 生成请求失败: "+err.Error()))
 			return
 		}
 		// 只在任何响应尚未发给客户端时重试明确的 Auto 拒绝。
@@ -269,7 +296,7 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 			data, readErr := readLimited(res.Body, maxMetadataBody)
 			_ = res.Body.Close()
 			if readErr != nil {
-				handleError(w, readErr)
+				s.handleError(r.Context(), w, readErr)
 				return
 			}
 			refusal := modelRefusal(data)
@@ -278,6 +305,7 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 				s.refuse(model)
 			}
 			if isAuto && (refusal || sessionGone) {
+				s.log(r.Context(), slog.LevelWarn, "Auto 上游拒绝当前模型", "model", model, "attempt", attempt+1, "retry", attempt < 2)
 				s.dropAuto(pick)
 				if attempt < 2 {
 					continue
@@ -286,8 +314,11 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 			copyResponseHeaders(w.Header(), res.Header)
 			w.WriteHeader(res.StatusCode)
 			_, _ = w.Write(data)
+			s.log(r.Context(), slog.LevelWarn, "生成请求返回客户端错误", "status", res.StatusCode, "model", model)
 			return
 		}
+		s.log(r.Context(), apiStatusLogLevel(res.StatusCode), "生成响应开始返回客户端",
+			"status", res.StatusCode, "model", model)
 		streamResponse(w, res)
 		return
 	}

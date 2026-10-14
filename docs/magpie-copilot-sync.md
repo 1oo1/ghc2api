@@ -69,7 +69,7 @@ git -C .local/magpie log --oneline --all --regexp-ignore-case --grep='copilot'
 
 - `internal/provider/account.go`：Copilot provider 接入、session 交换、请求头、模型和条款处理。
 - `internal/provider/copilot_signin.go`、`internal/provider/copilot_accounts.go`：OAuth 登录与 magpie 的 Copilot 账号管理。
-- `internal/provider/copilot_cli.go`：CLI token；编辑器凭证发现也需沿 `internal/provider/account.go` 查找。
+- 编辑器凭证发现也需沿 `internal/provider/account.go` 查找；本项目仅同步 OAuth token 流程。
 - `internal/provider/copilot_ghe.go`：GitHub Enterprise Cloud 主机行为。
 - `internal/provider/copilot_auto.go`、`internal/provider/copilot_refused.go`、`internal/provider/copilot_lapsed.go`：Auto 选择、拒绝后的处理和失效状态。
 - `internal/provider/copilot_*_test.go`、`internal/provider/account_test.go`、
@@ -84,8 +84,8 @@ git -C .local/magpie log --oneline --all --regexp-ignore-case --grep='copilot'
 
 | 本项目 | 重点核对的上游职责 |
 | --- | --- |
-| `internal/copilot/login.go`、`credentials.go` | `internal/provider/copilot_signin.go`、`copilot_accounts.go`、`account.go`、`copilot_cli.go` 中的登录和凭证行为 |
-| `internal/copilot/config.go`、`session.go` | `internal/provider/account.go`、`copilot_ghe.go`、`copilot_cli.go` 中的主机、token/session 和身份头行为 |
+| `internal/copilot/login.go`、`credentials.go` | `internal/provider/copilot_signin.go`、`copilot_accounts.go`、`account.go` 中的 OAuth 登录和凭证行为 |
+| `internal/copilot/config.go`、`session.go` | `internal/provider/account.go`、`copilot_ghe.go` 中的主机、OAuth session 和身份头行为 |
 | `internal/copilot/models.go`、`auto.go` | `internal/provider/account.go`、`copilot_auto.go` 及相关模型数据和测试 |
 | `internal/copilot/service.go`、`request.go` | provider 请求签名与 `internal/gateway/` 的转发、协议和流式行为 |
 
@@ -98,7 +98,7 @@ provider 代理范围；不要整文件复制，也不要为追求代码结构�
 调整测试，再实现必要的改动；优先使用本地模拟服务验证，不使用真实账号/token 做自动化测试。
 至少核对：
 
-- OAuth token 换取 session、有效期与刷新，以及 CLI token 是否应直接使用。
+- OAuth token 换取 session、有效期与刷新。
 - session 返回的 API 主机、企业域名校验和重定向/请求头安全边界。
 - 模型列表元数据、协议端点、模型条款和账号权限差异。
 - Auto/session 的 API 版本、模型选择、缓存、拒绝后的有限重试与手动 fallback。

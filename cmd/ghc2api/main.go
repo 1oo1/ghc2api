@@ -3,10 +3,10 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -22,141 +22,86 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx, os.Args[1:], os.Stdout, os.Stderr); err != nil {
-		fmt.Fprintln(os.Stderr, "错误:", err)
+		logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+		logger.Error("程序退出", "error", err)
 		os.Exit(1)
 	}
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	if len(args) == 0 {
-		args = []string{"serve"}
-	}
-	switch args[0] {
-	case "help", "--help", "-h":
-		_, err := fmt.Fprintln(stdout, "用法：ghc2api serve [选项] | ghc2api login [选项]\n使用子命令 --help 查看选项。")
+	configPath, err := configPath(args)
+	if err != nil {
 		return err
-	case "login":
-		flags := flag.NewFlagSet("login", flag.ContinueOnError)
-		flags.SetOutput(stderr)
-		host := flags.String("host", os.Getenv("COPILOT_HOST"), "GitHub 或 <name>.ghe.com 登录域名")
-		path := flags.String("credentials", "credentials.json", "保存登录凭证的文件")
-		if err := flags.Parse(args[1:]); err != nil {
-			if errors.Is(err, flag.ErrHelp) {
-				return nil
-			}
-			return err
-		}
-		if flags.NArg() != 0 {
-			return errors.New("login 不接受额外的位置参数")
-		}
-		return copilot.Login(ctx, *host, *path, nil, stdout)
-	case "serve":
-		return serve(ctx, args[1:], stdout, stderr)
+	}
+	config, err := loadConfig(configPath)
+	if err != nil {
+		return err
+	}
+	logger, err := newLogger(config.LogLevel, stderr)
+	if err != nil {
+		return err
+	}
+	logger.InfoContext(ctx, "配置加载完成", "config_file", configPath, "log_level", config.LogLevel)
+	if config.insecurePermissions {
+		logger.WarnContext(ctx, "配置文件权限过宽，建议执行 chmod 600", "config_file", configPath,
+			"mode", fmt.Sprintf("%04o", config.configMode))
+	}
+	if config.insecureCredential {
+		logger.WarnContext(ctx, "凭证文件权限过宽，建议执行 chmod 600", "credential_file", config.credentialFile,
+			"mode", fmt.Sprintf("%04o", config.credentialMode))
+	}
+	return serve(ctx, config, logger)
+}
+
+func configPath(args []string) (string, error) {
+	switch {
+	case len(args) == 0:
+		return "config.yaml", nil
+	case len(args) == 2 && args[0] == "-c" && strings.TrimSpace(args[1]) != "":
+		return args[1], nil
 	default:
-		return errors.New("未知子命令，请使用 serve、login 或 help")
+		return "", errors.New("启动参数仅支持 -c <配置文件>；未指定时默认读取 config.yaml")
 	}
 }
 
-func loadConfig(credentialsPath, editorConfig, host, mode string) (copilot.Config, error) {
-	c := copilot.Credential{Token: strings.TrimSpace(os.Getenv("GITHUB_TOKEN"))}
-	if c.Token == "" {
-		var err error
-		switch {
-		case credentialsPath != "":
-			c, err = copilot.LoadCredential(credentialsPath)
-		case editorConfig != "":
-			c, err = copilot.DiscoverEditor(editorConfig)
-		default:
-			return copilot.Config{}, errors.New("未配置 token，请先执行 login 或设置 GITHUB_TOKEN")
-		}
-		if err != nil {
-			return copilot.Config{}, err
-		}
-	}
-	if host != "" {
-		c.Host = host
-	}
-	if mode != "" {
-		c.Mode = mode
-	}
-	normalized, err := copilot.NormalizeHost(c.Host)
-	if err != nil {
-		return copilot.Config{}, err
-	}
-	config := copilot.Config{Token: c.Token, Host: normalized, TokenMode: c.Mode, APIKey: strings.TrimSpace(os.Getenv("GHC2API_API_KEY"))}
-	if _, err := copilot.New(config); err != nil {
-		return copilot.Config{}, err
-	}
-	return config, nil
-}
-
-func serve(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	addr := flags.String("listen", "127.0.0.1:8080", "HTTP 监听地址，非本机地址必须配置 GHC2API_API_KEY")
-	path := flags.String("credentials", "", "凭证文件，未指定时尝试 ./credentials.json")
-	editor := flags.String("editor-config", "", "包含 github-copilot 目录的编辑器配置目录（只读）")
-	host := flags.String("host", os.Getenv("COPILOT_HOST"), "覆盖凭证中的 GitHub 登录域名")
-	mode := flags.String("token-mode", os.Getenv("COPILOT_TOKEN_MODE"), "token 模式：oauth 或 cli")
-	if err := flags.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return nil
-		}
-		return err
-	}
-	if flags.NArg() != 0 {
-		return errors.New("serve 不接受额外的位置参数")
-	}
-	if *path == "" {
-		if _, err := os.Stat("credentials.json"); err == nil {
-			*path = "credentials.json"
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("无法读取默认凭证文件: %w", err)
-		}
-	}
-	config, err := loadConfig(*path, *editor, *host, *mode)
-	if err != nil {
-		return err
-	}
-	listenHost, _, err := net.SplitHostPort(*addr)
-	if err != nil {
-		return err
-	}
-	ip := net.ParseIP(listenHost)
-	local := (ip != nil && ip.IsLoopback()) || listenHost == "localhost"
-	if !local && config.APIKey == "" {
-		return errors.New("非本机监听地址必须配置 GHC2API_API_KEY 服务访问密钥")
-	}
+func serve(ctx context.Context, config appConfig, logger *slog.Logger) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	service, err := copilot.New(config)
+	service, err := copilot.New(copilot.Config{
+		Token: config.Token, Host: config.Host, APIKey: config.APIKey, Logger: logger,
+	})
 	if err != nil {
 		return err
 	}
-	listener, err := net.Listen("tcp", *addr)
+	listener, err := net.Listen("tcp", config.Listen)
 	if err != nil {
-		return err
+		return fmt.Errorf("无法监听 %s: %w", config.Listen, err)
 	}
 	defer listener.Close()
-	if tcp, ok := listener.Addr().(*net.TCPAddr); config.APIKey == "" && (!ok || !tcp.IP.IsLoopback()) {
-		return errors.New("实际监听地址不是本机地址，必须配置 GHC2API_API_KEY")
-	}
+
 	server := &http.Server{
 		Handler: service.Handler(), ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout: 30 * time.Second, IdleTimeout: time.Minute,
-		ErrorLog: log.New(stderr, "HTTP 服务: ", log.LstdFlags),
+		ErrorLog: log.New(slogWriter{logger: logger}, "", 0),
 		BaseContext: func(net.Listener) context.Context {
 			return ctx
 		},
 	}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
-	_, _ = fmt.Fprintf(stdout, "Copilot HTTP 服务监听 http://%s\n", listener.Addr())
+	logger.InfoContext(ctx, "HTTP 服务开始监听", "addr", listener.Addr().String())
 	select {
 	case err := <-done:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		if err != nil {
+			logger.ErrorContext(ctx, "HTTP 服务异常退出", "error", err)
+		}
 		return err
 	case <-ctx.Done():
+		logger.Info("收到退出信号，正在关闭 HTTP 服务")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		err := server.Shutdown(shutdownCtx)
@@ -164,6 +109,19 @@ func serve(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			_ = server.Close()
 		}
 		<-done
+		logger.Info("HTTP 服务已关闭")
 		return err
 	}
+}
+
+type slogWriter struct {
+	logger *slog.Logger
+}
+
+func (w slogWriter) Write(p []byte) (int, error) {
+	message := strings.TrimSpace(string(p))
+	if message != "" {
+		w.logger.Error("HTTP 服务内部错误", "message", message)
+	}
+	return len(p), nil
 }

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -65,6 +66,48 @@ func testService(t *testing.T, config Config) *Service {
 	return s
 }
 
+func captureSlog(t *testing.T, level slog.Level) *bytes.Buffer {
+	t.Helper()
+	previous := slog.Default()
+	output := &bytes.Buffer{}
+	slog.SetDefault(slog.New(slog.NewTextHandler(output, &slog.HandlerOptions{Level: level})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return output
+}
+
+func captureJSONSlog(t *testing.T, level slog.Level) *bytes.Buffer {
+	t.Helper()
+	previous := slog.Default()
+	output := &bytes.Buffer{}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(output, &slog.HandlerOptions{Level: level})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return output
+}
+
+type debugBodyLogEvent struct {
+	URL       string `json:"url"`
+	Body      string `json:"body"`
+	BodyBytes int64  `json:"body_bytes"`
+}
+
+func debugBodyLogEvents(t *testing.T, output []byte, endpoint string) []debugBodyLogEvent {
+	t.Helper()
+	var events []debugBodyLogEvent
+	for _, line := range bytes.Split(output, []byte{'\n'}) {
+		if len(line) == 0 {
+			continue
+		}
+		var event debugBodyLogEvent
+		if err := json.Unmarshal(line, &event); err != nil {
+			t.Fatalf("invalid JSON log entry: %v", err)
+		}
+		if strings.Contains(event.URL, endpoint) && event.BodyBytes > 0 {
+			events = append(events, event)
+		}
+	}
+	return events
+}
+
 func testRequest(s *Service, method, path, body string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, path, strings.NewReader(body))
 	r.Header.Set("Content-Type", "application/json")
@@ -75,18 +118,24 @@ func testRequest(s *Service, method, path, body string) *httptest.ResponseRecord
 
 func TestNewRejectsInvalidConfiguration(t *testing.T) {
 	for _, config := range []Config{
-		{}, {Token: "  "}, {Token: "token", TokenMode: "unknown"},
+		{}, {Token: "  "},
 		{Token: "token", Host: "evil.example"},
 		{Token: "token", Host: "github.com:443"},
 		{Token: "token", Host: "https://user" + "@" + "github.com"},
 		{Token: "token", Host: "https://github.com/path"},
 		{Token: "token", Host: "api.acme.ghe.com"},
 	} {
-		t.Run(fmt.Sprintf("%s_%s_%s", config.Token, config.TokenMode, config.Host), func(t *testing.T) {
+		t.Run(fmt.Sprintf("%s_%s", config.Token, config.Host), func(t *testing.T) {
 			if _, err := New(config); err == nil {
 				t.Fatalf("New(%+v) must reject invalid configuration", config)
 			}
 		})
+	}
+}
+
+func TestConfigDoesNotExposeTokenMode(t *testing.T) {
+	if _, ok := reflect.TypeOf(Config{}).FieldByName("TokenMode"); ok {
+		t.Fatal("Config must not expose token_mode")
 	}
 }
 
@@ -301,6 +350,415 @@ func TestInitiatorAndStructuredVision(t *testing.T) {
 	}
 }
 
+func TestDebugLogsRequestStagesAndRedactsSecrets(t *testing.T) {
+	logs := captureSlog(t, slog.LevelDebug)
+	var events []string
+	client := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		events = append(events, r.URL.Path)
+		switch r.URL.Path {
+		case "/copilot_internal/v2/token":
+			if r.Header.Get("Authorization") != "token github-oauth-secret" {
+				t.Errorf("OAuth exchange authorization = %q", r.Header.Get("Authorization"))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"token":"copilot-session-secret","expires_at":%d,"endpoints":{"api":"https://api.githubcopilot.com"}}`,
+				time.Now().Add(time.Hour).Unix())
+		case "/models":
+			_, _ = io.WriteString(w, testModels)
+		case "/auto":
+			testJSON(w, map[string]any{
+				"session_token":  "copilot-auto-session-secret",
+				"selected_model": "gpt-4.1",
+				"expires_at":     time.Now().Add(time.Hour).Unix(),
+			})
+		case "/chat/completions":
+			if r.Header.Get("Authorization") != "Bearer copilot-session-secret" {
+				t.Errorf("generation authorization = %q", r.Header.Get("Authorization"))
+			}
+			if r.Header.Get("Copilot-Session-Token") != "copilot-auto-session-secret" {
+				t.Errorf("Auto session header = %q", r.Header.Get("Copilot-Session-Token"))
+			}
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Error(err)
+			}
+			if !strings.Contains(string(body), "upstream-request-marker") {
+				t.Errorf("generation request body = %s", body)
+			}
+			_, _ = io.WriteString(w, `{"result":"upstream-response-marker"}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	s := testService(t, Config{
+		Token:  "github-oauth-secret",
+		APIKey: "service-api-key-secret",
+		Client: client,
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"auto","messages":[{"role":"user","content":"upstream-request-marker"}]}`))
+	request.Header.Set("Authorization", "Bearer service-api-key-secret")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, request)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "upstream-response-marker") {
+		t.Fatalf("generation response = %d %s", w.Code, w.Body.String())
+	}
+
+	wantEvents := []string{"/copilot_internal/v2/token", "/models", "/auto", "/chat/completions"}
+	if !reflect.DeepEqual(events, wantEvents) {
+		t.Fatalf("upstream stages = %v, want %v", events, wantEvents)
+	}
+	logOutput := logs.String()
+	for _, stage := range []string{
+		"/v1/chat/completions",
+		"/copilot_internal/v2/token",
+		"/models",
+		"/auto",
+		"/chat/completions",
+	} {
+		if !strings.Contains(logOutput, stage) {
+			t.Errorf("request stage %q missing from logs: %s", stage, logOutput)
+		}
+	}
+	for _, marker := range []string{"upstream-request-marker", "upstream-response-marker"} {
+		if !strings.Contains(logOutput, marker) {
+			t.Errorf("debug API body marker %q missing from logs: %s", marker, logOutput)
+		}
+	}
+	for _, secret := range []string{
+		"github-oauth-secret",
+		"copilot-session-secret",
+		"copilot-auto-session-secret",
+		"service-api-key-secret",
+	} {
+		if strings.Contains(logOutput, secret) {
+			t.Errorf("sensitive value %q leaked into logs: %s", secret, logOutput)
+		}
+	}
+}
+
+func TestGenerationLogsRedactModelMatchingOAuthToken(t *testing.T) {
+	logs := captureSlog(t, slog.LevelDebug)
+	const oauthToken = "oauth-model-token-secret"
+	s := testService(t, Config{
+		Token: oauthToken,
+		Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/copilot_internal/v2/token":
+				testSession(w, "https://api.githubcopilot.com", time.Now().Add(time.Hour))
+			case "/models":
+				_, _ = io.WriteString(w, testModels)
+			case "/chat/completions":
+				_, _ = io.WriteString(w, `{"ok":true}`)
+			default:
+				t.Errorf("unexpected path %s", r.URL.Path)
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+		}),
+	})
+
+	w := testRequest(s, http.MethodPost, "/v1/chat/completions",
+		`{"model":"oauth-model-token-secret","messages":[{"role":"user","content":"hello"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("generation response = %d %s", w.Code, w.Body.String())
+	}
+	if logOutput := logs.String(); strings.Contains(logOutput, oauthToken) {
+		t.Fatalf("OAuth token leaked through the client model field: %s", logOutput)
+	}
+}
+
+func TestGenerationUpstreamFailureStatusesAreLoggedAtFailureLevel(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		level  string
+	}{
+		{http.StatusTooManyRequests, "WARN"},
+		{http.StatusInternalServerError, "ERROR"},
+	} {
+		t.Run(fmt.Sprint(tc.status), func(t *testing.T) {
+			logs := captureSlog(t, slog.LevelDebug)
+			body := fmt.Sprintf(`{"error":"upstream status %d"}`, tc.status)
+			s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/copilot_internal/v2/token":
+					testSession(w, "https://api.githubcopilot.com", time.Now().Add(time.Hour))
+				case "/models":
+					_, _ = io.WriteString(w, testModels)
+				case "/chat/completions":
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(tc.status)
+					_, _ = io.WriteString(w, body)
+				default:
+					t.Errorf("unexpected path %s", r.URL.Path)
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			})})
+
+			w := testRequest(s, http.MethodPost, "/v1/chat/completions",
+				`{"model":"gpt-4.1","messages":[{"role":"user","content":"hello"}]}`)
+			if w.Code != tc.status || w.Body.String() != body {
+				t.Fatalf("upstream response = %d %s, want %d %s", w.Code, w.Body.String(), tc.status, body)
+			}
+
+			wantLevel := "level=" + tc.level
+			wantStatus := fmt.Sprintf("status=%d", tc.status)
+			for _, line := range strings.Split(logs.String(), "\n") {
+				if strings.Contains(line, wantLevel) && strings.Contains(line, wantStatus) {
+					return
+				}
+			}
+			t.Fatalf("no %s log event recorded for upstream HTTP %d", tc.level, tc.status)
+		})
+	}
+}
+
+func TestDebugLogsCompleteLargeAPIResponse(t *testing.T) {
+	logs := captureJSONSlog(t, slog.LevelDebug)
+	const firstMarker = "debug-response-first-marker"
+	const middleMarker = "debug-response-middle-marker"
+	const tailMarker = "debug-response-tail-marker"
+	responseLength := maxDebugBodySize + 1
+	middleOffset := responseLength/2 + 137
+	responseBody := firstMarker +
+		strings.Repeat("x", middleOffset-len(firstMarker)) +
+		middleMarker +
+		strings.Repeat("x", responseLength-middleOffset-len(middleMarker)) +
+		tailMarker
+	s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/copilot_internal/v2/token":
+			testSession(w, "https://api.githubcopilot.com", time.Now().Add(time.Hour))
+		case "/models":
+			_, _ = io.WriteString(w, testModels)
+		case "/chat/completions":
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = io.WriteString(w, responseBody)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})})
+
+	w := testRequest(s, http.MethodPost, "/v1/chat/completions",
+		`{"model":"gpt-4.1","messages":[{"role":"user","content":"hello"}]}`)
+	if w.Code != http.StatusOK || w.Body.String() != responseBody {
+		t.Fatalf("large upstream response was not fully proxied: status=%d bytes=%d", w.Code, w.Body.Len())
+	}
+
+	events := debugBodyLogEvents(t, logs.Bytes(), "/chat/completions")
+	if len(events) < 2 {
+		t.Fatalf("large response should be represented by multiple debug log chunks, got %d", len(events))
+	}
+	var totalBytes int64
+	var loggedBody strings.Builder
+	for _, event := range events {
+		totalBytes += event.BodyBytes
+		loggedBody.WriteString(event.Body)
+	}
+	if totalBytes != int64(len(responseBody)) {
+		t.Fatalf("debug response chunks total %d bytes, want %d", totalBytes, len(responseBody))
+	}
+	for _, marker := range []string{firstMarker, middleMarker, tailMarker} {
+		if !strings.Contains(loggedBody.String(), marker) {
+			t.Errorf("debug response chunks are missing marker %q", marker)
+		}
+	}
+	if loggedBody.String() != responseBody {
+		t.Fatalf("concatenated debug response chunks do not match all %d response bytes", len(responseBody))
+	}
+}
+
+func TestDebugLogsDoNotLeakRegisteredSecretsAcrossChunkBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		oauth  string
+		apiKey string
+		secret string
+	}{
+		{
+			name:   "oauth",
+			oauth:  "oauth-credential-cross-chunk-secret",
+			apiKey: "local-api-key",
+			secret: "oauth-credential-cross-chunk-secret",
+		},
+		{
+			name:   "api-key",
+			oauth:  "oauth-credential",
+			apiKey: "api-key-cross-chunk-secret",
+			secret: "api-key-cross-chunk-secret",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureJSONSlog(t, slog.LevelDebug)
+			responseBody := strings.Repeat("x", debugLogChunkSize-len(tc.secret)/2) + tc.secret
+			responseBody += strings.Repeat("y", debugLogChunkSize*4-len(responseBody))
+			s := testService(t, Config{
+				Token:  tc.oauth,
+				APIKey: tc.apiKey,
+				Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+					switch r.URL.Path {
+					case "/copilot_internal/v2/token":
+						testSession(w, "https://api.githubcopilot.com", time.Now().Add(time.Hour))
+					case "/models":
+						_, _ = io.WriteString(w, testModels)
+					case "/chat/completions":
+						w.Header().Set("Content-Type", "text/plain")
+						_, _ = io.WriteString(w, responseBody)
+					default:
+						t.Errorf("unexpected path %s", r.URL.Path)
+						w.WriteHeader(http.StatusInternalServerError)
+					}
+				}),
+			})
+			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+				strings.NewReader(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hello"}]}`))
+			request.Header.Set("Authorization", "Bearer "+tc.apiKey)
+			w := httptest.NewRecorder()
+			s.Handler().ServeHTTP(w, request)
+			if w.Code != http.StatusOK || w.Body.String() != responseBody {
+				t.Fatalf("upstream response = %d with %d bytes, want %d bytes",
+					w.Code, w.Body.Len(), len(responseBody))
+			}
+
+			events := debugBodyLogEvents(t, logs.Bytes(), "/chat/completions")
+			var loggedBody strings.Builder
+			for _, event := range events {
+				loggedBody.WriteString(event.Body)
+			}
+			if strings.Contains(loggedBody.String(), tc.secret) {
+				t.Fatalf("registered %s secret can be reconstructed from debug chunks", tc.name)
+			}
+			if strings.Contains(logs.String(), tc.secret) {
+				t.Fatalf("registered %s secret appears in debug logs", tc.name)
+			}
+		})
+	}
+}
+
+func TestDebugLogsKeepTailAfterOversizedSensitiveJSONField(t *testing.T) {
+	logs := captureJSONSlog(t, slog.LevelDebug)
+	const sensitiveValueLength = (1 << 20) + 1
+	const tailMarker = "debug-tail-after-oversized-sensitive-field"
+	sensitiveValue := strings.Repeat("s", sensitiveValueLength)
+	responseBody := `{"session_token":"` + sensitiveValue + `","tail":"` + tailMarker + `"}`
+	s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/copilot_internal/v2/token":
+			testSession(w, "https://api.githubcopilot.com", time.Now().Add(time.Hour))
+		case "/models":
+			_, _ = io.WriteString(w, testModels)
+		case "/chat/completions":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, responseBody)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})})
+
+	w := testRequest(s, http.MethodPost, "/v1/chat/completions",
+		`{"model":"gpt-4.1","messages":[{"role":"user","content":"hello"}]}`)
+	if w.Code != http.StatusOK || w.Body.String() != responseBody {
+		t.Fatalf("upstream response = %d with %d bytes, want %d bytes",
+			w.Code, w.Body.Len(), len(responseBody))
+	}
+
+	events := debugBodyLogEvents(t, logs.Bytes(), "/chat/completions")
+	var loggedBody strings.Builder
+	for _, event := range events {
+		loggedBody.WriteString(event.Body)
+	}
+	body := loggedBody.String()
+	if strings.Contains(body, sensitiveValue) {
+		t.Error("debug response logs contain the oversized sensitive value")
+	}
+	if !strings.Contains(body, `"[REDACTED]"`) {
+		t.Error("debug response logs do not show the sensitive JSON field as redacted")
+	}
+	if !strings.Contains(body, tailMarker) {
+		t.Errorf("debug response logs dropped the body tail marker %q", tailMarker)
+	}
+}
+
+func TestDebugLogsCompleteOversizedMetadataResponse(t *testing.T) {
+	logs := captureJSONSlog(t, slog.LevelDebug)
+	const tailMarker = "metadata-response-tail-marker"
+	responseBody := strings.Repeat("m", maxMetadataBody+1) + tailMarker
+	s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/copilot_internal/v2/token":
+			testSession(w, "https://api.githubcopilot.com", time.Now().Add(time.Hour))
+		case "/models":
+			_, _ = io.WriteString(w, responseBody)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})})
+
+	w := testRequest(s, http.MethodGet, "/v1/models", "")
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("oversized metadata response status = %d, want %d: %s",
+			w.Code, http.StatusBadGateway, w.Body.String())
+	}
+
+	events := debugBodyLogEvents(t, logs.Bytes(), "/models")
+	if len(events) == 0 {
+		t.Fatal("debug logs contain no body chunks for the oversized /models response")
+	}
+	var totalBytes int64
+	var loggedBody strings.Builder
+	for _, event := range events {
+		totalBytes += event.BodyBytes
+		loggedBody.WriteString(event.Body)
+	}
+	if totalBytes != int64(len(responseBody)) {
+		t.Fatalf("debug metadata response chunks total %d bytes, want %d", totalBytes, len(responseBody))
+	}
+	if !strings.Contains(loggedBody.String(), tailMarker) {
+		t.Fatalf("debug metadata response log is missing tail marker %q", tailMarker)
+	}
+	if loggedBody.String() != responseBody {
+		t.Fatalf("debug metadata response chunks do not contain all %d bytes", len(responseBody))
+	}
+}
+
+func TestInfoLogsRequestStagesWithoutDebugBodies(t *testing.T) {
+	logs := captureSlog(t, slog.LevelInfo)
+	s := testService(t, Config{Token: "github-oauth-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/copilot_internal/v2/token":
+			testSession(w, "", time.Now().Add(time.Hour))
+		case "/models":
+			_, _ = io.WriteString(w, testModels)
+		case "/chat/completions":
+			_, _ = io.ReadAll(r.Body)
+			_, _ = io.WriteString(w, `{"result":"info-response-body-marker"}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	})})
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4.1","messages":[{"role":"user","content":"info-request-body-marker"}]}`))
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, request)
+	if w.Code != http.StatusOK {
+		t.Fatalf("generation response = %d %s", w.Code, w.Body.String())
+	}
+	logOutput := logs.String()
+	for _, stage := range []string{"/v1/chat/completions", "/copilot_internal/v2/token", "/models", "/chat/completions"} {
+		if !strings.Contains(logOutput, stage) {
+			t.Errorf("info request stage %q missing from logs: %s", stage, logOutput)
+		}
+	}
+	for _, marker := range []string{"info-request-body-marker", "info-response-body-marker"} {
+		if strings.Contains(logOutput, marker) {
+			t.Errorf("info logs contain debug body marker %q: %s", marker, logOutput)
+		}
+	}
+}
+
 func TestTermsAcceptedBeforeGenerationAndFailureDoesNotBlock(t *testing.T) {
 	for _, policyStatus := range []int{200, 403} {
 		t.Run(fmt.Sprint(policyStatus), func(t *testing.T) {
@@ -398,46 +856,6 @@ func TestSessionReuseRefreshAndEnterpriseHost(t *testing.T) {
 	}
 }
 
-func TestCLIDirectTokenAndUsageAliases(t *testing.T) {
-	var exchanges atomic.Int32
-	const quota = `{"quota_snapshots":{"premium_interactions":{"remaining":12,"unlimited":false}},"quota_reset_date":"2026-11-01","endpoints":{"api":"https://api.githubcopilot.com"}}`
-	s := testService(t, Config{Token: "cli-secret", TokenMode: "cli", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/copilot_internal/v2/token":
-			exchanges.Add(1)
-			w.WriteHeader(403)
-		case "/copilot_internal/user":
-			if r.Header.Get("Authorization") != "token cli-secret" {
-				t.Errorf("usage authorization = %q", r.Header.Get("Authorization"))
-			}
-			_, _ = io.WriteString(w, quota)
-		case "/models":
-			_, _ = io.WriteString(w, testModels)
-		case "/chat/completions":
-			for key, want := range map[string]string{"Authorization": "Bearer cli-secret", "Editor-Version": "copilot/1.0.88", "Copilot-Integration-Id": "copilot-developer-cli", "X-GitHub-Api-Version": "2026-07-01", "User-Agent": "copilot/1.0.88"} {
-				if got := r.Header.Get(key); got != want {
-					t.Errorf("%s = %q want %q", key, got, want)
-				}
-			}
-			_, _ = io.WriteString(w, `{}`)
-		default:
-			t.Errorf("unexpected path %s", r.URL.Path)
-		}
-	})})
-	for _, path := range []string{"/usage", "/v1/usage"} {
-		w := testRequest(s, "GET", path, "")
-		if w.Code != 200 || strings.TrimSpace(w.Body.String()) != quota {
-			t.Fatalf("usage %s = %d %s", path, w.Code, w.Body.String())
-		}
-	}
-	if w := testRequest(s, "POST", "/v1/chat/completions", `{"model":"gpt-4.1","messages":[]}`); w.Code != 200 {
-		t.Fatalf("CLI generation = %d %s", w.Code, w.Body.String())
-	}
-	if exchanges.Load() != 0 {
-		t.Fatal("CLI token must never be exchanged")
-	}
-}
-
 func TestRejectUnsafeSessionEndpoints(t *testing.T) {
 	for _, endpoint := range []string{
 		"http://api.githubcopilot.com", "https://evil.example", "https://evil.githubcopilot.com",
@@ -490,6 +908,49 @@ func TestNetworkFailureReturnsBadGateway(t *testing.T) {
 	})}})
 	if w := testRequest(s, "GET", "/v1/models", ""); w.Code != 502 {
 		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestGenerationNetworkFailureRedactsSensitiveQueryFromLogs(t *testing.T) {
+	logs := captureSlog(t, slog.LevelDebug)
+	const querySecret = "client-query-token-secret"
+	baseClient := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/copilot_internal/v2/token":
+			testSession(w, "", time.Now().Add(time.Hour))
+		case "/models":
+			_, _ = io.WriteString(w, testModels)
+		default:
+			t.Errorf("unexpected upstream request %s", r.URL.Path)
+		}
+	})
+	baseTransport := baseClient.Transport
+	client := &http.Client{Transport: testTransport(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/chat/completions" {
+			if got := r.URL.Query().Get("access_token"); got != querySecret {
+				t.Errorf("upstream access_token = %q, want query value to be forwarded", got)
+			}
+			return nil, errors.New("dial tcp: network is unreachable")
+		}
+		return baseTransport.RoundTrip(r)
+	})}
+	s := testService(t, Config{Token: "github-secret", Client: client})
+
+	w := testRequest(s, http.MethodPost,
+		"/v1/chat/completions?access_token="+querySecret,
+		`{"model":"gpt-4.1","messages":[{"role":"user","content":"hello"}]}`)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d body=%s, want %d", w.Code, w.Body.String(), http.StatusBadGateway)
+	}
+
+	logOutput := logs.String()
+	if strings.Contains(logOutput, querySecret) {
+		t.Errorf("sensitive query value leaked into logs")
+	}
+	for _, stage := range []string{"上游 API 请求失败", "请求处理失败"} {
+		if !strings.Contains(logOutput, stage) {
+			t.Errorf("failure stage %q missing from logs: %s", stage, logOutput)
+		}
 	}
 }
 
