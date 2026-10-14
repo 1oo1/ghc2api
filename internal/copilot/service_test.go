@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,10 +57,19 @@ func testSession(w http.ResponseWriter, api string, expiry time.Time) {
 	})
 }
 
-const testModels = `{"data":[{"id":"gpt-4.1","name":"GPT 4.1","model_picker_enabled":true,"is_chat_fallback":true,"capabilities":{"type":"chat","supports":{"reasoning_effort":["low","high"]}},"supported_endpoints":["/chat/completions","/responses"],"policy":{"state":"enabled"}},{"id":"terms-model","model_picker_enabled":true,"capabilities":{"type":"chat"},"policy":{"state":"disabled","terms":"Accept terms"}},{"id":"blocked","model_picker_enabled":true,"capabilities":{"type":"chat"},"policy":{"state":"disabled"}},{"id":"embed","model_picker_enabled":true,"capabilities":{"type":"embeddings"}},{"id":"copilot-search","model_picker_enabled":true,"capabilities":{"type":"chat"}},{"id":"gpt-secondary","model_picker_enabled":true,"capabilities":{"type":"chat"}},{"id":"hidden","capabilities":{"type":"chat"}},{"id":"experimental","vendor":"Experimental","model_picker_enabled":true,"capabilities":{"type":"chat"}}]}`
+type persistedSessionForTest struct {
+	Token     string `json:"token"`
+	ExpiresAt int64  `json:"expires_at"`
+	API       string `json:"api"`
+}
+
+const testModels = `{"data":[{"id":"gpt-4.1","name":"GPT 4.1","model_picker_enabled":true,"is_chat_fallback":true,"capabilities":{"type":"chat","supports":{"reasoning_effort":["low","high"]}},"supported_endpoints":["/chat/completions","/responses","/v1/messages"],"policy":{"state":"enabled"}},{"id":"terms-model","model_picker_enabled":true,"capabilities":{"type":"chat"},"policy":{"state":"disabled","terms":"Accept terms"}},{"id":"blocked","model_picker_enabled":true,"capabilities":{"type":"chat"},"policy":{"state":"disabled"}},{"id":"embed","model_picker_enabled":true,"capabilities":{"type":"embeddings"}},{"id":"copilot-search","model_picker_enabled":true,"capabilities":{"type":"chat"}},{"id":"gpt-secondary","model_picker_enabled":true,"capabilities":{"type":"chat"}},{"id":"hidden","capabilities":{"type":"chat"}},{"id":"experimental","vendor":"Experimental","model_picker_enabled":true,"capabilities":{"type":"chat"}}]}`
 
 func testService(t *testing.T, config Config) *Service {
 	t.Helper()
+	if strings.TrimSpace(config.CacheDir) == "" {
+		config.CacheDir = t.TempDir()
+	}
 	s, err := New(config)
 	if err != nil {
 		t.Fatal(err)
@@ -229,7 +240,7 @@ func TestModelsFilterAndPreserveMetadata(t *testing.T) {
 			id, _ := m["id"].(string)
 			ids[id] = true
 			if id == "gpt-4.1" {
-				if !reflect.DeepEqual(m["supported_endpoints"], []any{"/chat/completions", "/responses"}) || m["capabilities"] == nil || m["name"] != "GPT 4.1" {
+				if !reflect.DeepEqual(m["supported_endpoints"], []any{"/chat/completions", "/responses", "/v1/messages"}) || m["capabilities"] == nil || m["name"] != "GPT 4.1" {
 					t.Errorf("model metadata lost: %#v", m)
 				}
 			}
@@ -240,6 +251,89 @@ func TestModelsFilterAndPreserveMetadata(t *testing.T) {
 	}
 	if tokenCalls.Load() != 1 || modelCalls.Load() != 1 {
 		t.Fatalf("cache calls: token=%d models=%d", tokenCalls.Load(), modelCalls.Load())
+	}
+}
+
+func TestModelsCachePersistsAcrossServiceInstances(t *testing.T) {
+	var modelCalls atomic.Int32
+	client := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/copilot_internal/v2/token":
+			testSession(w, "", time.Now().Add(time.Hour))
+		case "/models":
+			modelCalls.Add(1)
+			_, _ = io.WriteString(w, testModels)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	config := Config{
+		Token: "github-secret", CacheDir: t.TempDir(), ModelsCacheTTL: time.Hour, Client: client,
+	}
+
+	var firstService *Service
+	for range 2 {
+		s := testService(t, config)
+		if firstService == nil {
+			firstService = s
+		}
+		w := testRequest(s, "GET", "/v1/models", "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+		}
+	}
+	if got := modelCalls.Load(); got != 1 {
+		t.Fatalf("model upstream calls = %d, want 1 across Service instances", got)
+	}
+	if runtime.GOOS != "windows" {
+		dirInfo, err := os.Stat(firstService.cacheDir)
+		if err != nil {
+			t.Fatalf("stat account cache directory: %v", err)
+		}
+		if got := dirInfo.Mode().Perm(); got != 0o700 {
+			t.Errorf("account cache directory permissions = %04o, want 0700", got)
+		}
+		fileInfo, err := os.Stat(firstService.cacheFile("models"))
+		if err != nil {
+			t.Fatalf("stat model cache file: %v", err)
+		}
+		if got := fileInfo.Mode().Perm(); got != 0o600 {
+			t.Errorf("model cache file permissions = %04o, want 0600", got)
+		}
+	}
+}
+
+func TestModelsCacheRefreshesAfterTTL(t *testing.T) {
+	const ttl = 30 * time.Millisecond
+	var modelCalls atomic.Int32
+	client := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/copilot_internal/v2/token":
+			testSession(w, "", time.Now().Add(time.Hour))
+		case "/models":
+			modelCalls.Add(1)
+			_, _ = io.WriteString(w, testModels)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	config := Config{
+		Token: "github-secret", CacheDir: t.TempDir(), ModelsCacheTTL: ttl, Client: client,
+	}
+
+	s := testService(t, config)
+	if w := testRequest(s, "GET", "/v1/models", ""); w.Code != http.StatusOK {
+		t.Fatalf("initial request status=%d body=%s", w.Code, w.Body.String())
+	}
+	time.Sleep(ttl + 20*time.Millisecond)
+
+	if w := testRequest(s, "GET", "/v1/models", ""); w.Code != http.StatusOK {
+		t.Fatalf("request after TTL status=%d body=%s", w.Code, w.Body.String())
+	}
+	if got := modelCalls.Load(); got != 2 {
+		t.Fatalf("model upstream calls after TTL = %d, want 2", got)
 	}
 }
 
@@ -448,7 +542,7 @@ func TestGenerationLogsRedactModelMatchingOAuthToken(t *testing.T) {
 			case "/copilot_internal/v2/token":
 				testSession(w, "https://api.githubcopilot.com", time.Now().Add(time.Hour))
 			case "/models":
-				_, _ = io.WriteString(w, testModels)
+				_, _ = fmt.Fprintf(w, `{"data":[{"id":%q,"model_picker_enabled":true,"capabilities":{"type":"chat"},"supported_endpoints":["/chat/completions"],"policy":{"state":"enabled"}}]}`, oauthToken)
 			case "/chat/completions":
 				_, _ = io.WriteString(w, `{"ok":true}`)
 			default:
@@ -458,8 +552,8 @@ func TestGenerationLogsRedactModelMatchingOAuthToken(t *testing.T) {
 		}),
 	})
 
-	w := testRequest(s, http.MethodPost, "/v1/chat/completions",
-		`{"model":"oauth-model-token-secret","messages":[{"role":"user","content":"hello"}]}`)
+	requestBody := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hello"}]}`, oauthToken)
+	w := testRequest(s, http.MethodPost, "/v1/chat/completions", requestBody)
 	if w.Code != http.StatusOK {
 		t.Fatalf("generation response = %d %s", w.Code, w.Body.String())
 	}
@@ -818,6 +912,218 @@ func TestManualModelSurvivesModelListFailureAndDoesNotRetry(t *testing.T) {
 	}
 }
 
+func TestAutoRequiresModelListAfterInitialFetchFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		refreshedStatus int
+		refreshedBody   string
+		wantStatus      int
+	}{
+		{
+			name:            "reject model that does not support path",
+			refreshedStatus: http.StatusOK,
+			refreshedBody:   `{"data":[{"id":"gpt-4.1","model_picker_enabled":true,"capabilities":{"type":"chat"},"supported_endpoints":["/chat/completions"],"policy":{"state":"enabled"}}]}`,
+			wantStatus:      http.StatusBadRequest,
+		},
+		{
+			name:            "reject when model list refresh fails",
+			refreshedStatus: http.StatusServiceUnavailable,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var modelCalls, autoCalls, generationCalls atomic.Int32
+			s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/copilot_internal/v2/token":
+					testSession(w, "", time.Now().Add(time.Hour))
+				case "/models":
+					n := modelCalls.Add(1)
+					if n == 1 {
+						w.WriteHeader(http.StatusServiceUnavailable)
+						return
+					}
+					if n != 2 {
+						t.Errorf("model list request count exceeded 2: %d", n)
+						w.WriteHeader(http.StatusInternalServerError)
+						return
+					}
+					w.WriteHeader(tc.refreshedStatus)
+					if tc.refreshedBody != "" {
+						_, _ = io.WriteString(w, tc.refreshedBody)
+					}
+				case "/auto":
+					autoCalls.Add(1)
+					testJSON(w, map[string]any{
+						"session_token":  "auto-secret",
+						"selected_model": "gpt-4.1",
+						"expires_at":     time.Now().Add(time.Hour).Unix(),
+					})
+				case "/responses":
+					generationCalls.Add(1)
+					w.WriteHeader(http.StatusOK)
+				default:
+					t.Errorf("unexpected path %s", r.URL.Path)
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			})})
+
+			w := testRequest(s, "POST", "/v1/responses", `{"model":"auto","input":"hello"}`)
+			if tc.wantStatus != 0 && w.Code != tc.wantStatus {
+				t.Errorf("status=%d body=%s, want %d", w.Code, w.Body.String(), tc.wantStatus)
+			} else if tc.wantStatus == 0 && w.Code < http.StatusBadRequest {
+				t.Errorf("status=%d body=%s, want Auto request rejected before generation", w.Code, w.Body.String())
+			}
+			if got := modelCalls.Load(); got != 2 {
+				t.Errorf("model list calls=%d, want 2", got)
+			}
+			if got := autoCalls.Load(); got != 1 {
+				t.Errorf("Auto calls=%d, want 1", got)
+			}
+			if got := generationCalls.Load(); got != 0 {
+				t.Errorf("generation calls=%d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestGenerationRejectsModelsUnavailableForPath(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		path          string
+		body          string
+		autoModel     string
+		wantAutoCalls int32
+	}{
+		{
+			name: "manual model does not support path",
+			path: "/v1/responses",
+			body: `{"model":"terms-model","input":"hello"}`,
+		},
+		{
+			name: "manual model is not in visible list",
+			path: "/v1/chat/completions",
+			body: `{"model":"hidden","messages":[{"role":"user","content":"hello"}]}`,
+		},
+		{
+			name: "manual unknown model",
+			path: "/v1/chat/completions",
+			body: `{"model":"unknown-model","messages":[{"role":"user","content":"hello"}]}`,
+		},
+		{
+			name:          "auto selects model that does not support path",
+			path:          "/v1/responses",
+			body:          `{"model":"auto","input":"hello"}`,
+			autoModel:     "terms-model",
+			wantAutoCalls: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var modelCalls, autoCalls, generationCalls atomic.Int32
+			s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/copilot_internal/v2/token":
+					testSession(w, "", time.Now().Add(time.Hour))
+				case "/models":
+					modelCalls.Add(1)
+					_, _ = io.WriteString(w, testModels)
+				case "/models/terms-model/policy":
+					w.WriteHeader(http.StatusOK)
+				case "/auto":
+					autoCalls.Add(1)
+					testJSON(w, map[string]any{
+						"session_token":  "auto-secret",
+						"selected_model": tc.autoModel,
+						"expires_at":     time.Now().Add(time.Hour).Unix(),
+					})
+				case "/chat/completions", "/responses", "/v1/messages":
+					generationCalls.Add(1)
+					w.WriteHeader(http.StatusOK)
+				default:
+					t.Errorf("unexpected path %s", r.URL.Path)
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			})})
+
+			w := testRequest(s, "POST", tc.path, tc.body)
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("status=%d body=%s, want 400", w.Code, w.Body.String())
+			}
+			if got := modelCalls.Load(); got != 1 {
+				t.Errorf("model list calls=%d, want 1", got)
+			}
+			if got := autoCalls.Load(); got != tc.wantAutoCalls {
+				t.Errorf("auto calls=%d, want %d", got, tc.wantAutoCalls)
+			}
+			if got := generationCalls.Load(); got != 0 {
+				t.Errorf("generation calls=%d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestAutoSelectionForUnsupportedPathIsNotCached(t *testing.T) {
+	var autoCalls, generationCalls atomic.Int32
+	var forwardedModel atomic.Value
+	s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/copilot_internal/v2/token":
+			testSession(w, "", time.Now().Add(time.Hour))
+		case "/models":
+			_, _ = io.WriteString(w, testModels)
+		case "/auto":
+			n := autoCalls.Add(1)
+			selected := "terms-model"
+			if n == 2 {
+				selected = "gpt-4.1"
+			}
+			testJSON(w, map[string]any{
+				"session_token":  fmt.Sprintf("auto-%d", n),
+				"selected_model": selected,
+				"expires_at":     time.Now().Add(time.Hour).Unix(),
+			})
+		case "/responses":
+			generationCalls.Add(1)
+			var body struct {
+				Model string `json:"model"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode generation request: %v", err)
+			}
+			forwardedModel.Store(body.Model)
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})})
+	const requestBody = `{"model":"auto","input":"hello"}`
+
+	first := testRequest(s, "POST", "/v1/responses", requestBody)
+	if first.Code != http.StatusBadRequest {
+		t.Fatalf("first status=%d body=%s, want 400", first.Code, first.Body.String())
+	}
+	if got := autoCalls.Load(); got != 1 {
+		t.Fatalf("Auto calls after first request=%d, want 1", got)
+	}
+	if got := generationCalls.Load(); got != 0 {
+		t.Fatalf("generation calls after first request=%d, want 0", got)
+	}
+
+	second := testRequest(s, "POST", "/v1/responses", requestBody)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second status=%d body=%s, want 200", second.Code, second.Body.String())
+	}
+	if got := autoCalls.Load(); got != 2 {
+		t.Errorf("total Auto calls=%d, want 2", got)
+	}
+	if got := generationCalls.Load(); got != 1 {
+		t.Errorf("total generation calls=%d, want 1", got)
+	}
+	if got, _ := forwardedModel.Load().(string); got != "gpt-4.1" {
+		t.Errorf("forwarded model=%q, want gpt-4.1", got)
+	}
+}
+
 func TestSessionReuseRefreshAndEnterpriseHost(t *testing.T) {
 	for _, ttl := range []time.Duration{time.Hour, time.Minute} {
 		t.Run(ttl.String(), func(t *testing.T) {
@@ -853,6 +1159,116 @@ func TestSessionReuseRefreshAndEnterpriseHost(t *testing.T) {
 				t.Fatalf("expiring session not refreshed, exchanges=%d", exchanges.Load())
 			}
 		})
+	}
+}
+
+func TestSessionCachePersistsAcrossServiceInstances(t *testing.T) {
+	var exchanges atomic.Int32
+	client := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/copilot_internal/v2/token" {
+			t.Errorf("unexpected upstream path %s", r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		exchanges.Add(1)
+		testSession(w, "https://api.githubcopilot.com", time.Now().Add(time.Hour))
+	})
+	config := Config{Token: "github-secret", CacheDir: t.TempDir(), Client: client}
+
+	firstService := testService(t, config)
+	first, err := firstService.getSession(context.Background())
+	if err != nil {
+		t.Fatalf("first getSession: %v", err)
+	}
+	if remaining := time.Until(time.Unix(first.ExpiresAt, 0)); remaining <= 2*time.Minute {
+		t.Fatalf("test session remaining lifetime = %s, want more than the 2-minute refresh window", remaining)
+	}
+
+	cachePath := firstService.cacheFile("session")
+	data, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Errorf("read persisted session cache %q: %v", cachePath, err)
+	} else {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(data, &fields); err != nil {
+			t.Errorf("decode persisted session cache: %v", err)
+		} else {
+			for _, field := range []string{"token", "expires_at", "api"} {
+				if _, ok := fields[field]; !ok {
+					t.Errorf("persisted session cache is missing JSON field %q: %s", field, data)
+				}
+			}
+			var persisted persistedSessionForTest
+			if err := json.Unmarshal(data, &persisted); err != nil {
+				t.Errorf("decode persisted session fields: %v", err)
+			} else if persisted.Token != first.Token || persisted.ExpiresAt != first.ExpiresAt || persisted.API != first.API {
+				t.Errorf("persisted session = %+v, want token/expires_at/api matching %+v", persisted, first)
+			}
+		}
+	}
+
+	secondService := testService(t, config)
+	second, err := secondService.getSession(context.Background())
+	if err != nil {
+		t.Fatalf("second getSession: %v", err)
+	}
+	if second.Token != first.Token || second.ExpiresAt != first.ExpiresAt || second.API != first.API {
+		t.Errorf("second service session = %+v, want persisted session %+v", second, first)
+	}
+	if got := exchanges.Load(); got != 1 {
+		t.Errorf("OAuth exchanges across Service instances = %d, want 1", got)
+	}
+}
+
+func TestSessionCacheRefreshesWhenExpiresAtIsPast(t *testing.T) {
+	var exchanges atomic.Int32
+	client := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/copilot_internal/v2/token" {
+			t.Errorf("unexpected upstream path %s", r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		exchanges.Add(1)
+		testSession(w, "https://api.githubcopilot.com", time.Now().Add(time.Hour))
+	})
+	config := Config{Token: "github-secret", CacheDir: t.TempDir(), Client: client}
+
+	firstService := testService(t, config)
+	first, err := firstService.getSession(context.Background())
+	if err != nil {
+		t.Fatalf("initial getSession: %v", err)
+	}
+	cachePath := firstService.cacheFile("session")
+	data, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("read persisted session cache %q: %v", cachePath, err)
+	}
+	var cached persistedSessionForTest
+	if err := json.Unmarshal(data, &cached); err != nil {
+		t.Fatalf("decode persisted session cache: %v", err)
+	}
+	if cached.Token != first.Token || cached.API != first.API {
+		t.Fatalf("persisted session = %+v, want initial session %+v", cached, first)
+	}
+	cached.ExpiresAt = time.Now().Add(-time.Minute).Unix()
+	data, err = json.Marshal(cached)
+	if err != nil {
+		t.Fatalf("encode expired session cache: %v", err)
+	}
+	if err := os.WriteFile(cachePath, data, 0o600); err != nil {
+		t.Fatalf("expire session cache: %v", err)
+	}
+
+	newService := testService(t, config)
+	got, err := newService.getSession(context.Background())
+	if err != nil {
+		t.Fatalf("getSession with expired disk cache: %v", err)
+	}
+	if got.Token != "session-secret" {
+		t.Errorf("session after expired cache = %+v, want a newly fetched session", got)
+	}
+	if exchanges.Load() != 2 {
+		t.Errorf("OAuth exchanges after expiring persisted session = %d, want 2", exchanges.Load())
 	}
 }
 
@@ -1179,6 +1595,11 @@ func TestAutoLegacyAndManualFallback(t *testing.T) {
 }
 
 func TestAutoRetryIsBounded(t *testing.T) {
+	retryModels := strings.TrimSuffix(testModels, "]}") + `,
+		{"id":"picked-1","model_picker_enabled":true,"capabilities":{"type":"chat"},"supported_endpoints":["/chat/completions"]},
+		{"id":"picked-2","model_picker_enabled":true,"capabilities":{"type":"chat"},"supported_endpoints":["/chat/completions"]},
+		{"id":"picked-3","model_picker_enabled":true,"capabilities":{"type":"chat"},"supported_endpoints":["/chat/completions"]}
+	]}`
 	for _, rejection := range []string{`{"error":{"code":"model_not_supported"}}`, `{"error":{"message":"not available for session"}}`} {
 		for _, succeeds := range []bool{true, false} {
 			t.Run(rejection+fmt.Sprint(succeeds), func(t *testing.T) {
@@ -1188,7 +1609,7 @@ func TestAutoRetryIsBounded(t *testing.T) {
 					case "/copilot_internal/v2/token":
 						testSession(w, "", time.Now().Add(time.Hour))
 					case "/models":
-						_, _ = io.WriteString(w, testModels)
+						_, _ = io.WriteString(w, retryModels)
 					case "/auto":
 						n := autoCalls.Add(1)
 						testJSON(w, map[string]any{"session_token": fmt.Sprint("auto-", n), "selected_model": fmt.Sprint("picked-", n), "expires_at": time.Now().Add(time.Hour).Unix()})
@@ -1211,6 +1632,9 @@ func TestAutoRetryIsBounded(t *testing.T) {
 				}
 				if !succeeds && (w.Code != 400 || generationCalls.Load() < 2 || generationCalls.Load() > 3) {
 					t.Fatalf("bounded retry status=%d calls=%d", w.Code, generationCalls.Load())
+				}
+				if autoCalls.Load() != generationCalls.Load() {
+					t.Fatalf("auto selections=%d generation attempts=%d", autoCalls.Load(), generationCalls.Load())
 				}
 			})
 		}

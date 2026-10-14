@@ -168,6 +168,43 @@ func TestConfigYAMLUsesDefaultsForOmittedSettings(t *testing.T) {
 	}
 }
 
+func TestModelsCacheTTLConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		value   string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "default", want: 2 * time.Hour},
+		{name: "custom", value: "1h30m", want: 90 * time.Minute},
+		{name: "invalid", value: "not-a-duration", wantErr: true},
+		{name: "zero", value: "0s", wantErr: true},
+		{name: "negative", value: "-1s", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var contents strings.Builder
+			contents.WriteString("github_token: models-cache-config-token\n")
+			if tc.value != "" {
+				fmt.Fprintf(&contents, "models_cache_ttl: %s\n", strconv.Quote(tc.value))
+			}
+			configPath := writeConfigFile(t, contents.String())
+			config, err := loadConfig(configPath)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("无效的 models_cache_ttl 未被拒绝")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadConfig() error = %v", err)
+			}
+			if config.ModelsCacheTTL != tc.want {
+				t.Fatalf("models_cache_ttl = %s, want %s", config.ModelsCacheTTL, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunWarnsWhenConfigPermissionsAreTooBroad(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows 不支持 Unix 配置文件权限检查")

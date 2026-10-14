@@ -3,9 +3,11 @@ package copilot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"sort"
 	"time"
@@ -34,11 +36,11 @@ type model struct {
 }
 
 type modelList struct {
-	Data    []json.RawMessage
-	Picks   []string
-	Known   map[string]bool
-	Waiting map[string]bool
-	At      time.Time
+	Data    []json.RawMessage `json:"data"`
+	Picks   []string          `json:"picks"`
+	Known   map[string]bool   `json:"known"`
+	Waiting map[string]bool   `json:"waiting"`
+	At      time.Time         `json:"at"`
 }
 
 func (s *Service) getModels(ctx context.Context, current session) (modelList, error) {
@@ -46,9 +48,21 @@ func (s *Service) getModels(ctx context.Context, current session) (modelList, er
 		return modelList{}, err
 	}
 	defer s.modelsMu.unlock()
-	if !s.models.At.IsZero() && time.Since(s.models.At) < 5*time.Minute {
+	if modelCacheFresh(s.models.At, s.modelsCacheTTL) {
 		s.log(ctx, slog.LevelDebug, "复用缓存的 Copilot 模型列表", "model_count", len(s.models.Data))
 		return s.models, nil
+	}
+	if path := s.cacheFile("models"); path != "" {
+		var cached modelList
+		if err := readCacheFile(path, &cached); err == nil {
+			if modelCacheFresh(cached.At, s.modelsCacheTTL) {
+				s.models = cached
+				s.log(ctx, slog.LevelDebug, "复用磁盘中的 Copilot 模型列表", "model_count", len(cached.Data))
+				return cached, nil
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			s.log(ctx, slog.LevelWarn, "读取磁盘模型缓存失败", "error", s.redactString(err.Error()))
+		}
 	}
 	s.log(ctx, slog.LevelInfo, "开始刷新 Copilot 模型列表")
 	var wire struct {
@@ -100,8 +114,33 @@ func (s *Service) getModels(ctx context.Context, current session) (modelList, er
 	}
 	sort.SliceStable(list.Picks, func(i, j int) bool { return rank[list.Picks[i]] < rank[list.Picks[j]] })
 	s.models = list
+	if path := s.cacheFile("models"); path != "" {
+		if err := writeCacheFile(path, list); err != nil {
+			s.log(ctx, slog.LevelWarn, "写入磁盘模型缓存失败", "error", s.redactString(err.Error()))
+		}
+	}
 	s.log(ctx, slog.LevelInfo, "Copilot 模型列表刷新完成", "visible_count", len(list.Data), "selectable_count", len(list.Picks))
 	return list, nil
+}
+
+func modelCacheFresh(at time.Time, ttl time.Duration) bool {
+	age := time.Since(at)
+	return !at.IsZero() && age >= 0 && age < ttl
+}
+
+func (list modelList) supportsEndpoint(id, path string) bool {
+	for _, raw := range list.Data {
+		var entry model
+		if json.Unmarshal(raw, &entry) != nil || entry.ID != id {
+			continue
+		}
+		for _, endpoint := range entry.Endpoints {
+			if endpoint == path {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (s *Service) handleModels(w http.ResponseWriter, r *http.Request) {
@@ -141,6 +180,16 @@ func (s *Service) acceptTerms(ctx context.Context, current session, model string
 	if s.fetchJSON(ctx, current, http.MethodPost, "/models/"+url.PathEscape(model)+"/policy",
 		[]byte(`{"state":"enabled"}`), nil) == nil {
 		delete(s.models.Waiting, model)
+		s.models.At = time.Time{}
+		if path := s.cacheFile("models"); path != "" {
+			if err := writeCacheFile(path, s.models); err != nil {
+				s.log(ctx, slog.LevelWarn, "写入磁盘模型缓存失败", "error", s.redactString(err.Error()))
+				if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+					s.log(ctx, slog.LevelWarn, "清除失效的磁盘模型缓存失败",
+						"error", s.redactString(removeErr.Error()))
+				}
+			}
+		}
 		s.log(ctx, slog.LevelInfo, "模型使用条款已接受", "model", model)
 	} else {
 		s.log(ctx, slog.LevelWarn, "接受模型使用条款失败", "model", model)

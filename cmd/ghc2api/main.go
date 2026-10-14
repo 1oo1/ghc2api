@@ -69,7 +69,8 @@ func serve(ctx context.Context, config appConfig, logger *slog.Logger) error {
 		return err
 	}
 	service, err := copilot.New(copilot.Config{
-		Token: config.Token, Host: config.Host, APIKey: config.APIKey, Logger: logger,
+		Token: config.Token, Host: config.Host, APIKey: config.APIKey,
+		ModelsCacheTTL: config.ModelsCacheTTL, Logger: logger,
 	})
 	if err != nil {
 		return err

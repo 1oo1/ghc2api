@@ -11,6 +11,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +27,9 @@ type Service struct {
 	config Config
 	client *http.Client
 	logger *slog.Logger
+
+	cacheDir       string
+	modelsCacheTTL time.Duration
 
 	requestSeq atomic.Uint64
 	secretsMu  sync.RWMutex
@@ -55,9 +60,30 @@ func New(config Config) (*Service, error) {
 	if config.Logger == nil {
 		config.Logger = slog.Default()
 	}
+	cacheRoot := strings.TrimSpace(config.CacheDir)
+	if cacheRoot == "" {
+		var cacheErr error
+		cacheRoot, cacheErr = os.UserCacheDir()
+		if cacheErr != nil {
+			config.Logger.Warn("无法确定本地缓存目录，缓存将只保存在内存中", "error", cacheErr)
+			cacheRoot = ""
+		} else {
+			cacheRoot = filepath.Join(cacheRoot, "ghc2api")
+		}
+	}
+	cacheDir := ""
+	if cacheRoot != "" {
+		accountKey := sha256.Sum256([]byte(config.Host + "\x00" + config.Token))
+		cacheDir = filepath.Join(cacheRoot, fmt.Sprintf("%x", accountKey))
+	}
+	modelsCacheTTL := config.ModelsCacheTTL
+	if modelsCacheTTL <= 0 {
+		modelsCacheTTL = DefaultModelsCacheTTL
+	}
 	service := &Service{
 		config: config, client: safeClient(config.Client), refused: make(map[string]time.Time),
 		logger: config.Logger, secrets: make(map[string]struct{}),
+		cacheDir: cacheDir, modelsCacheTTL: modelsCacheTTL,
 		sessionMu: make(contextMutex, 1), modelsMu: make(contextMutex, 1), autoMu: make(contextMutex, 1),
 	}
 	service.addSecret(config.Token)
@@ -250,9 +276,10 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 			s.handleError(r.Context(), w, err)
 			return
 		}
-		// 模型列表失败不妨碍手选模型，真正的生成错误仍由上游返回。
-		if _, err := s.getModels(r.Context(), current); err != nil {
-			s.log(r.Context(), slog.LevelWarn, "读取模型列表失败，继续尝试指定模型", "error", s.redactString(err.Error()))
+		// 手选模型在列表失败时由上游判断；Auto 会在解析后重试读取列表。
+		list, modelErr := s.getModels(r.Context(), current)
+		if modelErr != nil {
+			s.log(r.Context(), slog.LevelWarn, "读取模型列表失败", "error", s.redactString(modelErr.Error()))
 		}
 		outBody := body
 		var pick autoSession
@@ -267,6 +294,24 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 			s.log(r.Context(), slog.LevelInfo, "Auto 模型已解析", "model", model)
 			request["model"], _ = json.Marshal(model)
 			outBody, _ = json.Marshal(request)
+		}
+		if isAuto && modelErr != nil {
+			// Auto 接口可能成功而模型列表失败；重试获取列表，无法校验时不转发。
+			list, modelErr = s.getModels(r.Context(), current)
+			if modelErr != nil {
+				s.log(r.Context(), slog.LevelWarn, "Auto 模型路径校验失败", "error", s.redactString(modelErr.Error()))
+				s.handleError(r.Context(), w, modelErr)
+				return
+			}
+		}
+		if modelErr == nil && !list.supportsEndpoint(model, path) {
+			if isAuto {
+				s.dropAuto(pick)
+			}
+			s.log(r.Context(), slog.LevelWarn, "所选模型不支持当前 API 路径",
+				"model", model, "upstream_path", path)
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("模型 %q 不支持 API 路径 %s", model, path))
+			return
 		}
 		s.acceptTerms(r.Context(), current, model)
 		req, err := s.apiRequest(r.Context(), current, http.MethodPost, path, outBody)

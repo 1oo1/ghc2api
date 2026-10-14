@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"ghc2api/internal/copilot"
 	"gopkg.in/yaml.v3"
@@ -20,13 +21,15 @@ import (
 const maxConfigSize = 1 << 20
 
 type appConfig struct {
-	Listen       string `yaml:"listen"`
-	GitHubToken  string `yaml:"github_token"`
-	Credentials  string `yaml:"credentials"`
-	EditorConfig string `yaml:"editor_config"`
-	Host         string `yaml:"host"`
-	APIKey       string `yaml:"api_key"`
-	LogLevel     string `yaml:"log_level"`
+	Listen              string        `yaml:"listen"`
+	GitHubToken         string        `yaml:"github_token"`
+	Credentials         string        `yaml:"credentials"`
+	EditorConfig        string        `yaml:"editor_config"`
+	Host                string        `yaml:"host"`
+	APIKey              string        `yaml:"api_key"`
+	LogLevel            string        `yaml:"log_level"`
+	ModelsCacheTTLValue string        `yaml:"models_cache_ttl"`
+	ModelsCacheTTL      time.Duration `yaml:"-"`
 
 	Token               string      `yaml:"-"`
 	configMode          os.FileMode `yaml:"-"`
@@ -85,6 +88,14 @@ func loadConfig(path string) (appConfig, error) {
 	}
 	if _, err := logLevel(config.LogLevel); err != nil {
 		return appConfig{}, err
+	}
+	config.ModelsCacheTTL = copilot.DefaultModelsCacheTTL
+	if value := strings.TrimSpace(config.ModelsCacheTTLValue); value != "" {
+		ttl, err := time.ParseDuration(value)
+		if err != nil || ttl <= 0 {
+			return appConfig{}, fmt.Errorf("无效的 models_cache_ttl %q，必须是正的 Go duration（例如 2h）", value)
+		}
+		config.ModelsCacheTTL = ttl
 	}
 	if err := validateListen(config.Listen, config.APIKey); err != nil {
 		return appConfig{}, err

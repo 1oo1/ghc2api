@@ -24,4 +24,7 @@ api_key: ""
 # 会增加内存和日志占用；日志中也可能包含提示词和生成内容等业务数据。
 log_level: "info"
 
+# 模型列表缓存有效期，使用 Go duration 格式；必须大于 0，默认 2h。
+models_cache_ttl: "2h"
+
 # 配置文件含有凭证时请将实际 config.yaml 权限设为 0600（chmod 600）。

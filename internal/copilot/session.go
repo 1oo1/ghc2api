@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -21,6 +22,12 @@ type session struct {
 		API string `json:"api"`
 	} `json:"endpoints"`
 	API string
+}
+
+type cachedSession struct {
+	Token     string `json:"token"`
+	ExpiresAt int64  `json:"expires_at"`
+	API       string `json:"api"`
 }
 
 func (session session) setHeaders(header http.Header) {
@@ -55,6 +62,12 @@ func (s *Service) getSession(ctx context.Context) (session, error) {
 		s.log(ctx, slog.LevelDebug, "复用缓存的 Copilot session", "expires_at", s.session.ExpiresAt)
 		return s.session, nil
 	}
+	if cached, ok := s.loadCachedSession(ctx); ok {
+		s.session = cached
+		s.addSecret(cached.Token)
+		s.log(ctx, slog.LevelDebug, "复用磁盘中的 Copilot session", "expires_at", cached.ExpiresAt)
+		return cached, nil
+	}
 	s.log(ctx, slog.LevelInfo, "开始通过 OAuth 获取 Copilot session")
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -83,6 +96,35 @@ func (s *Service) getSession(ctx context.Context) (session, error) {
 	}
 	s.session = fresh
 	s.addSecret(fresh.Token)
+	if path := s.cacheFile("session"); path != "" {
+		cache := cachedSession{Token: fresh.Token, ExpiresAt: fresh.ExpiresAt, API: fresh.API}
+		if err := writeCacheFile(path, cache); err != nil {
+			s.log(ctx, slog.LevelWarn, "写入磁盘 session 缓存失败", "error", s.redactString(err.Error()))
+		}
+	}
 	s.log(ctx, slog.LevelInfo, "Copilot session 获取成功", "expires_at", fresh.ExpiresAt, "api_host", fresh.API)
 	return fresh, nil
+}
+
+func (s *Service) loadCachedSession(ctx context.Context) (session, bool) {
+	path := s.cacheFile("session")
+	if path == "" {
+		return session{}, false
+	}
+	var cached cachedSession
+	if err := readCacheFile(path, &cached); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			s.log(ctx, slog.LevelWarn, "读取磁盘 session 缓存失败", "error", s.redactString(err.Error()))
+		}
+		return session{}, false
+	}
+	if cached.Token == "" || time.Until(time.Unix(cached.ExpiresAt, 0)) <= 2*time.Minute {
+		return session{}, false
+	}
+	api, err := validateAPI(cached.API, s.config.Host)
+	if err != nil {
+		s.log(ctx, slog.LevelWarn, "磁盘 session 缓存包含无效 API 地址", "error", s.redactString(err.Error()))
+		return session{}, false
+	}
+	return session{Token: cached.Token, ExpiresAt: cached.ExpiresAt, API: api}, true
 }

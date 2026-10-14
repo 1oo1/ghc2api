@@ -10,13 +10,18 @@ import (
 	"time"
 )
 
+// DefaultModelsCacheTTL 是模型列表缓存的默认有效期。
+const DefaultModelsCacheTTL = 2 * time.Hour
+
 // Config 配置单个 Copilot 账号；APIKey 是本服务密钥，不是 GitHub token。
 type Config struct {
-	Token  string
-	Host   string
-	APIKey string
-	Client *http.Client
-	Logger *slog.Logger
+	Token          string
+	Host           string
+	APIKey         string
+	CacheDir       string        // 留空时使用系统用户缓存目录；自定义目录应由调用方限制访问权限。
+	ModelsCacheTTL time.Duration // 非正值使用默认的模型列表缓存有效期。
+	Client         *http.Client
+	Logger         *slog.Logger
 }
 
 var enterpriseLabel = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
