@@ -114,10 +114,8 @@ func (s *Service) getModels(ctx context.Context, current session) (modelList, er
 	}
 	sort.SliceStable(list.Picks, func(i, j int) bool { return rank[list.Picks[i]] < rank[list.Picks[j]] })
 	s.models = list
-	if path := s.cacheFile("models"); path != "" {
-		if err := writeCacheFile(path, list); err != nil {
-			s.log(ctx, slog.LevelWarn, "写入磁盘模型缓存失败", "error", s.redactString(err.Error()))
-		}
+	if err := s.writeCache("models", list); err != nil {
+		s.log(ctx, slog.LevelWarn, "写入磁盘模型缓存失败", "error", s.redactString(err.Error()))
 	}
 	s.log(ctx, slog.LevelInfo, "Copilot 模型列表刷新完成", "visible_count", len(list.Data), "selectable_count", len(list.Picks))
 	return list, nil
@@ -181,9 +179,9 @@ func (s *Service) acceptTerms(ctx context.Context, current session, model string
 		[]byte(`{"state":"enabled"}`), nil) == nil {
 		delete(s.models.Waiting, model)
 		s.models.At = time.Time{}
-		if path := s.cacheFile("models"); path != "" {
-			if err := writeCacheFile(path, s.models); err != nil {
-				s.log(ctx, slog.LevelWarn, "写入磁盘模型缓存失败", "error", s.redactString(err.Error()))
+		if err := s.writeCache("models", s.models); err != nil {
+			s.log(ctx, slog.LevelWarn, "写入磁盘模型缓存失败", "error", s.redactString(err.Error()))
+			if path := s.cacheFile("models"); path != "" {
 				if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 					s.log(ctx, slog.LevelWarn, "清除失效的磁盘模型缓存失败",
 						"error", s.redactString(removeErr.Error()))

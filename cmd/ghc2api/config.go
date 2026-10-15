@@ -32,13 +32,19 @@ type appConfig struct {
 	LogsPath            string        `yaml:"logs_path"`
 	Host                string        `yaml:"host"`
 	APIKey              string        `yaml:"api_key"`
+	ManagementKey       string        `yaml:"management_key"` // 为空时禁用 Web 控制台与管理接口
 	LogLevel            string        `yaml:"log_level"`
 	ModelsCacheTTLValue string        `yaml:"models_cache_ttl"`
 	ModelsCacheTTL      time.Duration `yaml:"-"`
-	LogMaxSizeMBValue   *string       `yaml:"log_max_size_mb"` // 保留原值以便报告字段级校验错误。
-	LogMaxBackupsValue  *string       `yaml:"log_max_backups"` // 显式解析以区分缺省值和非法输入。
-	LogMaxSizeMB        int64         `yaml:"-"`
-	LogMaxBackups       int           `yaml:"-"`
+	// SessionAffinityValue 保留原值以区分缺省（默认开启）与显式关闭。
+	SessionAffinityValue    *bool         `yaml:"session_affinity"`
+	SessionAffinityTTLValue string        `yaml:"session_affinity_ttl"`
+	SessionAffinity         bool          `yaml:"-"`
+	SessionAffinityTTL      time.Duration `yaml:"-"`
+	LogMaxSizeMBValue       *string       `yaml:"log_max_size_mb"` // 保留原值以便报告字段级校验错误。
+	LogMaxBackupsValue      *string       `yaml:"log_max_backups"` // 显式解析以区分缺省值和非法输入。
+	LogMaxSizeMB            int64         `yaml:"-"`
+	LogMaxBackups           int           `yaml:"-"`
 
 	CacheDir            string      `yaml:"-"`
 	configMode          os.FileMode `yaml:"-"`
@@ -52,6 +58,7 @@ type accountConfig struct {
 	Token              string
 	Host               string // 规范化后的 host
 	User               string // 凭证文件名去掉 .json 后的 GitHub 用户名，保留原有大小写
+	Disabled           bool   // 凭证文件中的 disabled 字段；为 true 时启动后不参与轮询
 	credentialFile     string
 	credentialMode     os.FileMode
 	insecureCredential bool
@@ -110,6 +117,22 @@ func loadConfig(path string) (appConfig, error) {
 	config.LogsPath = resolveConfigPath(path, config.LogsPath)
 	config.Host = strings.TrimSpace(config.Host)
 	config.APIKey = strings.TrimSpace(config.APIKey)
+	config.ManagementKey = strings.TrimSpace(config.ManagementKey)
+	if config.ManagementKey != "" && config.ManagementKey == config.APIKey {
+		return appConfig{}, errors.New("management_key 必须与 api_key 不同")
+	}
+	config.SessionAffinity = true
+	if config.SessionAffinityValue != nil {
+		config.SessionAffinity = *config.SessionAffinityValue
+	}
+	config.SessionAffinityTTL = copilot.DefaultSessionAffinityTTL
+	if value := strings.TrimSpace(config.SessionAffinityTTLValue); value != "" {
+		ttl, err := time.ParseDuration(value)
+		if err != nil || ttl <= 0 {
+			return appConfig{}, fmt.Errorf("无效的 session_affinity_ttl %q，必须是大于 0 的 Go duration（例如 2h）", value)
+		}
+		config.SessionAffinityTTL = ttl
+	}
 	config.LogLevel = strings.ToLower(strings.TrimSpace(config.LogLevel))
 	if config.LogLevel == "" {
 		config.LogLevel = "info"
@@ -155,27 +178,49 @@ func loadConfig(path string) (appConfig, error) {
 		return appConfig{}, err
 	}
 
-	config.Accounts, err = loadAccounts(filepath.Join(config.DataPath, credentialsDirName), config.Host)
+	credentialsDir := filepath.Join(config.DataPath, credentialsDirName)
+	// 启用管理接口时可以从零个账号开始，因此凭证目录不存在时自动创建，并允许没有凭证文件。
+	allowEmpty := config.ManagementKey != ""
+	if allowEmpty {
+		if err := os.MkdirAll(credentialsDir, 0o700); err != nil {
+			return appConfig{}, fmt.Errorf("无法创建 credentials 目录 %q: %w", credentialsDir, err)
+		}
+	}
+	config.Accounts, err = loadAccounts(credentialsDir, config.Host, allowEmpty)
 	if err != nil {
 		return appConfig{}, err
 	}
-	// 启动前用与 serve 相同的配置校验账号，确保 loadConfig 通过即可创建轮询池。
-	if _, err := copilot.NewPool(config.copilotConfigs(nil)); err != nil {
+	// 启动前用与 serve 相同的配置校验账号，确保 loadConfig 通过即可创建账号池。
+	if _, err := copilot.NewManagedPool(config.poolConfig(nil), config.poolAccounts()); err != nil {
 		return appConfig{}, err
 	}
 	return config, nil
 }
 
-// copilotConfigs 为每个账号生成 copilot.Config，所有账号共享服务级设置。
-func (c appConfig) copilotConfigs(logger *slog.Logger) []copilot.Config {
-	configs := make([]copilot.Config, 0, len(c.Accounts))
+// poolConfig 生成账号池的服务级配置；账号相关的设置由 poolAccounts 提供。
+// 关闭会话亲和时 SessionAffinityTTL 为 0。
+func (c appConfig) poolConfig(logger *slog.Logger) copilot.PoolConfig {
+	affinityTTL := c.SessionAffinityTTL
+	if !c.SessionAffinity {
+		affinityTTL = 0
+	}
+	return copilot.PoolConfig{
+		APIKey: c.APIKey, ManagementKey: c.ManagementKey,
+		CredentialsDir: filepath.Join(c.DataPath, credentialsDirName), CacheDir: c.CacheDir,
+		Host: c.Host, ModelsCacheTTL: c.ModelsCacheTTL, SessionAffinityTTL: affinityTTL,
+		Logger: logger,
+	}
+}
+
+// poolAccounts 把已加载的账号转换为账号池的输入，保持凭证文件名的顺序。
+func (c appConfig) poolAccounts() []copilot.PoolAccount {
+	accounts := make([]copilot.PoolAccount, 0, len(c.Accounts))
 	for _, account := range c.Accounts {
-		configs = append(configs, copilot.Config{
-			Token: account.Token, Host: account.Host, User: account.User, APIKey: c.APIKey,
-			CacheDir: c.CacheDir, ModelsCacheTTL: c.ModelsCacheTTL, Logger: logger,
+		accounts = append(accounts, copilot.PoolAccount{
+			Token: account.Token, Host: account.Host, User: account.User, Disabled: account.Disabled,
 		})
 	}
-	return configs
+	return accounts
 }
 
 func resolveConfigPath(configFile, value string) string {

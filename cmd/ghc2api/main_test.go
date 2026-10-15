@@ -402,7 +402,8 @@ func TestLoadConfigFollowsSymlinkToRegularFileOnly(t *testing.T) {
 // TestLoadConfigRejectsInvalidGitHubUserNames 文件名去掉 .json 后必须是合法的 GitHub 用户名，错误信息包含文件名。
 func TestLoadConfigRejectsInvalidGitHubUserNames(t *testing.T) {
 	for _, name := range []string{
-		"-bad.json", "bad-.json", "a--b.json", "bad_name.json", "bad name.json", strings.Repeat("a", 40) + ".json",
+		"-bad.json", "bad-.json", "a--b.json", "bad__name.json", "bad-_name.json", "_bad.json", "bad_.json",
+		"bad.name.json", "bad name.json", strings.Repeat("a", 101) + ".json",
 	} {
 		t.Run(name, func(t *testing.T) {
 			configDir := isolatedConfigDir(t)
@@ -418,9 +419,10 @@ func TestLoadConfigRejectsInvalidGitHubUserNames(t *testing.T) {
 	}
 }
 
-// TestLoadConfigAcceptsValidGitHubUserNameBoundaries 合法的边界用户名（1 个字符、39 个字符、单个连字符）可以加载。
+// TestLoadConfigAcceptsValidGitHubUserNameBoundaries 合法的边界用户名（1 个字符、39 与 100 个字符、单个连字符或下划线、
+// 企业托管用户形式 mona-cat_octo）可以加载。
 func TestLoadConfigAcceptsValidGitHubUserNameBoundaries(t *testing.T) {
-	names := []string{"a", "a-b", strings.Repeat("a", 39), "A1-b2-C3"}
+	names := []string{"a", "a-b", "a_b", strings.Repeat("a", 39), strings.Repeat("a", 100), "A1-b2-C3", "mona-cat_octo"}
 	configDir := t.TempDir()
 	for i, name := range names {
 		writeCredentialFile(t, filepath.Join(configDir, "data", "credentials", name+".json"),
@@ -1246,5 +1248,263 @@ func TestLoadConfigRejectsUserNamesDifferingOnlyByCase(t *testing.T) {
 	message := err.Error()
 	if !strings.Contains(message, "重复") || (!strings.Contains(message, "Alice.json") && !strings.Contains(message, "alice.json")) {
 		t.Fatalf("错误信息应指出重复并包含文件名: %v", err)
+	}
+}
+
+// TestManagementKeyConfig management_key 去除首尾空白；与 api_key 相同（去空白后比较）时拒绝启动。
+func TestManagementKeyConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		contents string
+		want     string
+		wantErr  bool
+	}{
+		{name: "default-empty", contents: minimalConfig, want: ""},
+		{name: "trimmed", contents: "management_key: \"  mgmt-secret  \"\n", want: "mgmt-secret"},
+		{name: "same-as-api-key", contents: "management_key: shared-secret\napi_key: shared-secret\n", wantErr: true},
+		{name: "same-after-trim", contents: "management_key: \" shared-secret \"\napi_key: shared-secret\n", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			configPath := writeConfigWithAccount(t, "mgmt-config", accountJSON("mgmt-config-token"), tc.contents)
+			config, err := loadConfig(configPath)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("management_key 与 api_key 相同时未被拒绝")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadConfig() error = %v", err)
+			}
+			if config.ManagementKey != tc.want {
+				t.Fatalf("management_key = %q, want %q", config.ManagementKey, tc.want)
+			}
+		})
+	}
+}
+
+// TestSessionAffinityConfig session_affinity 默认开启，session_affinity_ttl 默认 2h；非法的开关或 TTL 被拒绝。
+func TestSessionAffinityConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		contents string
+		wantOn   bool
+		wantTTL  time.Duration
+		wantErr  bool
+	}{
+		{name: "defaults", contents: minimalConfig, wantOn: true, wantTTL: 2 * time.Hour},
+		{name: "disabled", contents: "session_affinity: false\n", wantOn: false, wantTTL: 2 * time.Hour},
+		{name: "custom-ttl", contents: "session_affinity_ttl: \"30m\"\n", wantOn: true, wantTTL: 30 * time.Minute},
+		{name: "invalid-switch", contents: "session_affinity: maybe\n", wantErr: true},
+		{name: "invalid-ttl", contents: "session_affinity_ttl: soon\n", wantErr: true},
+		{name: "zero-ttl", contents: "session_affinity_ttl: \"0s\"\n", wantErr: true},
+		{name: "negative-ttl", contents: "session_affinity_ttl: \"-1s\"\n", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			configPath := writeConfigWithAccount(t, "affinity-config", accountJSON("affinity-config-token"), tc.contents)
+			config, err := loadConfig(configPath)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("非法的会话亲和配置未被拒绝")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadConfig() error = %v", err)
+			}
+			if config.SessionAffinity != tc.wantOn || config.SessionAffinityTTL != tc.wantTTL {
+				t.Fatalf("session_affinity=%v ttl=%s, want %v %s", config.SessionAffinity, config.SessionAffinityTTL, tc.wantOn, tc.wantTTL)
+			}
+		})
+	}
+}
+
+// TestAccountDisabledFlagIsLoaded 凭证文件中的 disabled 被读取到账号配置中，省略时账号为启用状态。
+func TestAccountDisabledFlagIsLoaded(t *testing.T) {
+	configDir := isolatedConfigDir(t)
+	credentials := filepath.Join(configDir, "data", "credentials")
+	writeCredentialFile(t, filepath.Join(credentials, "alice.json"), `{"oauth_token":"disabled-token","disabled":true}`)
+	writeCredentialFile(t, filepath.Join(credentials, "bob.json"), accountJSON("enabled-token"))
+	config, err := loadConfig(writeConfigInDir(t, configDir, minimalConfig))
+	if err != nil {
+		t.Fatalf("loadConfig() error = %v", err)
+	}
+	if !accountByUser(t, config, "alice").Disabled {
+		t.Fatal("alice 的 disabled 字段未被读取")
+	}
+	if accountByUser(t, config, "bob").Disabled {
+		t.Fatal("bob 没有 disabled 字段却被禁用")
+	}
+}
+
+// TestManagementKeyAllowsEmptyCredentialsDirectory 设置 management_key 时，缺少的 credentials 目录会被创建，
+// 允许 0 个账号；未设置 management_key 时保持原有的失败行为。
+func TestManagementKeyAllowsEmptyCredentialsDirectory(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		contents  string
+		createDir bool
+		wantErr   bool
+	}{
+		{name: "management-key-creates-missing-directory", contents: "management_key: mgmt-secret\n"},
+		{name: "management-key-accepts-empty-directory", contents: "management_key: mgmt-secret\n", createDir: true},
+		{name: "without-management-key-missing-directory-fails", contents: minimalConfig, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			configDir := isolatedConfigDir(t)
+			credentials := filepath.Join(configDir, "data", "credentials")
+			if tc.createDir {
+				if err := os.MkdirAll(credentials, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			config, err := loadConfig(writeConfigInDir(t, configDir, tc.contents))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("未设置 management_key 且没有凭证时必须失败")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadConfig() error = %v", err)
+			}
+			if len(config.Accounts) != 0 {
+				t.Fatalf("accounts = %d, want 0", len(config.Accounts))
+			}
+			info, err := os.Stat(credentials)
+			if err != nil || !info.IsDir() {
+				t.Fatalf("credentials 目录未就绪: %v", err)
+			}
+			if runtime.GOOS != "windows" && info.Mode().Perm() != 0o700 {
+				t.Fatalf("credentials 目录权限 = %v, want 0700", info.Mode().Perm())
+			}
+		})
+	}
+}
+
+// TestPoolConfigMapsServiceSettings poolConfig 把服务级设置交给托管池：管理密钥、凭证目录、缓存目录、
+// 顶层 host；session_affinity 关闭时会话亲和 TTL 为 0。
+func TestPoolConfigMapsServiceSettings(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		contents string
+		wantTTL  time.Duration
+	}{
+		{name: "affinity-enabled", contents: "management_key: mgmt-secret\nhost: acme.ghe.com\n", wantTTL: 2 * time.Hour},
+		{name: "affinity-disabled", contents: "management_key: mgmt-secret\nhost: acme.ghe.com\nsession_affinity: false\n", wantTTL: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			configDir := isolatedConfigDir(t)
+			config, err := loadConfig(writeConfigInDir(t, configDir, tc.contents))
+			if err != nil {
+				t.Fatalf("loadConfig() error = %v", err)
+			}
+			pool := config.poolConfig(nil)
+			if pool.ManagementKey != "mgmt-secret" || pool.Host != "acme.ghe.com" || pool.SessionAffinityTTL != tc.wantTTL {
+				t.Fatalf("PoolConfig = %+v, want 管理密钥 mgmt-secret、host acme.ghe.com、亲和 TTL %s", pool, tc.wantTTL)
+			}
+			if pool.CredentialsDir != filepath.Join(configDir, "data", "credentials") ||
+				pool.CacheDir != filepath.Join(configDir, "data", "cache") {
+				t.Fatalf("凭证目录 = %q, 缓存目录 = %q", pool.CredentialsDir, pool.CacheDir)
+			}
+		})
+	}
+}
+
+// freeLoopbackAddressForTest 返回一个当前空闲的 127.0.0.1 地址。
+func freeLoopbackAddressForTest(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return addr
+}
+
+// startServiceForTest 在后台运行 run，等待 /healthz 就绪后返回基础地址；测试结束时取消上下文并等待退出。
+func startServiceForTest(t *testing.T, configPath, addr string) string {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	var stdout, stderr synchronizedBuffer
+	done := make(chan struct{})
+	var runErr error
+	go func() {
+		defer close(done)
+		runErr = run(ctx, []string{"-c", configPath}, &stdout, &stderr)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+			if runErr != nil && !errors.Is(runErr, context.Canceled) && !errors.Is(runErr, http.ErrServerClosed) {
+				t.Errorf("服务关闭错误: %v", runErr)
+			}
+		case <-time.After(15 * time.Second):
+			t.Error("服务在取消上下文后未退出")
+		}
+	})
+
+	baseURL := "http://" + addr
+	client := &http.Client{Timeout: 300 * time.Millisecond}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		select {
+		case <-done:
+			t.Fatalf("服务未能启动: %v; stderr=%s", runErr, stderr.String())
+		default:
+		}
+		if res, err := client.Get(baseURL + "/healthz"); err == nil {
+			_, _ = io.Copy(io.Discard, res.Body)
+			_ = res.Body.Close()
+			if res.StatusCode == http.StatusOK {
+				return baseURL
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("配置的监听地址未启动; stdout=%s stderr=%s", stdout.String(), stderr.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestRunServesWithoutCredentialsWhenManagementKeySet 设置 management_key 且没有任何凭证时服务仍能启动：
+// 控制台可以访问，管理接口返回空的账号列表。
+func TestRunServesWithoutCredentialsWhenManagementKeySet(t *testing.T) {
+	addr := freeLoopbackAddressForTest(t)
+	configDir := isolatedConfigDir(t)
+	const key = "live-management-key"
+	configPath := writeConfigInDir(t, configDir, fmt.Sprintf("listen: %s\nmanagement_key: %s\n",
+		strconv.Quote(addr), strconv.Quote(key)))
+	baseURL := startServiceForTest(t, configPath, addr)
+
+	page, err := http.Get(baseURL + "/management")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = page.Body.Close()
+	if page.StatusCode != http.StatusOK || !strings.HasPrefix(page.Header.Get("Content-Type"), "text/html") {
+		t.Fatalf("GET /management status=%d content-type=%q", page.StatusCode, page.Header.Get("Content-Type"))
+	}
+
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/v0/management/accounts", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var accounts []map[string]any
+	if res.StatusCode != http.StatusOK || json.NewDecoder(res.Body).Decode(&accounts) != nil || len(accounts) != 0 {
+		t.Fatalf("管理接口 status=%d accounts=%v, want 200 且为空列表", res.StatusCode, accounts)
+	}
+	if info, err := os.Stat(filepath.Join(configDir, "data", "credentials")); err != nil || !info.IsDir() {
+		t.Fatalf("credentials 目录未被创建: %v", err)
 	}
 }

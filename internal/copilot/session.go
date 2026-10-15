@@ -96,11 +96,9 @@ func (s *Service) getSession(ctx context.Context) (session, error) {
 	}
 	s.session = fresh
 	s.addSecret(fresh.Token)
-	if path := s.cacheFile("session"); path != "" {
-		cache := cachedSession{Token: fresh.Token, ExpiresAt: fresh.ExpiresAt, API: fresh.API}
-		if err := writeCacheFile(path, cache); err != nil {
-			s.log(ctx, slog.LevelWarn, "写入磁盘 session 缓存失败", "error", s.redactString(err.Error()))
-		}
+	cache := cachedSession{Token: fresh.Token, ExpiresAt: fresh.ExpiresAt, API: fresh.API}
+	if err := s.writeCache("session", cache); err != nil {
+		s.log(ctx, slog.LevelWarn, "写入磁盘 session 缓存失败", "error", s.redactString(err.Error()))
 	}
 	s.log(ctx, slog.LevelInfo, "Copilot session 获取成功", "expires_at", fresh.ExpiresAt, "api_host", fresh.API)
 	return fresh, nil

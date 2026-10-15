@@ -16,6 +16,29 @@ func (s *Service) cacheFile(name string) string {
 	return filepath.Join(s.cacheDir, name+".json")
 }
 
+// writeCache 把缓存写入账号的缓存目录。账号已删除时直接跳过，保证删除后不会重新创建缓存目录。
+// 读锁与 removeCache 的写锁互斥：删除完成前的写入先完成，删除之后的写入都会被跳过。
+func (s *Service) writeCache(name string, value any) error {
+	s.cacheMu.RLock()
+	defer s.cacheMu.RUnlock()
+	path := s.cacheFile(name)
+	if path == "" || s.cacheRemoved {
+		return nil
+	}
+	return writeCacheFile(path, value)
+}
+
+// removeCache 标记账号已删除并删除其缓存目录。之后 writeCache 不再写入。
+func (s *Service) removeCache() error {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	s.cacheRemoved = true
+	if s.cacheDir == "" {
+		return nil
+	}
+	return os.RemoveAll(s.cacheDir)
+}
+
 func readCacheFile(path string, value any) error {
 	file, err := os.Open(path)
 	if err != nil {

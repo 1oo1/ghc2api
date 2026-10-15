@@ -1,2 +1,3 @@
-- [x] 我想支持多 github copilot 账号，使用 round-robin 机制切换账号
-- [x] 实现 round-robin 账号切换的逻辑，包括获取下一个可用账号和更新当前使用的账号
+- [x] 添加会话亲和性功能，确保同一个客户端的会话总是使用同一个账号，提升 upstream 的模型缓存命中率。参考另一个项目中的 `/Users/zc/Downloads/cpa-github-copilot/internal/app/affinity.go`
+- [x] copilot 账号使用量统计除了 Credits，还需要添加 Additional Budget，具体请参考 `/Users/zc/Downloads/cpa-github-copilot/internal/copilot/quota.go`
+- [x] 添加 web 控制界面，用于管理 copilot 账号和查看使用量统计。可以直接 copy `/Users/zc/Downloads/cpa-github-copilot/web`，然后添加对应的 managment 相关 api。

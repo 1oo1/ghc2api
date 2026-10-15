@@ -100,3 +100,76 @@ func TestCredentialsRejectInvalidInput(t *testing.T) {
 		}
 	}
 }
+
+// TestCredentialDisabledFlagRoundTrip disabled 为 true 时写入文件，为 false 时省略该字段，读回后保持原值。
+func TestCredentialDisabledFlagRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "alice.json")
+	if err := SaveCredential(path, Credential{Token: "oauth-disabled", User: "alice", Disabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadCredential(path)
+	if err != nil || !c.Disabled {
+		t.Fatalf("LoadCredential(disabled) = %+v, %v; want Disabled=true", c, err)
+	}
+	fields := readCredentialFieldsForTest(t, path)
+	if fields["disabled"] != true {
+		t.Fatalf("禁用的凭证文件 disabled 字段 = %v, want true", fields["disabled"])
+	}
+
+	if err := SaveCredential(path, Credential{Token: "oauth-disabled", User: "alice"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := readCredentialFieldsForTest(t, path)["disabled"]; ok {
+		t.Fatal("启用的凭证不应写入 disabled 字段")
+	}
+	c, err = LoadCredential(path)
+	if err != nil || c.Disabled {
+		t.Fatalf("LoadCredential(enabled) = %+v, %v; want Disabled=false", c, err)
+	}
+}
+
+// TestCredentialDisabledFieldReadFromFile 手写的凭证文件中 disabled 被读取，省略时为 false，非布尔值被拒绝。
+func TestCredentialDisabledFieldReadFromFile(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		raw     string
+		want    bool
+		wantErr bool
+	}{
+		{name: "true", raw: `{"oauth_token":"t","disabled":true}`, want: true},
+		{name: "false", raw: `{"oauth_token":"t","disabled":false}`, want: false},
+		{name: "omitted", raw: `{"oauth_token":"t"}`, want: false},
+		{name: "not-a-boolean", raw: `{"oauth_token":"t","disabled":"yes"}`, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "credential.json")
+			if err := os.WriteFile(path, []byte(tc.raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			c, err := LoadCredential(path)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("LoadCredential(%s) should reject", tc.raw)
+				}
+				return
+			}
+			if err != nil || c.Disabled != tc.want {
+				t.Fatalf("LoadCredential(%s) = %+v, %v; want Disabled=%v", tc.raw, c, err, tc.want)
+			}
+		})
+	}
+}
+
+// readCredentialFieldsForTest 以原始 JSON 对象读取凭证文件，用于断言文件中是否存在某个字段。
+func readCredentialFieldsForTest(t *testing.T, path string) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatal(err)
+	}
+	return fields
+}

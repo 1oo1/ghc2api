@@ -8,3 +8,4 @@
 /.env
 /bin/
 /data/
+/web/node_modules/

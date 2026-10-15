@@ -75,7 +75,7 @@ func serve(ctx context.Context, config appConfig, logger *slog.Logger) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	pool, err := copilot.NewPool(config.copilotConfigs(logger))
+	pool, err := copilot.NewManagedPool(config.poolConfig(logger), config.poolAccounts())
 	if err != nil {
 		return err
 	}

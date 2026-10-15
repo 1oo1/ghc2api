@@ -296,16 +296,16 @@ func TestNewPoolAcceptsDistinctAccountsInConfigOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPool() error = %v", err)
 	}
-	if len(pool.services) != 3 {
-		t.Fatalf("services = %d, want 3", len(pool.services))
+	if len(pool.accounts) != 3 {
+		t.Fatalf("accounts = %d, want 3", len(pool.accounts))
 	}
 	for i, want := range []string{"oauth-a", "oauth-b", "oauth-a"} {
-		if got := pool.services[i].config.Token; got != want {
-			t.Errorf("services[%d] token = %q, want %q", i, got, want)
+		if got := pool.accounts[i].service.config.Token; got != want {
+			t.Errorf("accounts[%d] token = %q, want %q", i, got, want)
 		}
 	}
-	if got := pool.services[1].config.Host; got != "acme.ghe.com" {
-		t.Errorf("services[1] host = %q, want acme.ghe.com", got)
+	if got := pool.accounts[1].service.config.Host; got != "acme.ghe.com" {
+		t.Errorf("accounts[1] host = %q, want acme.ghe.com", got)
 	}
 }
 
@@ -342,7 +342,7 @@ func TestPoolNextRoundRobin(t *testing.T) {
 
 func TestPoolNextSkipsCoolingAccountWithoutExtraAdvance(t *testing.T) {
 	p := testPool(t, poolConfigs(t, nil, "oauth-a", "oauth-b", "oauth-c"))
-	p.services[1].setCooldown(time.Now().Add(time.Hour))
+	p.accounts[1].service.setCooldown(time.Now().Add(time.Hour))
 	// B 冷却期间，请求依次落在 A、C；跳过 B 不应额外消耗轮询位置。
 	for i, want := range []int{0, 2, 0, 2, 0, 2} {
 		if got := p.next(); got != want {
@@ -353,14 +353,14 @@ func TestPoolNextSkipsCoolingAccountWithoutExtraAdvance(t *testing.T) {
 
 func TestPoolNextReturnsAccountAfterCooldownExpires(t *testing.T) {
 	p := testPool(t, poolConfigs(t, nil, "oauth-a", "oauth-b", "oauth-c"))
-	p.services[1].setCooldown(time.Now().Add(time.Hour))
+	p.accounts[1].service.setCooldown(time.Now().Add(time.Hour))
 	for i, want := range []int{0, 2, 0} {
 		if got := p.next(); got != want {
 			t.Fatalf("冷却期内 next() 第 %d 次 = %d, want %d", i, got, want)
 		}
 	}
 	// 不等待真实时间：把冷却截止时间设为已经过去，模拟冷却过期。
-	p.services[1].setCooldown(time.Now().Add(-time.Second))
+	p.accounts[1].service.setCooldown(time.Now().Add(-time.Second))
 	// 游标此时位于 B，冷却过期后 B 应重新参与轮询。
 	for i, want := range []int{1, 2, 0} {
 		if got := p.next(); got != want {
@@ -372,8 +372,8 @@ func TestPoolNextReturnsAccountAfterCooldownExpires(t *testing.T) {
 func TestPoolNextFallsBackToPlainRoundRobinWhenAllCooling(t *testing.T) {
 	p := testPool(t, poolConfigs(t, nil, "oauth-a", "oauth-b", "oauth-c"))
 	until := time.Now().Add(time.Hour)
-	for _, s := range p.services {
-		s.setCooldown(until)
+	for _, a := range p.accounts {
+		a.service.setCooldown(until)
 	}
 	// 全部冷却时忽略冷却，按游标位置纯轮询，避免所有请求都无账号可用。
 	for i, want := range []int{0, 1, 2, 0} {
@@ -578,8 +578,8 @@ func TestPoolCancelledRequestDoesNotCoolAccounts(t *testing.T) {
 		t.Fatalf("已取消请求访问了上游 %d 次", got)
 	}
 	now := time.Now()
-	for i, s := range p.services {
-		if !s.available(now) {
+	for i, a := range p.accounts {
+		if !a.service.available(now) {
 			t.Errorf("客户端取消的请求不应冷却账号 %d", i)
 		}
 	}
@@ -734,8 +734,8 @@ func TestPoolSessionFreeRoutesIgnoreSessionFailures(t *testing.T) {
 		}
 	}
 	now := time.Now()
-	for i, s := range p.services {
-		if !s.available(now) {
+	for i, a := range p.accounts {
+		if !a.service.available(now) {
 			t.Errorf("不需要 session 的请求不应冷却账号 %d", i)
 		}
 	}

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 
@@ -18,17 +17,11 @@ const credentialsDirName = "credentials"
 // credentialFileExt 是凭证文件的扩展名；去掉它后的文件名即 GitHub 用户名。
 const credentialFileExt = ".json"
 
-// maxGitHubUserNameLength 是 GitHub 用户名允许的最大长度。
-const maxGitHubUserNameLength = 39
-
-// githubUserName 只允许字母和数字组成的片段，片段之间以单个连字符分隔，
-// 因此不会以连字符开头或结尾，也不含连续连字符。
-var githubUserName = regexp.MustCompile(`^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$`)
-
 // loadAccounts 扫描 credentialsDir 这一层的凭证文件，每个文件对应一个账号，结果按文件名字节序排列。
 // 只处理扩展名为 .json 的普通文件（符号链接按其目标判断）；隐藏文件、其他扩展名、子目录和指向目录的链接都被忽略。
-// 顶层 host 非空时覆盖所有账号的 host。账号重复由 copilot.NewPool 检查。
-func loadAccounts(credentialsDir, topHost string) ([]accountConfig, error) {
+// 顶层 host 非空时覆盖所有账号的 host。账号重复由 copilot.NewManagedPool 检查。
+// allowEmpty 为 true 时允许没有任何凭证文件（启用管理接口时账号可以通过控制台添加）。
+func loadAccounts(credentialsDir, topHost string, allowEmpty bool) ([]accountConfig, error) {
 	entries, err := os.ReadDir(credentialsDir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -63,7 +56,7 @@ func loadAccounts(credentialsDir, topHost string) ([]accountConfig, error) {
 		fileByUser[key] = name
 		accounts = append(accounts, account)
 	}
-	if len(accounts) == 0 {
+	if len(accounts) == 0 && !allowEmpty {
 		return nil, fmt.Errorf("credentials 目录 %q 中没有凭证文件，请放入以 GitHub 用户名命名的 .json 文件", credentialsDir)
 	}
 	return accounts, nil
@@ -87,9 +80,9 @@ func isRegularFile(path string) (bool, error) {
 // 错误信息中的文件名都带 .json 后缀，便于定位。
 func loadAccount(path, fileName, topHost string) (accountConfig, error) {
 	user := strings.TrimSuffix(fileName, credentialFileExt)
-	if !validGitHubUserName(user) {
+	if !copilot.ValidGitHubUserName(user) {
 		return accountConfig{}, fmt.Errorf("凭证文件 %q 的文件名不是合法的 GitHub 用户名："+
-			"只能包含字母、数字和单个连字符，不能以连字符开头或结尾，长度 1 到 %d", fileName, maxGitHubUserNameLength)
+			"只能包含字母、数字，片段之间以单个连字符或下划线分隔，不能以分隔符开头或结尾，长度 1 到 100", fileName)
 	}
 	credential, err := copilot.LoadCredential(path)
 	if err != nil {
@@ -105,7 +98,7 @@ func loadAccount(path, fileName, topHost string) (accountConfig, error) {
 	if err != nil {
 		return accountConfig{}, err
 	}
-	account := accountConfig{Token: credential.Token, Host: host, User: user, credentialFile: path}
+	account := accountConfig{Token: credential.Token, Host: host, User: user, Disabled: credential.Disabled, credentialFile: path}
 	if runtime.GOOS != "windows" {
 		info, err := os.Stat(path)
 		if err != nil {
@@ -115,9 +108,4 @@ func loadAccount(path, fileName, topHost string) (accountConfig, error) {
 		account.insecureCredential = account.credentialMode&0o077 != 0
 	}
 	return account, nil
-}
-
-// validGitHubUserName 检查用户名的长度与字符规则。
-func validGitHubUserName(name string) bool {
-	return len(name) >= 1 && len(name) <= maxGitHubUserNameLength && githubUserName.MatchString(name)
 }

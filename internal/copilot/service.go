@@ -30,6 +30,9 @@ type Service struct {
 
 	cacheDir       string
 	modelsCacheTTL time.Duration
+	// cacheMu 串行化缓存写入与账号删除，cacheRemoved 为账号已删除的标记（见 writeCache、removeCache）。
+	cacheMu      sync.RWMutex
+	cacheRemoved bool
 
 	requestSeq atomic.Uint64
 	// cooldownUntil 是账号冷却截止时间（UnixNano），0 表示从未冷却，见 pool.go。
@@ -109,8 +112,9 @@ const (
 
 // routeEntry 登记一条业务路由的路径及其上游访问方式。
 type routeEntry struct {
-	path string
-	need routeNeed
+	path     string
+	need     routeNeed
+	upstream string // 生成接口的上游路径（用于会话亲和）；其他路由为空
 }
 
 // serviceRoutes 是 Service 的业务路由。entries 以 ServeMux 的 pattern（如 "GET /v1/models"）为键，
@@ -125,12 +129,12 @@ func (s *Service) routes() serviceRoutes {
 	routes := serviceRoutes{mux: http.NewServeMux(), entries: map[string]routeEntry{}}
 	routes.handle("GET", "/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	}, needNone)
+	}, routeEntry{need: needNone})
 	for _, path := range []string{"/models", "/v1/models"} {
-		routes.handle("GET", path, s.handleModels, needSession)
+		routes.handle("GET", path, s.handleModels, routeEntry{need: needSession})
 	}
 	for _, path := range []string{"/usage", "/v1/usage"} {
-		routes.handle("GET", path, s.handleUsage, needAccount)
+		routes.handle("GET", path, s.handleUsage, routeEntry{need: needAccount})
 	}
 	for local, upstream := range map[string]string{
 		"/chat/completions": "/chat/completions", "/v1/chat/completions": "/chat/completions",
@@ -138,16 +142,17 @@ func (s *Service) routes() serviceRoutes {
 	} {
 		routes.handle("POST", local, func(w http.ResponseWriter, r *http.Request) {
 			s.handleGeneration(w, r, upstream)
-		}, needSession)
+		}, routeEntry{need: needSession, upstream: upstream})
 	}
 	return routes
 }
 
-// handle 注册一条路由并登记其访问上游的方式。
-func (t serviceRoutes) handle(method, path string, handler http.HandlerFunc, need routeNeed) {
+// handle 注册一条路由并登记其访问上游的方式；entry 的 path 由本函数填入。
+func (t serviceRoutes) handle(method, path string, handler http.HandlerFunc, entry routeEntry) {
 	pattern := method + " " + path
 	t.mux.HandleFunc(pattern, handler)
-	t.entries[pattern] = routeEntry{path: path, need: need}
+	entry.path = path
+	t.entries[pattern] = entry
 }
 
 // requireAPIKey 对除 /healthz 外的请求校验服务访问密钥；apiKey 为空时不鉴权。
@@ -165,18 +170,18 @@ func requireAPIKey(apiKey string, logf logFunc, next http.Handler) http.Handler 
 
 // authorizedRequest 检查请求是否携带与 apiKey 相同的 Bearer 或 X-Api-Key 密钥。
 func authorizedRequest(apiKey string, r *http.Request) bool {
-	expected := sha256.Sum256([]byte(apiKey))
 	bearer := ""
 	if value := r.Header.Get("Authorization"); strings.HasPrefix(value, "Bearer ") {
 		bearer = strings.TrimPrefix(value, "Bearer ")
 	}
-	for _, value := range []string{bearer, r.Header.Get("X-Api-Key")} {
-		actual := sha256.Sum256([]byte(value))
-		if subtle.ConstantTimeCompare(expected[:], actual[:]) == 1 {
-			return true
-		}
-	}
-	return false
+	return secretMatches(apiKey, bearer) || secretMatches(apiKey, r.Header.Get("X-Api-Key"))
+}
+
+// secretMatches 以常量时间比较两个密钥（先哈希，使比较时间与长度无关）。
+func secretMatches(expected, actual string) bool {
+	e := sha256.Sum256([]byte(expected))
+	a := sha256.Sum256([]byte(actual))
+	return subtle.ConstantTimeCompare(e[:], a[:]) == 1
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

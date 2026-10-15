@@ -15,6 +15,8 @@ type Credential struct {
 	Token string `json:"oauth_token"`
 	Host  string `json:"host,omitempty"`
 	User  string `json:"user,omitempty"`
+	// Disabled 为 true 时账号启动后不参与轮询，由管理接口写入。
+	Disabled bool `json:"disabled,omitempty"`
 }
 
 func validateCredential(c Credential) (Credential, error) {
