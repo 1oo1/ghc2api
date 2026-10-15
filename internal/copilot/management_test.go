@@ -499,8 +499,8 @@ func TestManagementAccountsListShowsQuotaAndRequestStats(t *testing.T) {
 	}
 }
 
-// TestManagementQuotaIsCachedForSixtySecondsUnlessRefreshed 额度在 60 秒内不重复请求上游，强制刷新除外。
-func TestManagementQuotaIsCachedForSixtySecondsUnlessRefreshed(t *testing.T) {
+// TestManagementQuotaIsCachedUnlessRefreshed 额度在 2 小时内不重复请求上游，强制刷新除外。
+func TestManagementQuotaIsCachedUnlessRefreshed(t *testing.T) {
 	up := newMgmtUpstream(t)
 	p, _ := mgmtNewPool(t, up, 0, "alice", "bob")
 	mgmtAccounts(t, p) // 首次列表：两个账号都没有额度缓存，各拉取一次。
@@ -513,6 +513,31 @@ func TestManagementQuotaIsCachedForSixtySecondsUnlessRefreshed(t *testing.T) {
 	}
 	if alice, bob := up.quotaCount("oauth-alice"), up.quotaCount("oauth-bob"); alice != 2 || bob != 1 {
 		t.Fatalf("强制刷新后额度请求次数 alice=%d bob=%d, want 2 与 1", alice, bob)
+	}
+}
+
+// TestManagementQuotaExpiresAfterCacheTTL 距上次尝试不足 quotaCacheTTL 时不重复请求上游；超过该时长后，列表重新请求一次。
+func TestManagementQuotaExpiresAfterCacheTTL(t *testing.T) {
+	up := newMgmtUpstream(t)
+	p, _ := mgmtNewPool(t, up, 0, "alice")
+	mgmtAccounts(t, p) // 首次列表：拉取一次额度。
+	account := p.findAccount("alice")
+	setCheckedAt := func(ago time.Duration) {
+		account.quota.mu.Lock()
+		account.quota.checkedAt = time.Now().Add(-ago)
+		account.quota.mu.Unlock()
+	}
+
+	setCheckedAt(quotaCacheTTL - time.Minute) // 距上次尝试仍不足 TTL：缓存有效，不请求上游。
+	mgmtAccounts(t, p)
+	if got := up.quotaCount("oauth-alice"); got != 1 {
+		t.Fatalf("TTL 内列表后额度请求次数 = %d, want 1", got)
+	}
+
+	setCheckedAt(quotaCacheTTL + time.Second) // 超过 TTL：缓存过期，列表重新请求一次。
+	mgmtAccounts(t, p)
+	if got := up.quotaCount("oauth-alice"); got != 2 {
+		t.Fatalf("TTL 过期后列表额度请求次数 = %d, want 2", got)
 	}
 }
 

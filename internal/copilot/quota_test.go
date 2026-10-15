@@ -405,3 +405,10 @@ func TestFetchQuotaForbiddenWithRetryAfterIsRateLimited(t *testing.T) {
 		})
 	}
 }
+
+// TestQuotaCacheTTLIsTwoHours 额度的自动刷新间隔为 2 小时；强制刷新不受该间隔限制。
+func TestQuotaCacheTTLIsTwoHours(t *testing.T) {
+	if quotaCacheTTL != 2*time.Hour {
+		t.Fatalf("quotaCacheTTL = %s, want 2h", quotaCacheTTL)
+	}
+}

@@ -130,10 +130,10 @@ func parseQuota(raw []byte) (Quota, error)
 2xx 时解析并设置 `ObservedAt`；429 返回 `errQuotaRateLimited`（`var errQuotaRateLimited = errors.New(...)`，调用方用 `errors.Is` 判断）；
 403 且带 `Retry-After` 头同样视为限流（返回 `errQuotaRateLimited`），没有该头的 403 仍是普通错误；
 限流时调用方保留旧数据并置 `Stale=true`；其他非 2xx 返回 `*upstreamError`；2xx 但正文非法时返回解析错误。
-- 节流：额度按账号的 `checkedAt`（最近一次**尝试**的时间）节流，距今不足 60 秒时不重复请求上游（强制刷新除外）。
-  失败与超时同样计为一次尝试，60 秒内不会因为列表反复刷新而再次请求。**调用方主动取消**（`context.Canceled`，例如客户端断开）不是上游状态，
+- 节流：额度按账号的 `checkedAt`（最近一次**尝试**的时间）节流，距今不足 2 小时时不重复请求上游（强制刷新除外）。
+  失败与超时同样计为一次尝试，2 小时内不会因为列表反复刷新而再次请求。**调用方主动取消**（`context.Canceled`，例如客户端断开）不是上游状态，
   不算一次尝试：不更新 `checkedAt`，也不写入 `quota_error`，下一次列表请求会重新请求上游。
-- `GET accounts`：对从未获取或距上次尝试超过 60 秒的账号并发刷新（总超时 10 秒）。刷新失败时：
+- `GET accounts`：对从未获取或距上次尝试超过 2 小时的账号并发刷新（总超时 10 秒）。刷新失败时：
   429 保留旧数据并置 `Stale=true`；其他错误有旧数据则保留并设置 `quota_error`，没有旧数据则只设置 `quota_error`。失败不影响 200。
 - `POST quota/refresh`（强制刷新，忽略节流）：
   - 429 返回 200、保留旧数据并 `Stale=true`；
@@ -174,7 +174,7 @@ func parseQuota(raw []byte) (Quota, error)
 | 方法与路径 | 请求 | 响应 |
 | --- | --- | --- |
 | `GET /management` | 无需鉴权 | 控制台 HTML（`web.Index()`），`Content-Type: text/html; charset=utf-8` |
-| `GET /v0/management/accounts` | — | `[]AccountView`；顺带为额度缓存超过 60 秒的账号并发刷新额度（总超时 10 秒，失败不影响返回） |
+| `GET /v0/management/accounts` | — | `[]AccountView`；顺带为额度缓存超过 2 小时的账号并发刷新额度（总超时 10 秒，失败不影响返回） |
 | `POST /v0/management/accounts` | `{"credential":{"oauth_token":"...","host":"","user":""}}` | `200 AccountView`；见下 |
 | `PATCH /v0/management/accounts` | `{"id":"alice","disabled":true}` | `200 AccountView` |
 | `DELETE /v0/management/accounts?id=alice` | — | `200 {"ok":true}` |

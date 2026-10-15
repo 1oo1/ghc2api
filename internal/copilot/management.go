@@ -111,7 +111,7 @@ func decodeManagementJSON(w http.ResponseWriter, r *http.Request, value any) boo
 	return false
 }
 
-// handleListAccounts 返回全部账号。额度缓存超过 60 秒的账号并发刷新（总超时 10 秒），刷新失败不影响结果。
+// handleListAccounts 返回全部账号。额度缓存超过 quotaCacheTTL（2 小时）的账号并发刷新（总超时 10 秒），刷新失败不影响结果。
 func (p *Pool) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), quotaRefreshTimeout)
 	defer cancel()

@@ -9,8 +9,9 @@ import (
 	"time"
 )
 
-// quotaCacheTTL 是额度的刷新间隔：距上次尝试不足该时长时不重复请求上游（强制刷新除外）。
-const quotaCacheTTL = time.Minute
+// quotaCacheTTL 是额度的自动刷新间隔（2 小时）：距上次尝试不足该时长时不重复请求上游；
+// 控制台的「刷新额度」（POST quota/refresh）为强制刷新，不受该间隔限制。
+const quotaCacheTTL = 2 * time.Hour
 
 // maxQuotaResetSeconds 是重置时间戳的上限（公元 10000 年），超过则视为无效。
 const maxQuotaResetSeconds = 253402300800
