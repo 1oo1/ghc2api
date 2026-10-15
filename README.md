@@ -1,7 +1,7 @@
 # ghc2api
 
 从 magpie 的 GitHub Copilot provider 提取的独立 Go HTTP 服务，配置解析使用 `yaml.v3`。
-当前实现以 magpie 上游提交 `250bdd5c` 为对照基线；源码定位与后续同步流程见
+当前实现以 magpie 上游提交 `a1f7b8c1` 为对照基线；源码定位与后续同步流程见
 [`docs/magpie-copilot-sync.md`](docs/magpie-copilot-sync.md)。
 
 ## 配置与启动

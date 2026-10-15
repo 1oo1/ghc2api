@@ -3,7 +3,7 @@
 本项目是从 magpie 拆分的独立服务，不是 magpie 的子模块或自动镜像。同步时以
 [magpie GitHub 仓库](https://github.com/yetone/magpie) 中实际跟踪的源码、测试和提交历史为准。
 
-当前实现对照的上游基线：`250bdd5c4f6c00740ad4133512bf63fd2745bd70`。
+当前实现对照的上游基线：`a1f7b8c13fd51473ca52e08ef4cc7334bc4a0337`。
 完成后续同步并通过验证时，应将本文和 README 中记录的基线更新为实际核对的上游提交。
 
 ## 获取或更新上游
@@ -44,7 +44,7 @@ git -C .local/magpie log -1 --format='%H %cs %s'
 从上次同步记录的提交开始查看相关差异。首次核对可用本文开头的基线：
 
 ```sh
-BASE=250bdd5c4f6c00740ad4133512bf63fd2745bd70
+BASE=a1f7b8c13fd51473ca52e08ef4cc7334bc4a0337
 git -C .local/magpie diff --name-status "${BASE}..HEAD"
 git -C .local/magpie diff "${BASE}..HEAD" -- \
   internal/provider/account.go \
