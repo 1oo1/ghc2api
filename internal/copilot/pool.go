@@ -166,7 +166,7 @@ func (p *Pool) addConfigured(index int, config Config, disabled bool, priority i
 	return nil
 }
 
-// newPool 按服务级配置创建空池，并按配置启用会话亲和与管理接口。
+// newPool 按服务级配置创建空池，并按配置启用会话亲和与管理接口。开启会话亲和且 CacheDir 非空时，启动即加载绑定文件（见 loadSessionAffinity）。
 func newPool(config PoolConfig) *Pool {
 	logger := config.Logger
 	if logger == nil {
@@ -178,6 +178,7 @@ func newPool(config PoolConfig) *Pool {
 	}
 	if config.SessionAffinityTTL > 0 {
 		p.affinity = newAffinityTable(config.SessionAffinityTTL)
+		p.loadSessionAffinity()
 	}
 	if config.ManagementKey != "" {
 		p.logins = make(map[string]*deviceLogin)

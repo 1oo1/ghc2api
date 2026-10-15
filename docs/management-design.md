@@ -64,7 +64,7 @@ func NewManagedPool(config PoolConfig, accounts []PoolAccount) (*Pool, error)
 
 ## 3. 会话亲和（internal/copilot/affinity.go）
 
-- 默认 TTL：`DefaultSessionAffinityTTL = 2 * time.Hour`；绑定表上限 `maxSessionBindings = 4096` 条，满时先删除过期项，
+- 默认 TTL：`DefaultSessionAffinityTTL = 2 * time.Hour`；绑定表上限 `maxSessionBindings = 500` 条，满时先删除过期项，
   仍满则删除最早过期的一条（并列按键字典序），续期已有键不触发淘汰。
 - 绑定表（测试依赖的内部接口）：
   - `newAffinityTable(ttl time.Duration) *affinityTable`；`SessionAffinityTTL<=0` 时 Pool 不创建绑定表。
@@ -72,6 +72,15 @@ func NewManagedPool(config PoolConfig, accounts []PoolAccount) (*Pool, error)
   - `(t *affinityTable) lookup(key string, now time.Time) (accountID string, ok bool)`：截止时刻及之后视为不存在。
   - `(t *affinityTable) count() int`：当前条数（含尚未清理的过期项；满表插入后的条数即清理与淘汰的结果）。
   - 所有方法并发安全。
+- 持久化（`internal/copilot/affinity_store.go`）：
+  - `(t *affinityTable) save(path string, now time.Time) error`：只写入 `now` 时刻仍有效的绑定，经 `writeCacheFile` 原子写入，权限 0600。
+  - `(t *affinityTable) load(path string, now time.Time) error`：文件不存在时返回 nil 且表为空；文件损坏返回错误且表保持不变。
+    丢弃截止时刻及之后的项与 `key` 或账号 ID 为空的项；每条有效期取 `min(文件中的截止时刻, now+ttl)`；
+    超过 `maxSessionBindings` 条时保留截止时刻最晚的，并列时键字典序小者优先。
+  - 文件为 `<CacheDir>/session_affinity.json`，格式 `{"version":1,"bindings":[{"key","account","expires"}]}`。
+  - `(*Pool).SaveSessionAffinity() error`：未开启亲和或 `CacheDir` 为空时返回 nil 且不做任何事。`newPool` 在开启亲和且 `CacheDir` 非空时启动即加载；加载失败只输出 Warn（消息含「会话亲和」，不含完整会话键），池以空表照常启动。
+  - cmd 层 `serve` 在 HTTP 服务关闭（Shutdown 完成）之后调用（用 defer 保证信号退出与异常退出都会保存）：成功输出 Info「会话亲和：已保存」，失败输出 Warn，均不改变 serve 的返回值。
+  - 绑定只在关闭时保存、启动时加载；进程被强杀时最近的绑定会丢失，属于可接受的缓存语义。
 - 只对 POST 生成请求（chat completions、responses、`/v1/messages`）生效；模型列表、用量不使用亲和。
 - Pool 在选账号前读取请求体（最多 16 MiB），计算会话键后把请求体原样还给下游 handler；超过上限时不计算会话键，
   并保证下游仍能读到完整请求体从而返回原有的 413。
@@ -289,8 +298,8 @@ session_affinity_ttl: "2h"
 - `MinPriority`、`MaxPriority`（`credentials.go`）；`quotaWeight`、`weigh(*Quota)`（`weight.go`）。
 - `(*Service).setCooldown(time.Time)`、`(*Service).available(time.Time) bool`（已有）。
 - `sessionKey(r *http.Request, body []byte, upstreamPath string) string`。
-- `const maxSessionBindings = 4096`；`newAffinityTable(ttl time.Duration) *affinityTable`；
-  `bind` / `lookup` / `count` 见第 3 节。
+- `const maxSessionBindings = 500`；`newAffinityTable(ttl time.Duration) *affinityTable`；
+  `bind` / `lookup` / `count` 见第 3 节；`save` / `load` 与 `(*Pool).SaveSessionAffinity() error` 见第 3 节的持久化说明。
 - `const DefaultSessionAffinityTTL = 2 * time.Hour`。
 - `(*Service).fetchQuota(ctx context.Context) (Quota, error)`；`var errQuotaRateLimited error`。
 - `parseQuota(raw []byte) (Quota, error)`；`Quota`、`QuotaSubscription`、`QuotaGroup`、`QuotaBucket`、`QuotaMetric` 字段与 JSON 名见第 4 节。

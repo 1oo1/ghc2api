@@ -192,7 +192,9 @@ func loadConfig(path string) (appConfig, error) {
 		return appConfig{}, err
 	}
 	// 启动前用与 serve 相同的配置校验账号，确保 loadConfig 通过即可创建账号池。
-	if _, err := copilot.NewManagedPool(config.poolConfig(nil), config.poolAccounts()); err != nil {
+	// 校验用的池立即丢弃，因此其日志也丢弃：否则绑定文件损坏时的 Warn 会输出到默认 logger，并与 serve 输出的重复。
+	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if _, err := copilot.NewManagedPool(config.poolConfig(discard), config.poolAccounts()); err != nil {
 		return appConfig{}, err
 	}
 	return config, nil

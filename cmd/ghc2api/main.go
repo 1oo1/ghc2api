@@ -96,6 +96,8 @@ func serve(ctx context.Context, config appConfig, logger *slog.Logger) error {
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	logger.InfoContext(ctx, "HTTP 服务开始监听", "addr", listener.Addr().String())
+	// 无论因退出信号还是异常退出，都要等 HTTP 服务关闭（无在途请求）之后再保存会话亲和。
+	defer saveSessionAffinity(pool, config.SessionAffinity, logger)
 	select {
 	case err := <-done:
 		if errors.Is(err, http.ErrServerClosed) {
@@ -104,19 +106,40 @@ func serve(ctx context.Context, config appConfig, logger *slog.Logger) error {
 		if err != nil {
 			logger.ErrorContext(ctx, "HTTP 服务异常退出", "error", err)
 		}
+		// Serve 已异常返回，但已建立的连接可能仍有在途请求，关闭服务并等待其结束。
+		_ = shutdownServer(server)
 		return err
 	case <-ctx.Done():
 		logger.Info("收到退出信号，正在关闭 HTTP 服务")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		err := server.Shutdown(shutdownCtx)
-		if err != nil {
-			_ = server.Close()
-		}
+		err := shutdownServer(server)
 		<-done
 		logger.Info("HTTP 服务已关闭")
 		return err
 	}
+}
+
+// shutdownServer 优雅关闭 HTTP 服务并等待在途请求结束，最多等待 10 秒；超时后强制关闭。
+func shutdownServer(server *http.Server) error {
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := server.Shutdown(shutdownCtx)
+	if err != nil {
+		_ = server.Close()
+	}
+	return err
+}
+
+// saveSessionAffinity 在服务关闭后保存会话亲和绑定；未开启会话亲和时不做任何事。
+// 成功输出 Info，失败只输出 Warn，不改变 serve 的返回值。
+func saveSessionAffinity(pool *copilot.Pool, enabled bool, logger *slog.Logger) {
+	if !enabled {
+		return
+	}
+	if err := pool.SaveSessionAffinity(); err != nil {
+		logger.Warn("会话亲和：保存失败", "error", err)
+		return
+	}
+	logger.Info("会话亲和：已保存")
 }
 
 type slogWriter struct {

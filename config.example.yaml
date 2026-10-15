@@ -30,6 +30,7 @@ api_key: ""
 management_key: ""
 
 # 会话亲和：同一客户端会话的生成请求固定使用同一账号，以提高上游提示词缓存的命中率。默认 true；false 时每个请求都按优先级与额度权重重新选择账号。
+# 绑定在服务关闭时保存到 <data_path>/cache/session_affinity.json，启动时读回。
 session_affinity: true
 
 # 会话绑定的有效期，使用 Go duration 格式；必须大于 0，默认 2h。每次使用都会续期。

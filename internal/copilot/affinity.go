@@ -14,8 +14,9 @@ import (
 // DefaultSessionAffinityTTL 是会话绑定的默认有效期。
 const DefaultSessionAffinityTTL = 2 * time.Hour
 
-// maxSessionBindings 限制绑定表的条数；表满时先清理过期项，仍满则淘汰最早过期的一条。
-const maxSessionBindings = 4096
+// maxSessionBindings 限制绑定表的条数为 500（内存与绑定文件的规模上限，加载时也按此截断）；
+// 表满时先清理过期项，仍满则淘汰最早过期的一条。
+const maxSessionBindings = 500
 
 // maxClaudeUserIDBytes 是 metadata.user_id 参与解析的上限，超过则视为没有会话信号。
 const maxClaudeUserIDBytes = 4096
