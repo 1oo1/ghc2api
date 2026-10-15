@@ -58,7 +58,8 @@ type accountConfig struct {
 	Token              string
 	Host               string // 规范化后的 host
 	User               string // 凭证文件名去掉 .json 后的 GitHub 用户名，保留原有大小写
-	Disabled           bool   // 凭证文件中的 disabled 字段；为 true 时启动后不参与轮询
+	Disabled           bool   // 凭证文件中的 disabled 字段；为 true 时启动后不参与选择
+	Priority           int    // 凭证文件中的 priority 字段；省略时为 0，数值越大越优先被选择
 	credentialFile     string
 	credentialMode     os.FileMode
 	insecureCredential bool
@@ -218,6 +219,7 @@ func (c appConfig) poolAccounts() []copilot.PoolAccount {
 	for _, account := range c.Accounts {
 		accounts = append(accounts, copilot.PoolAccount{
 			Token: account.Token, Host: account.Host, User: account.User, Disabled: account.Disabled,
+			Priority: account.Priority,
 		})
 	}
 	return accounts

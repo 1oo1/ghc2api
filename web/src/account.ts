@@ -54,3 +54,18 @@ export function formatTime(value?: string): string {
     ? date.toLocaleString("zh-CN", { hour12: false })
     : "—";
 }
+
+/** 优先级的取值范围（含两端），与服务端 MinPriority、MaxPriority 一致。 */
+export const MIN_PRIORITY = -1;
+export const MAX_PRIORITY = 100;
+
+/**
+ * 解析优先级输入。去除首尾空白后必须是可选负号加十进制数字（不接受正号、小数与科学计数法），
+ * 且在 MIN_PRIORITY 到 MAX_PRIORITY 之间；否则返回 null。
+ */
+export function parsePriority(text: string): number | null {
+  const trimmed = text.trim();
+  if (!/^-?\d+$/.test(trimmed)) return null;
+  const value = Number(trimmed);
+  return value >= MIN_PRIORITY && value <= MAX_PRIORITY ? value : null;
+}

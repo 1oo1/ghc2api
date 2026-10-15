@@ -328,6 +328,23 @@ tr:last-child td {
   margin-left: auto;
 }
 
+/* 账号卡片的优先级编辑 */
+.priority-editor {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+}
+.priority-editor input {
+  width: 88px;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+.priority-editor .hint {
+  width: 100%;
+  margin: 0;
+}
+
 /* 状态徽标 */
 .badge {
   display: inline-flex;

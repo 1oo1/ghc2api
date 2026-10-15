@@ -98,7 +98,10 @@ func loadAccount(path, fileName, topHost string) (accountConfig, error) {
 	if err != nil {
 		return accountConfig{}, err
 	}
-	account := accountConfig{Token: credential.Token, Host: host, User: user, Disabled: credential.Disabled, credentialFile: path}
+	account := accountConfig{
+		Token: credential.Token, Host: host, User: user, Disabled: credential.Disabled, Priority: credential.Priority,
+		credentialFile: path,
+	}
 	if runtime.GOOS != "windows" {
 		info, err := os.Stat(path)
 		if err != nil {

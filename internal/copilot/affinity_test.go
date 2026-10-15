@@ -325,35 +325,44 @@ func TestAffinityTableDropsExpiredBeforeLiveBindings(t *testing.T) {
 	}
 }
 
-// TestSessionAffinityPinsSessionAndKeepsRoundRobinCursor 同一会话固定使用首次绑定的账号；
-// 亲和命中不推进轮询游标，因此新会话仍按轮询顺序分配账号。
-func TestSessionAffinityPinsSessionAndKeepsRoundRobinCursor(t *testing.T) {
+// TestSessionAffinityPinsSessionOverPriority 同一会话固定使用首次绑定的账号，即使之后出现优先级更高的账号；
+// 新会话则按当前优先级选择。
+func TestSessionAffinityPinsSessionOverPriority(t *testing.T) {
 	up := newMgmtUpstream(t)
-	p, _ := mgmtNewPool(t, up, DefaultSessionAffinityTTL, "alice", "bob", "carol")
+	p, _ := mgmtNewPool(t, up, DefaultSessionAffinityTTL, "alice", "bob")
 	x := affinityChatBody(t, "first question")
 	y := affinityChatBody(t, "second question")
-	z := affinityChatBody(t, "third question")
-	w := affinityChatBody(t, "fourth question")
-	for i, body := range []string{x, y, x, z, w} {
+	// X 首次绑定到文件名最小的 alice；之后 bob 的优先级高于 alice。
+	if res := poolRequest(p, "POST", "/v1/chat/completions", x); res.Code != http.StatusOK {
+		t.Fatalf("X 首次请求 status=%d body=%s", res.Code, res.Body.String())
+	}
+	mgmtPatchPriority(t, p, "bob", 10)
+	for i, body := range []string{y, x} {
 		if res := poolRequest(p, "POST", "/v1/chat/completions", body); res.Code != http.StatusOK {
 			t.Fatalf("请求 %d status=%d body=%s", i, res.Code, res.Body.String())
 		}
 	}
-	// X 绑定到 alice；第三个请求命中亲和，游标仍停在 bob，因此 Z 轮到 carol，W 回到 alice。
-	assertGenerationOrder(t, up.pool, mgmtOrder("alice", "bob", "alice", "carol", "alice")...)
+	// Y 是新会话，按当前优先级由 bob 处理；X 命中亲和，仍由 alice 处理。
+	assertGenerationOrder(t, up.pool, mgmtOrder("alice", "bob", "alice")...)
 }
 
-// TestSessionAffinityDisabledWithZeroTTLIsRoundRobin SessionAffinityTTL<=0 时关闭亲和，相同请求也按轮询分配。
-func TestSessionAffinityDisabledWithZeroTTLIsRoundRobin(t *testing.T) {
+// TestSessionAffinityDisabledWithZeroTTLReselectsEachRequest SessionAffinityTTL<=0 时关闭亲和：
+// 相同会话的请求每次都按当前优先级重新选择，不会固定到首次使用的账号。
+func TestSessionAffinityDisabledWithZeroTTLReselectsEachRequest(t *testing.T) {
 	up := newMgmtUpstream(t)
-	p, _ := mgmtNewPool(t, up, 0, "alice", "bob", "carol")
+	p, _ := mgmtNewPool(t, up, 0, "alice", "bob")
 	body := affinityChatBody(t, "pinned?")
-	for i := range 3 {
+	if res := poolRequest(p, "POST", "/v1/chat/completions", body); res.Code != http.StatusOK {
+		t.Fatalf("请求 0 status=%d body=%s", res.Code, res.Body.String())
+	}
+	mgmtPatchPriority(t, p, "bob", 10)
+	for i := 1; i < 3; i++ {
 		if res := poolRequest(p, "POST", "/v1/chat/completions", body); res.Code != http.StatusOK {
 			t.Fatalf("请求 %d status=%d body=%s", i, res.Code, res.Body.String())
 		}
 	}
-	assertGenerationOrder(t, up.pool, mgmtOrder("alice", "bob", "carol")...)
+	// 关闭亲和时没有绑定，bob 优先级更高，之后的请求都由 bob 处理。
+	assertGenerationOrder(t, up.pool, mgmtOrder("alice", "bob", "bob")...)
 }
 
 // TestSessionAffinityRebindsWhenBoundAccountUnavailable 绑定账号被禁用、删除、冷却或 session 失败后，
@@ -384,7 +393,7 @@ func TestSessionAffinityRebindsWhenBoundAccountUnavailable(t *testing.T) {
 				up.pool.failSession("oauth-alice", poolFailure{http.StatusInternalServerError, `{"message":"alice down"}`})
 			}
 
-			// 第一次改用其他账号，第二次必须继续使用同一个账号（已重新绑定），而不是轮询到下一个账号。
+			// 第一次改用其他账号，第二次必须继续使用同一个账号（已重新绑定），而不是重新按优先级选择。
 			var served []string
 			for i := range 2 {
 				if res := poolRequest(p, "POST", "/v1/chat/completions", body); res.Code != http.StatusOK {

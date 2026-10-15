@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-// AccountCooldown 是账号失败后暂停参与轮询的时长。
+// AccountCooldown 是账号失败后暂停参与选择的时长。
 const AccountCooldown = time.Minute
 
 // PoolConfig 是账号池的服务级配置，账号无关的设置都放在这里。
@@ -38,14 +38,16 @@ type PoolAccount struct {
 	Host     string
 	User     string // GitHub 用户名，必填（为空返回错误）
 	Disabled bool
+	Priority int // 优先级，取值 MinPriority 到 MaxPriority；数值越大越优先被选择
 }
 
-// poolAccount 是池内一个账号的运行时状态。id、service 与 routes 创建后不再变化；disabled 由 Pool.mu 保护。
+// poolAccount 是池内一个账号的运行时状态。id、service 与 routes 创建后不再变化；disabled 与 priority 由 Pool.mu 保护。
 type poolAccount struct {
 	id       string        // 账号 ID：GitHub 用户名的小写形式；无用户名时为初始下标
 	service  *Service      // 账号的 Copilot 服务
 	routes   serviceRoutes // 账号的业务路由，闭包捕获 service
 	disabled bool
+	priority int // 优先级，见 PoolAccount.Priority
 
 	requests atomic.Uint64 // 分发到该账号的需要账号的请求数（含用量与生成）
 	failures atomic.Uint64 // 其中响应状态 >= 400 的数量
@@ -61,7 +63,7 @@ func newPoolAccount(service *Service, id string) *poolAccount {
 	return account
 }
 
-// Pool 以 round-robin 方式在多个 GitHub 账号之间分发请求，并负责会话亲和、账号的运行时增删与禁用。
+// Pool 在多个 GitHub 账号之间分发请求：按优先级与额度权重选择最优的可用账号，并负责会话亲和、账号的运行时增删、禁用与调整优先级。
 type Pool struct {
 	apiKey     string // 所有账号共用的服务访问密钥
 	logger     *slog.Logger
@@ -73,16 +75,15 @@ type Pool struct {
 
 	requestSeq atomic.Uint64
 
-	adminMu  sync.Mutex // 串行化账号的增删、禁用与凭证文件写入
-	mu       sync.Mutex // 保护 accounts、cursor 与各账号的 disabled
+	adminMu  sync.Mutex // 串行化账号的增删、禁用、优先级与凭证文件写入
+	mu       sync.Mutex // 保护 accounts 与各账号的 disabled、priority
 	accounts []*poolAccount
-	cursor   int // 下一次轮询的起始账号下标
 
 	loginMu sync.Mutex
 	logins  map[string]*deviceLogin // 设备登录状态，见 management_login.go
 }
 
-// NewPool 校验所有账号配置并创建轮询池，账号顺序即轮询顺序。会话亲和与管理接口均关闭。
+// NewPool 校验所有账号配置并创建账号池，账号顺序即加入顺序（选择只看优先级、额度权重与文件名，与顺序无关）。会话亲和与管理接口均关闭。
 // 所有账号的服务访问密钥去除首尾空白后必须一致，GitHub 账号（Host 规范化后与 Token）不能重复。
 func NewPool(configs []Config) (*Pool, error) {
 	if len(configs) == 0 {
@@ -96,7 +97,7 @@ func NewPool(configs []Config) (*Pool, error) {
 		} else if config.APIKey != p.apiKey {
 			return nil, errors.New("所有账号的服务访问密钥必须一致")
 		}
-		if err := p.addConfigured(i+1, config, false); err != nil {
+		if err := p.addConfigured(i+1, config, false, 0); err != nil {
 			return nil, err
 		}
 	}
@@ -135,7 +136,7 @@ func NewManagedPool(config PoolConfig, accounts []PoolAccount) (*Pool, error) {
 			Token: account.Token, Host: account.Host, User: user, APIKey: p.apiKey,
 			CacheDir: config.CacheDir, ModelsCacheTTL: config.ModelsCacheTTL,
 			Client: config.Client, Logger: p.logger,
-		}, account.Disabled)
+		}, account.Disabled, account.Priority)
 		if err != nil {
 			return nil, err
 		}
@@ -145,7 +146,8 @@ func NewManagedPool(config PoolConfig, accounts []PoolAccount) (*Pool, error) {
 
 // addConfigured 在构造阶段为配置创建账号并追加到池末尾。账号 ID 为用户名的小写形式；没有用户名时为下标。
 // index 是账号在输入中的序号（从 1 开始），只用于错误信息；错误信息不包含 token。
-func (p *Pool) addConfigured(index int, config Config, disabled bool) error {
+// disabled 与 priority 是账号的初始状态。
+func (p *Pool) addConfigured(index int, config Config, disabled bool, priority int) error {
 	service, err := New(config)
 	if err != nil {
 		return fmt.Errorf("第 %d 个 GitHub 账号配置无效: %w", index, err)
@@ -159,6 +161,7 @@ func (p *Pool) addConfigured(index int, config Config, disabled bool) error {
 	}
 	account := newPoolAccount(service, id)
 	account.disabled = disabled
+	account.priority = priority
 	p.accounts = append(p.accounts, account)
 	return nil
 }
@@ -200,7 +203,7 @@ func (p *Pool) conflicts(service *Service, id string) bool {
 	return false
 }
 
-// Handler 返回与单账号 Service 相同的 HTTP 接口：统一鉴权，业务请求按轮询交给某个账号处理。
+// Handler 返回与单账号 Service 相同的 HTTP 接口：统一鉴权，业务请求按账号选择规则交给某个账号处理。
 // 启用管理接口时，/management 与 /v0/management/ 下的路径改用管理密钥鉴权，不受 api_key 影响。
 func (p *Pool) Handler() http.Handler {
 	business := requireAPIKey(p.apiKey, p.log, http.HandlerFunc(p.dispatch))
@@ -217,8 +220,8 @@ func (p *Pool) Handler() http.Handler {
 	return withRequestLog(p.logger, &p.requestSeq, p.log, handler)
 }
 
-// dispatch 按路由登记的上游访问方式分发请求：不访问上游的请求直接处理且不推进轮询；
-// 需要账号的请求按轮询选择账号；需要 session 的请求进入 forward。
+// dispatch 按路由登记的上游访问方式分发请求：不访问上游的请求直接处理且不参与账号选择；
+// 需要账号的请求按选择规则选择账号；需要 session 的请求进入 forward。
 func (p *Pool) dispatch(w http.ResponseWriter, r *http.Request) {
 	entry := p.routeOf(r)
 	switch entry.need {
@@ -262,7 +265,7 @@ func (p *Pool) affinityKey(r *http.Request, upstream string) string {
 	return sessionKey(r, body, upstream)
 }
 
-// forward 处理需要 session 的请求。先按会话亲和（已有绑定）或轮询选择账号并预取 session；
+// forward 处理需要 session 的请求。先按会话亲和（已有绑定）或账号选择规则选出账号并预取 session；
 // session 获取失败时冷却该账号，并在同一请求内改用其他尚未尝试的账号，每个账号最多尝试一次。
 // 全部失败时按最后一个账号的 handleError 规则返回错误；没有任何可选账号时返回 503。
 // 客户端已取消时不冷却账号。
@@ -385,8 +388,8 @@ func (p *Pool) services() []*Service {
 	return services
 }
 
-// choose 选择处理本次请求的账号。会话键已绑定且该账号仍可用（未禁用、未冷却、本请求未尝试过）时优先使用它，
-// 且不推进轮询游标；否则按轮询选择并推进游标。没有候选时返回 nil。
+// choose 选择处理本次请求的账号。会话键已绑定且该账号仍可用（未禁用、未冷却、本请求未尝试过）时优先使用它；
+// 否则按 pickLocked 的排序选择最优账号。没有候选时返回 nil。
 func (p *Pool) choose(key string, tried map[*poolAccount]bool) *poolAccount {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -399,52 +402,64 @@ func (p *Pool) choose(key string, tried map[*poolAccount]bool) *poolAccount {
 			}
 		}
 	}
-	index := p.pickLocked(now, func(i int) bool { return tried[p.accounts[i]] })
-	if index < 0 {
-		return nil
+	return p.pickLocked(now, tried)
+}
+
+// selectKey 是账号参与选择时的排序键：已冷却的账号靠后，其余字段数值大者优先、文件名小者优先。字段顺序即比较顺序，见 before。
+type selectKey struct {
+	cooling  bool        // 已冷却的账号排在未冷却的账号之后
+	priority int         // 优先级，数值大者在前
+	weight   quotaWeight // 额度权重，见 weigh
+	file     string      // 凭证文件名（用户名 + ".json"，无用户名时用 ID），字节序升序
+}
+
+// keyOf 计算账号的排序键。调用方须持有 p.mu（读取 priority）。额度权重只读取缓存，不访问上游。
+func keyOf(a *poolAccount, now time.Time) selectKey {
+	name := a.service.config.User
+	if name == "" {
+		name = a.id
 	}
-	return p.accounts[index]
+	quota, _ := a.quota.snapshot()
+	return selectKey{
+		cooling:  !a.service.available(now),
+		priority: a.priority,
+		weight:   weigh(quota),
+		file:     name + ".json",
+	}
 }
 
-// next 返回下一个账号下标（不排除任何账号），见 pick。
-func (p *Pool) next() int {
-	return p.pick(nil)
+// before 报告 k 是否应排在 o 之前：未冷却优先，其次优先级高者在前，再次额度权重高者在前，最后凭证文件名字节序升序。
+func (k selectKey) before(o selectKey) bool {
+	if k.cooling != o.cooling {
+		return !k.cooling
+	}
+	if k.priority != o.priority {
+		return k.priority > o.priority
+	}
+	switch {
+	case k.weight.better(o.weight):
+		return true
+	case o.weight.better(k.weight):
+		return false
+	}
+	return k.file < o.file
 }
 
-// pick 从游标开始选择账号下标并把游标移到所选账号之后。候选按优先级排列：
-// 先选未冷却、未禁用且未被 tried 排除的账号，再选已冷却但未禁用、未被排除的账号作为最后候选；
-// 两类内部都保持轮询顺序。tried 为本请求已尝试过的账号下标（nil 表示不排除）。没有候选时返回 -1。
-func (p *Pool) pick(tried []bool) int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.pickLocked(time.Now(), func(i int) bool { return tried != nil && i < len(tried) && tried[i] })
-}
-
-// pickLocked 是 pick 的实现，调用方须持有 p.mu。
-func (p *Pool) pickLocked(now time.Time, excluded func(int) bool) int {
-	n := len(p.accounts)
-	chosen := -1
-	for _, allowCooling := range []bool{false, true} {
-		for offset := range n {
-			j := (p.cursor + offset) % n
-			account := p.accounts[j]
-			if account.disabled || excluded(j) {
-				continue
-			}
-			if allowCooling || account.service.available(now) {
-				chosen = j
-				break
-			}
+// pickLocked 选出本次应使用的账号，调用方须持有 p.mu。候选为未禁用且未被 tried 排除的账号，
+// 按 selectKey 排序取最优者。冷却中的账号排在未冷却账号之后，只有没有未冷却候选时才会被选中。没有候选时返回 nil。
+func (p *Pool) pickLocked(now time.Time, tried map[*poolAccount]bool) *poolAccount {
+	var best *poolAccount
+	var bestKey selectKey
+	for _, a := range p.accounts {
+		if a.disabled || tried[a] {
+			continue
 		}
-		if chosen >= 0 {
-			break
+		key := keyOf(a, now)
+		if best == nil || key.before(bestKey) {
+			best, bestKey = a, key
 		}
 	}
-	if chosen < 0 {
-		return -1
-	}
-	p.cursor = (chosen + 1) % n
-	return chosen
+	return best
 }
 
 // findLocked 按 ID 查找账号，调用方须持有 p.mu。
@@ -490,12 +505,12 @@ func (p *Pool) removeAccount(target *poolAccount) {
 	p.accounts = slices.DeleteFunc(p.accounts, func(a *poolAccount) bool { return a == target })
 }
 
-// setCooldown 让账号在 until 之前不参与轮询。
+// setCooldown 让账号在 until 之前不参与选择。
 func (s *Service) setCooldown(until time.Time) {
 	s.cooldownUntil.Store(until.UnixNano())
 }
 
-// available 报告账号在 now 时是否可参与轮询；冷却截止时刻本身即视为可用，从未冷却的账号始终可用。
+// available 报告账号在 now 时是否可参与选择；冷却截止时刻本身即视为可用，从未冷却的账号始终可用。
 func (s *Service) available(now time.Time) bool {
 	until := s.cooldownUntil.Load()
 	return until == 0 || now.UnixNano() >= until

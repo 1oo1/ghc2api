@@ -453,13 +453,19 @@ func TestManagementAccountsListShowsQuotaAndRequestStats(t *testing.T) {
 	up.pool.failGeneration("oauth-bob", poolFailure{http.StatusInternalServerError, `{"error":"bob down"}`})
 	up.pool.failSession("oauth-carol", poolFailure{http.StatusInternalServerError, `{"message":"carol down"}`})
 
-	// 用量查询由 alice 处理；生成请求轮到 bob（上游 500）；再下一次轮到 carol，其 session 失败后改由 alice 处理。
+	// 通过 PATCH 调整优先级，依次让 alice、bob、carol 成为最优账号。
+	// 用量查询由 alice 处理（优先级最高）。
+	mgmtPatchPriority(t, p, "alice", 10)
 	if w := poolRequest(p, "GET", "/v1/usage", ""); w.Code != http.StatusOK {
 		t.Fatalf("用量请求 status=%d body=%s", w.Code, w.Body.String())
 	}
+	// alice 降为 -1 后 bob 最优：生成请求由 bob 处理，上游返回 500。
+	mgmtPatchPriority(t, p, "alice", -1)
 	if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusInternalServerError {
 		t.Fatalf("bob 的生成请求 status=%d, want 500", w.Code)
 	}
+	// bob 也降为 -1 后 carol 最优：carol 的 session 失败并冷却，同一请求改由 alice 处理（alice 与 bob 同为 -1，alice.json 更小）。
+	mgmtPatchPriority(t, p, "bob", -1)
 	if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK {
 		t.Fatalf("carol 失败后的生成请求 status=%d body=%s", w.Code, w.Body.String())
 	}
@@ -599,7 +605,7 @@ func TestManagementQuotaFailuresKeepOldData(t *testing.T) {
 }
 
 // TestManagementImportAccountAppendsToPool 导入凭证：登录名（保留大小写）决定文件名，ID 为小写，
-// 文件权限为 0600，新账号追加到轮询末尾。
+// 文件权限为 0600，新账号加入池中并按凭证文件名参与选择。
 func TestManagementImportAccountAppendsToPool(t *testing.T) {
 	up := newMgmtUpstream(t)
 	up.setLogin("oauth-carol", "Carol")
@@ -629,7 +635,8 @@ func TestManagementImportAccountAppendsToPool(t *testing.T) {
 			t.Fatalf("生成请求 status=%d body=%s", res.Code, res.Body.String())
 		}
 	}
-	assertGenerationOrder(t, up.pool, mgmtOrder("alice", "carol", "alice", "carol")...)
+	// Carol.json 的 'C'（0x43）小于 alice.json 的 'a'（0x61），因此新账号排在前面，所有请求都由它处理。
+	assertGenerationOrder(t, up.pool, "oauth-carol", "oauth-carol", "oauth-carol", "oauth-carol")
 }
 
 // TestManagementImportRejectsInvalidCredentials 导入失败时返回对应状态码，不写入文件、不加入池，且响应不包含 token。
@@ -699,7 +706,8 @@ func TestManagementImportRejectsInvalidCredentials(t *testing.T) {
 	}
 }
 
-// TestManagementDisableExcludesAccountAndPersistsFlag 禁用后账号不参与轮询，凭证文件的 disabled 被持久化；启用后恢复。
+// TestManagementDisableExcludesAccountAndPersistsFlag 禁用后账号不参与选择，凭证文件的 disabled 被持久化；启用后恢复。
+// alice 的文件名最小，最先被选中；禁用后由 bob 接替，启用后重新由 alice 处理。
 func TestManagementDisableExcludesAccountAndPersistsFlag(t *testing.T) {
 	up := newMgmtUpstream(t)
 	p, dir := mgmtNewPool(t, up, 0, "alice", "bob", "carol")
@@ -707,34 +715,35 @@ func TestManagementDisableExcludesAccountAndPersistsFlag(t *testing.T) {
 		t.Fatalf("请求 status=%d body=%s", w.Code, w.Body.String())
 	}
 
-	w := mgmtCall(p, "PATCH", "/v0/management/accounts", `{"id":"bob","disabled":true}`, mgmtKey)
-	if w.Code != http.StatusOK || !mgmtAccountByID(t, mgmtAccounts(t, p), "bob").Disabled {
-		t.Fatalf("禁用 bob status=%d body=%s", w.Code, w.Body.String())
+	w := mgmtCall(p, "PATCH", "/v0/management/accounts", `{"id":"alice","disabled":true}`, mgmtKey)
+	if w.Code != http.StatusOK || !mgmtAccountByID(t, mgmtAccounts(t, p), "alice").Disabled {
+		t.Fatalf("禁用 alice status=%d body=%s", w.Code, w.Body.String())
 	}
-	if c, err := LoadCredential(filepath.Join(dir, "bob.json")); err != nil || !c.Disabled {
+	if c, err := LoadCredential(filepath.Join(dir, "alice.json")); err != nil || !c.Disabled {
 		t.Fatalf("禁用后凭证文件 = %+v, %v; want Disabled=true", c, err)
 	}
 	for range 4 {
 		poolRequest(p, "POST", "/v1/chat/completions", poolChatBody)
 	}
-	// 第一次请求后游标指向 bob，但 bob 已禁用，因此依次落在 carol 与 alice 之间。
-	assertGenerationOrder(t, up.pool, mgmtOrder("alice", "carol", "alice", "carol", "alice")...)
+	// alice 禁用后 bob 的文件名最小，之后的请求都由 bob 处理，carol 不会被选中。
+	assertGenerationOrder(t, up.pool, mgmtOrder("alice", "bob", "bob", "bob", "bob")...)
 
-	w = mgmtCall(p, "PATCH", "/v0/management/accounts", `{"id":"bob","disabled":false}`, mgmtKey)
-	if w.Code != http.StatusOK || mgmtAccountByID(t, mgmtAccounts(t, p), "bob").Disabled {
-		t.Fatalf("启用 bob status=%d body=%s", w.Code, w.Body.String())
+	w = mgmtCall(p, "PATCH", "/v0/management/accounts", `{"id":"alice","disabled":false}`, mgmtKey)
+	if w.Code != http.StatusOK || mgmtAccountByID(t, mgmtAccounts(t, p), "alice").Disabled {
+		t.Fatalf("启用 alice status=%d body=%s", w.Code, w.Body.String())
 	}
-	if c, err := LoadCredential(filepath.Join(dir, "bob.json")); err != nil || c.Disabled {
+	if c, err := LoadCredential(filepath.Join(dir, "alice.json")); err != nil || c.Disabled {
 		t.Fatalf("启用后凭证文件 = %+v, %v; want Disabled=false", c, err)
 	}
-	raw, err := os.ReadFile(filepath.Join(dir, "bob.json"))
+	raw, err := os.ReadFile(filepath.Join(dir, "alice.json"))
 	if err != nil || strings.Contains(string(raw), "disabled") {
 		t.Fatalf("启用后凭证文件不应保留 disabled 字段: %s, %v", raw, err)
 	}
 	for range 3 {
 		poolRequest(p, "POST", "/v1/chat/completions", poolChatBody)
 	}
-	assertGenerationOrder(t, up.pool, mgmtOrder("alice", "carol", "alice", "carol", "alice", "bob", "carol", "alice")...)
+	// 重新启用后 alice 恢复为最优账号。
+	assertGenerationOrder(t, up.pool, mgmtOrder("alice", "bob", "bob", "bob", "bob", "alice", "alice", "alice")...)
 }
 
 // TestManagementDisableWriteFailureKeepsState 凭证写入失败时返回 500，内存中的禁用状态保持不变。
@@ -749,39 +758,37 @@ func TestManagementDisableWriteFailureKeepsState(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 
-	if w := mgmtCall(p, "PATCH", "/v0/management/accounts", `{"id":"bob","disabled":true}`, mgmtKey); w.Code != http.StatusInternalServerError {
+	if w := mgmtCall(p, "PATCH", "/v0/management/accounts", `{"id":"alice","disabled":true}`, mgmtKey); w.Code != http.StatusInternalServerError {
 		t.Fatalf("凭证写入失败时 status = %d, want 500; body=%s", w.Code, w.Body.String())
 	}
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if mgmtAccountByID(t, mgmtAccounts(t, p), "bob").Disabled {
-		t.Fatal("写入失败后内存中的 bob 不应被禁用")
+	if mgmtAccountByID(t, mgmtAccounts(t, p), "alice").Disabled {
+		t.Fatal("写入失败后内存中的 alice 不应被禁用")
 	}
 	poolRequest(p, "POST", "/v1/chat/completions", poolChatBody)
 	poolRequest(p, "POST", "/v1/chat/completions", poolChatBody)
-	assertGenerationOrder(t, up.pool, mgmtOrder("alice", "bob")...)
+	// alice 仍是最优账号：内存状态未被改动，两次请求都由它处理。
+	assertGenerationOrder(t, up.pool, mgmtOrder("alice", "alice")...)
 }
 
 // TestManagementDeleteRemovesCredentialAndAccount 删除账号会删除凭证文件，之后不再被选中；文件已不存在时仍然成功。
 func TestManagementDeleteRemovesCredentialAndAccount(t *testing.T) {
 	up := newMgmtUpstream(t)
 	p, dir := mgmtNewPool(t, up, 0, "alice", "bob", "carol")
-	w := mgmtCall(p, "DELETE", "/v0/management/accounts?id=bob", "", mgmtKey)
+	w := mgmtCall(p, "DELETE", "/v0/management/accounts?id=alice", "", mgmtKey)
 	if w.Code != http.StatusOK || strings.TrimSpace(w.Body.String()) != `{"ok":true}` {
-		t.Fatalf("删除 bob status=%d body=%s, want 200 {\"ok\":true}", w.Code, w.Body.String())
+		t.Fatalf("删除 alice status=%d body=%s, want 200 {\"ok\":true}", w.Code, w.Body.String())
 	}
-	if _, err := os.Stat(filepath.Join(dir, "bob.json")); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(dir, "alice.json")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("删除后凭证文件仍存在: %v", err)
 	}
 	for range 4 {
 		poolRequest(p, "POST", "/v1/chat/completions", poolChatBody)
 	}
-	for _, token := range up.pool.generationOrder() {
-		if token == "oauth-bob" {
-			t.Fatal("已删除的账号仍被选中")
-		}
-	}
+	// alice 是文件名最小的账号，删除后由 bob 接替，之后不再选中 alice。
+	assertGenerationOrder(t, up.pool, mgmtOrder("bob", "bob", "bob", "bob")...)
 
 	if err := os.Remove(filepath.Join(dir, "carol.json")); err != nil {
 		t.Fatal(err)
@@ -790,8 +797,8 @@ func TestManagementDeleteRemovesCredentialAndAccount(t *testing.T) {
 		t.Fatalf("凭证文件已不存在时删除 status=%d, want 200", w.Code)
 	}
 	views := mgmtAccounts(t, p)
-	if len(views) != 1 || views[0].ID != "alice" {
-		t.Fatalf("删除后账号列表 = %+v, want 只剩 alice", views)
+	if len(views) != 1 || views[0].ID != "bob" {
+		t.Fatalf("删除后账号列表 = %+v, want 只剩 bob", views)
 	}
 }
 

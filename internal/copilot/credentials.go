@@ -4,10 +4,17 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+)
+
+// MinPriority 与 MaxPriority 是账号优先级的取值范围（含两端）。数值越大越优先被选择。
+const (
+	MinPriority = -1
+	MaxPriority = 100
 )
 
 // Credential 是独立服务的凭证格式，不修改 magpie 或编辑器的账号文件。
@@ -15,11 +22,25 @@ type Credential struct {
 	Token string `json:"oauth_token"`
 	Host  string `json:"host,omitempty"`
 	User  string `json:"user,omitempty"`
-	// Disabled 为 true 时账号启动后不参与轮询，由管理接口写入。
+	// Disabled 为 true 时账号启动后不参与选择，由管理接口写入。
 	Disabled bool `json:"disabled,omitempty"`
+	// Priority 是账号的优先级，取值 MinPriority 到 MaxPriority；省略时为 0，由管理接口写入。
+	Priority int `json:"priority,omitempty"`
 }
 
+// checkPriority 报告优先级是否在 MinPriority 到 MaxPriority 之间。
+func checkPriority(priority int) error {
+	if priority < MinPriority || priority > MaxPriority {
+		return fmt.Errorf("priority 必须在 %d 到 %d 之间", MinPriority, MaxPriority)
+	}
+	return nil
+}
+
+// validateCredential 校验优先级范围、token 与 host，并返回规范化后的凭证。
 func validateCredential(c Credential) (Credential, error) {
+	if err := checkPriority(c.Priority); err != nil {
+		return Credential{}, err
+	}
 	config, err := New(Config{Token: c.Token, Host: c.Host})
 	if err != nil {
 		return Credential{}, err

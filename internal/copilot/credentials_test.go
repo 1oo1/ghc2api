@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -157,6 +158,95 @@ func TestCredentialDisabledFieldReadFromFile(t *testing.T) {
 				t.Fatalf("LoadCredential(%s) = %+v, %v; want Disabled=%v", tc.raw, c, err, tc.want)
 			}
 		})
+	}
+}
+
+// TestCredentialPriorityRoundTrip 优先级的边界值（-1、0、100）保存后读回保持不变；
+// 0 是默认值，写入文件时省略 priority 字段，-1 与 100 则写入。
+func TestCredentialPriorityRoundTrip(t *testing.T) {
+	if MinPriority != -1 || MaxPriority != 100 {
+		t.Fatalf("MinPriority = %d, MaxPriority = %d, want -1 与 100", MinPriority, MaxPriority)
+	}
+	for _, tc := range []struct {
+		name     string
+		priority int
+	}{
+		{name: "min", priority: MinPriority},
+		{name: "zero", priority: 0},
+		{name: "max", priority: MaxPriority},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "alice.json")
+			if err := SaveCredential(path, Credential{Token: "oauth-priority", User: "alice", Priority: tc.priority}); err != nil {
+				t.Fatalf("SaveCredential(priority=%d) error = %v", tc.priority, err)
+			}
+			c, err := LoadCredential(path)
+			if err != nil || c.Priority != tc.priority {
+				t.Fatalf("LoadCredential() = %+v, %v; want Priority=%d", c, err, tc.priority)
+			}
+			fields := readCredentialFieldsForTest(t, path)
+			value, written := fields["priority"]
+			if tc.priority == 0 {
+				if written {
+					t.Fatalf("priority 为 0 时不应写入文件，实际 = %v", value)
+				}
+				return
+			}
+			if !written || value != float64(tc.priority) {
+				t.Fatalf("凭证文件 priority 字段 = %v (存在=%v), want %d", value, written, tc.priority)
+			}
+		})
+	}
+}
+
+// TestCredentialPriorityReadFromFile 手写的凭证文件中 priority 被读取：省略时为 0，范围外或非整数被拒绝；
+// 非整数的错误信息为“不是有效的 OAuth JSON”。
+func TestCredentialPriorityReadFromFile(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		raw    string
+		want   int
+		reject bool
+		msg    string // 非空时错误信息必须包含该文本
+	}{
+		{name: "min", raw: `{"oauth_token":"t","priority":-1}`, want: -1},
+		{name: "max", raw: `{"oauth_token":"t","priority":100}`, want: 100},
+		{name: "zero", raw: `{"oauth_token":"t","priority":0}`, want: 0},
+		{name: "omitted", raw: `{"oauth_token":"t"}`, want: 0},
+		{name: "below-min", raw: `{"oauth_token":"t","priority":-2}`, reject: true},
+		{name: "above-max", raw: `{"oauth_token":"t","priority":101}`, reject: true},
+		{name: "fraction", raw: `{"oauth_token":"t","priority":1.5}`, reject: true, msg: "不是有效的 OAuth JSON"},
+		{name: "string", raw: `{"oauth_token":"t","priority":"5"}`, reject: true, msg: "不是有效的 OAuth JSON"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "credential.json")
+			if err := os.WriteFile(path, []byte(tc.raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			c, err := LoadCredential(path)
+			if tc.reject {
+				if err == nil {
+					t.Fatalf("LoadCredential(%s) should reject", tc.raw)
+				}
+				if tc.msg != "" && !strings.Contains(err.Error(), tc.msg) {
+					t.Fatalf("LoadCredential(%s) error = %q, want 包含 %q", tc.raw, err.Error(), tc.msg)
+				}
+				return
+			}
+			if err != nil || c.Priority != tc.want {
+				t.Fatalf("LoadCredential(%s) = %+v, %v; want Priority=%d", tc.raw, c, err, tc.want)
+			}
+		})
+	}
+}
+
+// TestCredentialPriorityRejectsOutOfRangeOnSave 保存时优先级超出 [-1, 100] 返回错误。
+func TestCredentialPriorityRejectsOutOfRangeOnSave(t *testing.T) {
+	for _, priority := range []int{MinPriority - 1, MaxPriority + 1} {
+		path := filepath.Join(t.TempDir(), "alice.json")
+		if err := SaveCredential(path, Credential{Token: "oauth-priority", User: "alice", Priority: priority}); err == nil {
+			t.Fatalf("SaveCredential(priority=%d) should reject", priority)
+		}
 	}
 }
 

@@ -105,8 +105,8 @@ func (s *Service) Handler() http.Handler {
 type routeNeed int
 
 const (
-	needNone    routeNeed = iota // 不访问上游（健康检查、未注册路由、重定向等）：由 routes[0] 直接处理，不推进轮询
-	needAccount                  // 访问上游但不需要 session（用量）：按轮询选择账号，失败不切换
+	needNone    routeNeed = iota // 不访问上游（健康检查、未注册路由、重定向等）：由 routes[0] 直接处理，不参与账号选择
+	needAccount                  // 访问上游但不需要 session（用量）：按账号选择规则选择账号，失败不切换
 	needSession                  // 需要 Copilot session（模型列表、生成请求）：预取 session，失败时切换账号
 )
 
@@ -212,7 +212,7 @@ func (s *Service) handleError(ctx context.Context, w http.ResponseWriter, err er
 			level = slog.LevelError
 		}
 		if upstream.status == http.StatusTooManyRequests {
-			// 限流的账号暂停参与轮询；429 原样透传，不在本请求内换账号。
+			// 限流的账号暂停参与选择；429 原样透传，不在本请求内换账号。
 			s.setCooldown(time.Now().Add(AccountCooldown))
 		}
 		s.log(ctx, level, "Copilot API 返回错误状态", "status", upstream.status)
@@ -414,7 +414,7 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 			return
 		}
 		if res.StatusCode == http.StatusTooManyRequests {
-			// 限流的账号暂停参与轮询；429 原样流式透传，不在本请求内换账号。
+			// 限流的账号暂停参与选择；429 原样流式透传，不在本请求内换账号。
 			s.setCooldown(time.Now().Add(AccountCooldown))
 			s.log(r.Context(), slog.LevelWarn, "Copilot 生成请求被限流，账号进入冷却", "cooldown", AccountCooldown.String())
 		}

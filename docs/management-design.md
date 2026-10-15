@@ -11,11 +11,18 @@
   如 `mona-cat_octo`。`NewManagedPool` 中用户名不合规时返回错误。
   `Config.User` 为空时（旧测试直接用 `NewPool` 创建的池），ID 退化为账号在初始列表中的下标字符串（`"0"`、`"1"`…）。
 - Pool 内部用 `accounts []*poolAccount` 保存账号，列表保持插入顺序：`NewPool`/`NewManagedPool` 按传入顺序（cmd 层已按凭证文件名排序），
-  管理接口新增的账号追加到末尾。轮询顺序与 `GET accounts` 的顺序都是此列表顺序；ID 只用于查找与唯一性（不排序，原因：
-  `Config.User` 为空时 ID 为下标，按字节序会改变既有账号的下标）。运行时可增删、启用/禁用。
-- 测试通过 `p.accounts[i].service` 访问第 i 个账号的 `*Service`（取代旧的 `p.services`）；`next()` 与
-  `pick(tried []bool) int` 的名字与语义保持不变。
-  `poolAccount` 至少包含：`id`、`service *Service`、`routes serviceRoutes`、`disabled bool`、请求统计、额度缓存。
+  管理接口新增的账号追加到末尾。`GET accounts` 的顺序即此列表顺序，但选择账号时不依赖列表顺序（见下条）；ID 只用于查找与唯一性（不排序，原因：
+  `Config.User` 为空时 ID 为下标，按字节序会改变既有账号的下标）。运行时可增删、启用/禁用、调整优先级。
+- 账号选择（`pickLocked`，每次需要账号的请求调用一次，调用方持有 `Pool.mu`）：候选为未禁用且未被本请求排除（`tried`）的账号，
+  取 `selectKey` 排序最优者，排序依次为：
+  1. 未冷却优先（冷却中的账号只在没有未冷却候选时才会被选中）；
+  2. `priority` 高者在前；
+  3. 额度权重高者在前：`weigh`（`internal/copilot/weight.go`）取第一个不是 `additional_budget` 的额度窗口为主额度，其 `RemainingFraction > 0` 时为“有 Credits”档、值为该比例；
+     否则取 `additional_budget` 窗口的比例，档位为“无 Credits”；都没有（含没有额度数据）时为“无 Credits”、0。先比档位，再比值；
+  4. 凭证文件名（`strings.Compare(User+".json", ...)`，无用户名时用 ID）字节序升序。
+  权重只读取账号的额度缓存，不访问上游，因此只在额度刷新后变化。没有轮询游标：相同状态下的连续请求选中同一账号。
+- 测试通过 `p.accounts[i].service` 访问第 i 个账号的 `*Service`（取代旧的 `p.services`）。
+  `poolAccount` 至少包含：`id`、`service *Service`、`routes serviceRoutes`、`disabled bool`、`priority int`、请求统计、额度缓存。
 - 被选中的账号指针在请求期间独立使用；删除账号不影响正在进行中的请求。
 - 禁用的账号完全不参与选择（也不作为“冷却账号最后候选”）。没有任何可选账号时，需要账号的请求返回
   `503`，错误格式同 `writeError`，消息为 `没有可用的 GitHub Copilot 账号`。
@@ -82,8 +89,8 @@ func NewManagedPool(config PoolConfig, accounts []PoolAccount) (*Pool, error)
        兜底信号与 Claude 会话信号的哈希编码必须互不混淆（具体格式实现自定）。
      - 都没有时返回 `""`（不使用亲和）。非法 JSON 也返回 `""`。
   3. 返回 `hex(sha256(json.Marshal([2]string{clientKey, signal})))`，不保留原始密钥或正文。
-- 选择规则（`forward` 中）：会话键已绑定、账号仍存在、未禁用、未冷却、本请求未尝试过时优先使用该账号，
-  且不推进轮询游标；否则按原有轮询规则选择。成功取得 session 后把会话键绑定（或续期）到最终使用的账号。
+- 选择规则（`forward` 中）：会话键已绑定、账号仍存在、未禁用、未冷却、本请求未尝试过时优先使用该账号；
+  否则按第 1 节的账号选择规则（`pickLocked`）选择。成功取得 session 后把会话键绑定（或续期）到最终使用的账号。
 - 绑定的账号 session 获取失败时，照原规则冷却并切换账号，切换后的账号成为新的绑定。
 - 会话键为 `""` 时不使用亲和、也不绑定。
 - 亲和日志（`Pool.bind`，携带账号信息的 ctx 输出，只在会话键非空且开启亲和时输出，共三种）：
@@ -166,15 +173,17 @@ func parseQuota(raw []byte) (Quota, error)
 ## 6. 凭证持久化
 
 - `Credential` 新增 `Disabled bool \`json:"disabled,omitempty"\``；`LoadCredential` 接受该字段。
+- `Credential` 新增 `Priority int \`json:"priority,omitempty"\``，取值 `MinPriority`（-1）到 `MaxPriority`（100），省略等同于 0。
+  `LoadCredential` 与 `SaveCredential` 都拒绝超出范围的值（错误信息 `priority 必须在 -1 到 100 之间`）；JSON 中的非整数（如 `1.5`、字符串）在解码时即被拒绝。
 - 管理接口写入 `<CredentialsDir>/<GitHub 登录名>.json`（登录名保留 GitHub 返回的大小写；权限 0600，复用 `SaveCredential` 原子写入）。
   写入前必须确认目录中没有同名文件（忽略大小写，并扫描目录而不是只检查路径）：即使该文件是运行期间放入、尚未加载的，
   导入与设备登录也返回 409（设备登录则结束于 `status=error`），原文件内容保持不变。
 - 文件名与 ID 使用的登录名必须通过 `ValidGitHubUserName`（见第 1 节）；不合规的登录名（如含空格或 `.`）导入时返回 400，不写文件。
-- 禁用/启用：重写对应凭证文件的 `disabled` 字段，然后更新内存状态；写入失败时内存状态不变并返回 500。
-  启用时 `disabled` 字段按 `omitempty` 省略。
+- 禁用/启用与修改优先级（PATCH）：一次重写对应凭证文件的 `disabled` 与 `priority` 字段（未提供的字段取当前值），然后更新内存状态；
+  写入失败时内存状态不变并返回 500。`disabled` 为 false 或 `priority` 为 0 时对应字段按 `omitempty` 省略。
 - 删除：先删除凭证文件，再从池中移除；文件不存在也视为成功。删除后清理该账号的缓存目录（session 与模型列表缓存）。
   进行中的请求即使之后才完成 session 获取或写入缓存，也不得重新创建该账号的缓存目录（实现须在写缓存前确认账号仍在池中，或使用账号级的已删除标记）。
-- 启动加载（cmd/ghc2api）读取 `disabled`，传入 `PoolAccount.Disabled`。
+- 启动加载（cmd/ghc2api）读取 `disabled` 与 `priority`，分别传入 `PoolAccount.Disabled` 与 `PoolAccount.Priority`。
 
 
 ## 7. 管理接口（internal/copilot/management.go）
@@ -188,7 +197,7 @@ func parseQuota(raw []byte) (Quota, error)
 | `GET /management` | 无需鉴权 | 控制台 HTML（`web.Index()`），`Content-Type: text/html; charset=utf-8` |
 | `GET /v0/management/accounts` | — | `[]AccountView`；顺带为额度缓存超过 2 小时的账号并发刷新额度（总超时 10 秒，失败不影响返回） |
 | `POST /v0/management/accounts` | `{"credential":{"oauth_token":"...","host":"","user":""}}` | `200 AccountView`；见下 |
-| `PATCH /v0/management/accounts` | `{"id":"alice","disabled":true}` | `200 AccountView` |
+| `PATCH /v0/management/accounts` | `{"id":"alice","disabled":true}` 或 `{"id":"alice","priority":50}`，两者可同时提供 | `200 AccountView` |
 | `DELETE /v0/management/accounts?id=alice` | — | `200 {"ok":true}` |
 | `POST /v0/management/quota/refresh` | `{"id":"alice"}` | `200 AccountView`（强制刷新额度；失败时 502，但若已有旧数据则返回 200 并带 `quota_error`） |
 | `POST /v0/management/login` | — | `200 {"state","url","user_code","interval","expires_in"}` |
@@ -203,6 +212,7 @@ type AccountView struct {
     User          string     `json:"user"`
     Host          string     `json:"host"`                     // 空表示 github.com
     Disabled      bool       `json:"disabled"`
+    Priority      int        `json:"priority"`                 // -1 到 100，数值越大越优先被选择；始终输出
     CooldownUntil *time.Time `json:"cooldown_until,omitempty"` // 仅在冷却中时输出
     Stats         struct {
         Requests   uint64     `json:"requests"`
@@ -214,8 +224,9 @@ type AccountView struct {
 }
 ```
 
-- 不存在的 `id` 返回 404。请求体不是合法 JSON 或缺少必填字段返回 400：PATCH 的 `id` 与 `disabled` 都必填
-  （`disabled` 需用指针检测缺失）；DELETE 缺少 `id` 参数、quota/refresh 缺少 `id` 均返回 400。
+- 不存在的 `id` 返回 404。请求体不是合法 JSON 或缺少必填字段返回 400：PATCH 的 `id` 必填，`disabled` 与 `priority` 至少提供一个
+  （二者均用指针检测缺失；两者都缺失、`priority` 超出 [-1, 100]、或 `priority` 为非整数（如 `1.5`、字符串）时返回 400，且不写文件、不改变状态）；
+  DELETE 缺少 `id` 参数、quota/refresh 缺少 `id` 均返回 400。
 - `GET accounts` 按账号列表顺序返回（见第 1 节）。
 - 导入账号（POST accounts）：校验 token 与 host（顶层 Host 非空时覆盖），用该 token 请求 GitHub `/user` 得到登录名，
   再请求 `/copilot_internal/user` 确认订阅（复用 login.go 的 `finishLogin` 校验逻辑）。凭证中 `user` 非空且与登录名
@@ -248,7 +259,7 @@ session_affinity_ttl: "2h"
 - `session_affinity: false` 时传给 Pool 的 `SessionAffinityTTL` 为 0。
 - `session_affinity_ttl` 必须是大于 0 的 Go duration，非法值（含 `0s`、负值）启动失败。
 - 内部字段（供测试与实现对齐）：`appConfig.ManagementKey string`、`appConfig.SessionAffinity bool`、
-  `appConfig.SessionAffinityTTL time.Duration`（`loadConfig` 解析并校验）；`accountConfig.Disabled bool`（来自凭证文件）。
+  `appConfig.SessionAffinityTTL time.Duration`（`loadConfig` 解析并校验）；`accountConfig.Disabled bool`、`accountConfig.Priority int`（来自凭证文件）。
 - `func (c appConfig) poolConfig(logger *slog.Logger) copilot.PoolConfig`：生成服务级配置，包含 `APIKey`、`ManagementKey`、
   `CredentialsDir`（`DataPath/credentials`）、`CacheDir`（`DataPath/cache`）、`ModelsCacheTTL`、`SessionAffinityTTL`
   （关闭时为 0）、`Host`（顶层 host）、`Logger`。替代原 `copilotConfigs`。
@@ -261,20 +272,21 @@ session_affinity_ttl: "2h"
 - 从 `/Users/zc/Downloads/cpa-github-copilot/web` 复制并裁剪；使用 npm（`package-lock.json`），构建产物
   `web/dist/index.html` 提交到 git，`web/embed.go`（`package web`，导入路径 `ghc2api/web`）提供 `func Index() ([]byte, error)`。
 - 页面：「概览」（可用账号数、累计请求、错误数、各账号请求统计表）与「账号与额度」（账号卡片：状态、
-  Credits/Premium/Additional Budget 进度条与重置时间、请求统计；操作：刷新额度、启用/禁用、删除；
+  Credits/Premium/Additional Budget 进度条与重置时间、请求统计、优先级（数字输入框与保存按钮）；操作：刷新额度、启用/禁用、删除；
   工具栏：导入凭证 JSON、GitHub 设备登录）。登录页输入管理密钥，密钥保存在当前标签页的 sessionStorage 中
   （`web/src/session.ts`，键名 `ghc2api.managementKey`），刷新页面后仍保持登录；关闭标签页、退出登录或密钥失效时清除。
   存储不可用时所有存取静默忽略，登录状态退化为只保存在 React state 中。
   安全说明：管理密钥存于 sessionStorage 意味着同源脚本可读取该密钥，且关闭标签页后失效；此风险已接受，控制台不得引入第三方脚本。
-- 不包含参考项目中的 API Keys、运行日志、设置、优先级、模型列表、刷新凭据等功能。
+- 不包含参考项目中的 API Keys、运行日志、设置、模型列表、刷新凭据等功能。
 - Makefile 新增 `web` 目标：`cd web && npm ci && npm run build`；`build` 不依赖 Node。
 
 ## 10. 测试依赖的内部名字（实现须遵循）
 
 以下名字由测试直接使用，实现必须采用相同的名字与签名：
 
-- `Pool.accounts []*poolAccount`；`poolAccount` 字段：`id string`、`service *Service`、`disabled bool`。
-- `(*Pool).next() int`、`(*Pool).pick(tried []bool) int`（已有，语义不变）。
+- `Pool.accounts []*poolAccount`；`poolAccount` 字段：`id string`、`service *Service`、`disabled bool`、`priority int`。
+- `(*Pool).pickLocked(now time.Time, tried map[*poolAccount]bool) *poolAccount`（账号选择规则见第 1 节）；`next()`、`pick()` 与游标已删除。
+- `MinPriority`、`MaxPriority`（`credentials.go`）；`quotaWeight`、`weigh(*Quota)`（`weight.go`）。
 - `(*Service).setCooldown(time.Time)`、`(*Service).available(time.Time) bool`（已有）。
 - `sessionKey(r *http.Request, body []byte, upstreamPath string) string`。
 - `const maxSessionBindings = 4096`；`newAffinityTable(ttl time.Duration) *affinityTable`；

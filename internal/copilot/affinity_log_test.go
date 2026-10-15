@@ -16,7 +16,7 @@ import (
 const affinityLogClientKey = "affinity-log-client-secret"
 
 // affinityLogPool 创建 alice、bob 两个账号的托管池，日志以 JSON 写入返回的缓冲区，级别为 level。
-// 轮询从 alice 开始，因此首个请求由 alice 处理。
+// 两个账号都没有额度与优先级差异，按凭证文件名排序，alice 最小，因此首个请求由 alice 处理。
 func affinityLogPool(t *testing.T, up *mgmtUpstream, level slog.Level, ttl time.Duration) (*Pool, *bytes.Buffer) {
 	t.Helper()
 	dir := t.TempDir()

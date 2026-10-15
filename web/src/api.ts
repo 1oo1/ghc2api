@@ -9,6 +9,8 @@ export type AccountView = {
   /** 空表示 github.com。 */
   host: string;
   disabled: boolean;
+  /** 优先级，范围 -1 到 100；数值越大越优先被选择。 */
+  priority: number;
   /** 仅在冷却中时存在。 */
   cooldown_until?: string;
   stats: {
@@ -96,6 +98,8 @@ export function createManagementClient(managementKey: string) {
       request<AccountView>("accounts", "POST", { credential }),
     setDisabled: (id: string, disabled: boolean) =>
       request<AccountView>("accounts", "PATCH", { id, disabled }),
+    setPriority: (id: string, priority: number) =>
+      request<AccountView>("accounts", "PATCH", { id, priority }),
     deleteAccount: (id: string) =>
       request<{ ok: boolean }>(
         `accounts?id=${encodeURIComponent(id)}`,

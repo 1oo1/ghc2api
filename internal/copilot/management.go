@@ -36,6 +36,7 @@ type AccountView struct {
 	User          string     `json:"user"`
 	Host          string     `json:"host"` // 空表示 github.com
 	Disabled      bool       `json:"disabled"`
+	Priority      int        `json:"priority"`                 // 优先级，取值 MinPriority 到 MaxPriority；数值越大越优先被选择
 	CooldownUntil *time.Time `json:"cooldown_until,omitempty"` // 仅在冷却中时输出
 	Stats         struct {
 		Requests   uint64     `json:"requests"`
@@ -183,18 +184,26 @@ func (p *Pool) handleImportAccount(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, p.accountView(account))
 }
 
-// handlePatchAccount 启用或禁用账号。先重写凭证文件，成功后才更新内存状态；写入失败时返回 500 且状态不变。
+// handlePatchAccount 更新账号的 disabled 与 priority，两者至少提供一个，未提供的字段保持不变。
+// 先重写凭证文件，成功后才更新内存状态；写入失败时返回 500 且状态不变。
 func (p *Pool) handlePatchAccount(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID       string `json:"id"`
 		Disabled *bool  `json:"disabled"`
+		Priority *int   `json:"priority"`
 	}
 	if !decodeManagementJSON(w, r, &req) {
 		return
 	}
-	if req.ID == "" || req.Disabled == nil {
-		writeError(w, http.StatusBadRequest, "请求必须包含 id 与 disabled")
+	if req.ID == "" || (req.Disabled == nil && req.Priority == nil) {
+		writeError(w, http.StatusBadRequest, "请求必须包含 id，且 disabled 与 priority 至少提供一个")
 		return
+	}
+	if req.Priority != nil {
+		if err := checkPriority(*req.Priority); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	p.adminMu.Lock()
 	defer p.adminMu.Unlock()
@@ -203,14 +212,24 @@ func (p *Pool) handlePatchAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "账号不存在")
 		return
 	}
-	if err := setCredentialDisabled(p.credentialPath(account), *req.Disabled); err != nil {
+	// adminMu 串行化了所有修改，此处读到的 disabled 与 priority 在写入期间不会被其他请求改变。
+	p.mu.Lock()
+	disabled, priority := account.disabled, account.priority
+	p.mu.Unlock()
+	if req.Disabled != nil {
+		disabled = *req.Disabled
+	}
+	if req.Priority != nil {
+		priority = *req.Priority
+	}
+	if err := setCredentialState(p.credentialPath(account), disabled, priority); err != nil {
 		writeError(w, http.StatusInternalServerError, "写入凭证失败: "+err.Error())
 		return
 	}
 	p.mu.Lock()
-	account.disabled = *req.Disabled
+	account.disabled, account.priority = disabled, priority
 	p.mu.Unlock()
-	p.log(r.Context(), slog.LevelInfo, "管理接口：账号禁用状态已更新", "id", account.id, "disabled", *req.Disabled)
+	p.log(r.Context(), slog.LevelInfo, "管理接口：账号已更新", "id", account.id, "disabled", disabled, "priority", priority)
 	writeJSON(w, http.StatusOK, p.accountView(account))
 }
 
@@ -270,7 +289,7 @@ func (p *Pool) handleRefreshQuota(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, p.accountView(account))
 }
 
-// addVerifiedAccount 保存已通过 GitHub 校验的凭证，并把账号追加到池末尾。
+// addVerifiedAccount 保存已通过 GitHub 校验的凭证，并把账号追加到池末尾。新账号的优先级为 0。
 // 登录名（忽略大小写）或 Host+Token 已存在、凭证目录中已有同名文件时返回 errAccountExists，且不写入凭证。
 // 登录名须通过 ValidGitHubUserName，因为它会用作凭证文件名。
 func (p *Pool) addVerifiedAccount(token, host, login string) (*poolAccount, error) {
@@ -339,17 +358,18 @@ func (p *Pool) credentialPathFor(login string) string {
 	return filepath.Join(p.config.CredentialsDir, login+".json")
 }
 
-// setCredentialDisabled 重写凭证文件的 disabled 字段，其他字段保持不变；启用时该字段被省略。
-func setCredentialDisabled(path string, disabled bool) error {
+// setCredentialState 重写凭证文件中的 disabled 与 priority 字段，其他字段保持不变；disabled 为 false 时该字段被省略，priority 为 0 时同样省略。
+func setCredentialState(path string, disabled bool, priority int) error {
 	credential, err := LoadCredential(path)
 	if err != nil {
 		return err
 	}
 	credential.Disabled = disabled
+	credential.Priority = priority
 	return SaveCredential(path, credential)
 }
 
-// accountViews 返回全部账号的视图，顺序与轮询顺序一致。
+// accountViews 返回全部账号的视图，顺序与账号列表顺序一致。
 func (p *Pool) accountViews() []AccountView {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -368,10 +388,10 @@ func (p *Pool) accountView(account *poolAccount) AccountView {
 	return account.view(time.Now())
 }
 
-// view 生成账号视图。调用方须持有 p.mu（读取 disabled）。
+// view 生成账号视图。调用方须持有 p.mu（读取 disabled 与 priority）。
 func (a *poolAccount) view(now time.Time) AccountView {
 	view := AccountView{
-		ID: a.id, User: a.service.config.User, Host: a.service.config.Host, Disabled: a.disabled,
+		ID: a.id, User: a.service.config.User, Host: a.service.config.Host, Disabled: a.disabled, Priority: a.priority,
 	}
 	if until := a.service.cooldownUntil.Load(); until > now.UnixNano() {
 		cooldown := time.Unix(0, until).UTC()

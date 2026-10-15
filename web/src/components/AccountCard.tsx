@@ -1,10 +1,14 @@
-// 单个账号的卡片：状态、额度、请求统计与操作按钮。
+// 单个账号的卡片：状态、额度、请求统计、优先级与操作按钮。
+import { useState } from "react";
 import type { AccountView } from "../api";
 import type { Actions } from "../actions";
 import {
   accountStatus,
   formatTime,
   hostLabel,
+  MAX_PRIORITY,
+  MIN_PRIORITY,
+  parsePriority,
   statusLabel,
 } from "../account";
 import { buckets, resetLabel, usedPercent, type Bucket, type Quota } from "../quota";
@@ -39,6 +43,8 @@ export function AccountCard({
         {status === "cooling" &&
           ` · 冷却至 ${formatTime(account.cooldown_until)}`}
       </p>
+      {/* 以服务端的优先级为 key：优先级变化后重新挂载，输入框随之显示新值。 */}
+      <PriorityEditor key={account.priority} account={account} actions={actions} />
       <footer>
         <button
           disabled={busy}
@@ -80,6 +86,55 @@ export function AccountCard({
         </button>
       </footer>
     </article>
+  );
+}
+
+/** 优先级编辑：输入新值后保存。输入非法或与当前值相同时不能保存。 */
+function PriorityEditor({
+  account,
+  actions,
+}: {
+  account: AccountView;
+  actions: Actions;
+}) {
+  const { busy, client, run } = actions;
+  const [text, setText] = useState(String(account.priority));
+  const value = parsePriority(text);
+  const changed = value !== null && value !== account.priority;
+
+  return (
+    <form
+      className="priority-editor"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (value === null || !changed) return;
+        void run(async () => {
+          await client.setPriority(account.id, value);
+          return `${account.user} 优先级已设为 ${value}`;
+        });
+      }}
+    >
+      <label>
+        优先级
+        <input
+          type="number"
+          min={MIN_PRIORITY}
+          max={MAX_PRIORITY}
+          value={text}
+          disabled={busy}
+          aria-invalid={value === null}
+          onChange={(e) => setText(e.target.value)}
+        />
+      </label>
+      <button type="submit" disabled={busy || !changed}>
+        保存
+      </button>
+      {value === null && (
+        <p className="hint error">
+          优先级必须是 {MIN_PRIORITY} 到 {MAX_PRIORITY} 之间的整数
+        </p>
+      )}
+    </form>
   );
 }
 

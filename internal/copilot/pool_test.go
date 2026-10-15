@@ -12,7 +12,6 @@ import (
 	"reflect"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -33,7 +32,7 @@ type poolFailure struct {
 }
 
 // poolUpstream 模拟多个 GitHub 账号共用的上游：按 OAuth token 颁发不同的 session，
-// 并记录每个生成请求到达的账号，用于断言 round-robin、session 复用和冷却行为。
+// 并记录每个生成请求到达的账号，用于断言账号选择、session 复用和冷却行为。
 type poolUpstream struct {
 	t *testing.T
 
@@ -169,12 +168,6 @@ func (u *poolUpstream) failGenerationWithHeader(account string, failure poolFail
 	u.generationHeaders[account] = header
 }
 
-func (u *poolUpstream) recoverGeneration(account string) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	delete(u.generationResult, account)
-}
-
 func (u *poolUpstream) failAuto(account string, failure poolFailure) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -219,11 +212,23 @@ func assertGenerationOrder(t *testing.T, u *poolUpstream, want ...string) {
 }
 
 // poolConfigs 为每个 OAuth token 生成独立账号配置；每个账号使用独立临时缓存目录，避免磁盘 session 互相影响。
+// 账号没有用户名，文件名由下标决定（0.json、1.json）；需要按用户名文件名选择时用 poolUserConfigs。
 func poolConfigs(t *testing.T, client *http.Client, tokens ...string) []Config {
 	t.Helper()
 	configs := make([]Config, 0, len(tokens))
 	for _, token := range tokens {
 		configs = append(configs, Config{Token: token, CacheDir: t.TempDir(), Client: client})
+	}
+	return configs
+}
+
+// poolUserConfigs 按用户名生成账号配置：凭证文件名为 <user>.json，token 为 "oauth-" + user，
+// 账号按传入顺序加入池（即 account 日志下标）。选择顺序由文件名决定，与传入顺序无关。
+func poolUserConfigs(t *testing.T, client *http.Client, users ...string) []Config {
+	t.Helper()
+	configs := make([]Config, 0, len(users))
+	for _, user := range users {
+		configs = append(configs, Config{Token: "oauth-" + user, User: user, CacheDir: t.TempDir(), Client: client})
 	}
 	return configs
 }
@@ -331,92 +336,22 @@ func TestServiceCooldownFollowsDeadline(t *testing.T) {
 	}
 }
 
-func TestPoolNextRoundRobin(t *testing.T) {
-	p := testPool(t, poolConfigs(t, nil, "oauth-a", "oauth-b", "oauth-c"))
-	for i, want := range []int{0, 1, 2, 0, 1, 2, 0} {
-		if got := p.next(); got != want {
-			t.Fatalf("next() 第 %d 次 = %d, want %d", i, got, want)
-		}
-	}
-}
-
-func TestPoolNextSkipsCoolingAccountWithoutExtraAdvance(t *testing.T) {
-	p := testPool(t, poolConfigs(t, nil, "oauth-a", "oauth-b", "oauth-c"))
-	p.accounts[1].service.setCooldown(time.Now().Add(time.Hour))
-	// B 冷却期间，请求依次落在 A、C；跳过 B 不应额外消耗轮询位置。
-	for i, want := range []int{0, 2, 0, 2, 0, 2} {
-		if got := p.next(); got != want {
-			t.Fatalf("next() 第 %d 次 = %d, want %d", i, got, want)
-		}
-	}
-}
-
-func TestPoolNextReturnsAccountAfterCooldownExpires(t *testing.T) {
-	p := testPool(t, poolConfigs(t, nil, "oauth-a", "oauth-b", "oauth-c"))
-	p.accounts[1].service.setCooldown(time.Now().Add(time.Hour))
-	for i, want := range []int{0, 2, 0} {
-		if got := p.next(); got != want {
-			t.Fatalf("冷却期内 next() 第 %d 次 = %d, want %d", i, got, want)
-		}
-	}
-	// 不等待真实时间：把冷却截止时间设为已经过去，模拟冷却过期。
-	p.accounts[1].service.setCooldown(time.Now().Add(-time.Second))
-	// 游标此时位于 B，冷却过期后 B 应重新参与轮询。
-	for i, want := range []int{1, 2, 0} {
-		if got := p.next(); got != want {
-			t.Fatalf("冷却过期后 next() 第 %d 次 = %d, want %d", i, got, want)
-		}
-	}
-}
-
-func TestPoolNextFallsBackToPlainRoundRobinWhenAllCooling(t *testing.T) {
-	p := testPool(t, poolConfigs(t, nil, "oauth-a", "oauth-b", "oauth-c"))
-	until := time.Now().Add(time.Hour)
-	for _, a := range p.accounts {
-		a.service.setCooldown(until)
-	}
-	// 全部冷却时忽略冷却，按游标位置纯轮询，避免所有请求都无账号可用。
-	for i, want := range []int{0, 1, 2, 0} {
-		if got := p.next(); got != want {
-			t.Fatalf("全部冷却时 next() 第 %d 次 = %d, want %d", i, got, want)
-		}
-	}
-}
-
-func TestPoolNextDistributesConcurrentCallsEvenly(t *testing.T) {
-	p := testPool(t, poolConfigs(t, nil, "oauth-a", "oauth-b", "oauth-c"))
-	const workers, perWorker = 30, 100 // 总数是账号数的整数倍，分布应严格均匀
-	counts := make([]atomic.Int64, 3)
-	var wait sync.WaitGroup
-	for range workers {
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
-			for range perWorker {
-				counts[p.next()].Add(1)
-			}
-		}()
-	}
-	wait.Wait()
-	for i := range counts {
-		if got := counts[i].Load(); got != workers*perWorker/3 {
-			t.Errorf("账号 %d 被选中 %d 次, want %d", i, got, workers*perWorker/3)
-		}
-	}
-}
-
-func TestPoolHandlerRoundRobinAcrossAccounts(t *testing.T) {
+func TestPoolHandlerSendsEveryRequestToFirstAccountByFileName(t *testing.T) {
 	upstream := newPoolUpstream(t)
-	p := testPool(t, poolConfigs(t, upstream.client(), "oauth-a", "oauth-b", "oauth-c"))
+	// 账号按 b、a、c 加入，但选择只看凭证文件名：a.json 最小，之后的请求不会轮流到其他账号。
+	p := testPool(t, poolUserConfigs(t, upstream.client(), "b", "a", "c"))
 	for i := range 6 {
 		if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK {
 			t.Fatalf("请求 %d status=%d body=%s", i, w.Code, w.Body.String())
 		}
 	}
-	assertGenerationOrder(t, upstream, "oauth-a", "oauth-b", "oauth-c", "oauth-a", "oauth-b", "oauth-c")
-	for _, account := range []string{"oauth-a", "oauth-b", "oauth-c"} {
-		if got := upstream.sessionCount(account); got != 1 {
-			t.Errorf("%s session 交换 %d 次, want 1（session 应按账号复用）", account, got)
+	assertGenerationOrder(t, upstream, "oauth-a", "oauth-a", "oauth-a", "oauth-a", "oauth-a", "oauth-a")
+	if got := upstream.sessionCount("oauth-a"); got != 1 {
+		t.Errorf("oauth-a session 交换 %d 次, want 1（session 应按账号复用）", got)
+	}
+	for _, account := range []string{"oauth-b", "oauth-c"} {
+		if got := upstream.sessionCount(account); got != 0 {
+			t.Errorf("%s 未被选中却发生了 %d 次 session 交换", account, got)
 		}
 	}
 }
@@ -462,17 +397,17 @@ func TestPoolSessionFailureSwitchesAccountInSameRequestAndCoolsDown(t *testing.T
 	logs := captureJSONSlog(t, slog.LevelWarn)
 	upstream := newPoolUpstream(t)
 	upstream.failSession("oauth-a", poolFailure{http.StatusInternalServerError, `{"message":"a down"}`})
-	p := testPool(t, poolConfigs(t, upstream.client(), "oauth-a", "oauth-b", "oauth-c"))
+	p := testPool(t, poolUserConfigs(t, upstream.client(), "a", "b", "c"))
 
-	// 第一次请求轮到 A，session 失败后同一请求改用 B；之后 A 冷却，轮询跳过它。
-	for i, want := range []string{"oauth-b", "oauth-c", "oauth-b"} {
+	// 第一次请求由文件名最小的 A 处理，A 的 session 失败后同一请求改用 B；之后 A 冷却，仍由 B 处理，A 不再被尝试。
+	for i := range 3 {
 		w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody)
 		if w.Code != http.StatusOK {
 			t.Fatalf("请求 %d status=%d body=%s", i, w.Code, w.Body.String())
 		}
 		got := upstream.generationOrder()
-		if len(got) == 0 || got[len(got)-1] != want {
-			t.Fatalf("请求 %d 的生成账号顺序 = %v, want 最后一个为 %s", i, got, want)
+		if len(got) == 0 || got[len(got)-1] != "oauth-b" {
+			t.Fatalf("请求 %d 的生成账号顺序 = %v, want 最后一个为 oauth-b", i, got)
 		}
 	}
 	if got := upstream.sessionCount("oauth-a"); got != 1 {
@@ -498,7 +433,7 @@ func TestPoolNetworkFailureOnOneAccountFallsBackToNextAccount(t *testing.T) {
 		}
 		return healthy.Transport.RoundTrip(r)
 	})}
-	p := testPool(t, poolConfigs(t, client, "oauth-a", "oauth-b"))
+	p := testPool(t, poolUserConfigs(t, client, "a", "b"))
 	for i := range 2 {
 		if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK {
 			t.Fatalf("请求 %d status=%d body=%s", i, w.Code, w.Body.String())
@@ -512,7 +447,7 @@ func TestPoolReturnsLastAccountErrorWhenAllSessionsFail(t *testing.T) {
 	upstream.failSession("oauth-a", poolFailure{http.StatusUnauthorized, "a rejected"})
 	upstream.failSession("oauth-b", poolFailure{http.StatusInternalServerError, "b failed"})
 	upstream.failSession("oauth-c", poolFailure{http.StatusForbidden, "c forbidden"})
-	p := testPool(t, poolConfigs(t, upstream.client(), "oauth-a", "oauth-b", "oauth-c"))
+	p := testPool(t, poolUserConfigs(t, upstream.client(), "a", "b", "c"))
 
 	w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody)
 	// 上游错误状态和正文原样透传，且最后一个尝试的账号是 C。
@@ -542,7 +477,7 @@ func TestPoolGeneration429PassesThroughAndCoolsAccount(t *testing.T) {
 		t.Run(path, func(t *testing.T) {
 			upstream := newPoolUpstream(t)
 			upstream.failGeneration("oauth-a", poolFailure{http.StatusTooManyRequests, `{"error":"quota exhausted"}`})
-			p := testPool(t, poolConfigs(t, upstream.client(), "oauth-a", "oauth-b"))
+			p := testPool(t, poolUserConfigs(t, upstream.client(), "a", "b"))
 
 			w := poolRequest(p, "POST", path, poolChatBody)
 			if w.Code != http.StatusTooManyRequests || w.Body.String() != `{"error":"quota exhausted"}` {
@@ -638,7 +573,7 @@ func TestPoolAuthenticationAndHealth(t *testing.T) {
 func TestPoolLogsIncreasingRequestIDsAndAccountIndex(t *testing.T) {
 	logs := captureJSONSlog(t, slog.LevelInfo)
 	upstream := newPoolUpstream(t)
-	p := testPool(t, poolConfigs(t, upstream.client(), "oauth-a", "oauth-b"))
+	p := testPool(t, poolUserConfigs(t, upstream.client(), "a", "b"))
 	for i := range poolRequestsTotal {
 		if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK {
 			t.Fatalf("请求 %d status=%d body=%s", i, w.Code, w.Body.String())
@@ -680,7 +615,8 @@ func TestPoolLogsIncreasingRequestIDsAndAccountIndex(t *testing.T) {
 			got = append(got, account)
 		}
 	}
-	want := []any{float64(0), float64(1), float64(0), float64(1)}
+	// 两个账号按文件名排序，所有请求都由 a（账号下标 0）处理。
+	want := []any{float64(0), float64(0), float64(0), float64(0)}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("各请求日志中的 account = %v, want %v", got, want)
 	}
@@ -776,27 +712,15 @@ func TestPoolLogsClientRequestHeadersWithSensitiveRedacted(t *testing.T) {
 	assertClientRequestHeadersLogged(t, logs.Bytes())
 }
 
-// setupCooledAccountB 通过 HTTP 请求让账号 B 因生成请求 429 进入冷却，并把轮询游标停在 A 上：
-// 请求 1 轮到 A 并成功，请求 2 轮到 B 并收到 429，请求 3 轮到 C 并成功。随后恢复 B 的生成结果，
-// 之后的请求从 A 开始，依次经过 A、（冷却的）B、C。
-// session 有效期设为 1 分钟，使每个请求都会重新交换 session，便于精确控制后续失败。
+// setupCooledAccountB 让账号 B 处于冷却中，A 与 C 未冷却。冷却直接设置而不经过 429 请求，
+// 使测试只关注 session 失败与冷却档的选择顺序。session 有效期设为 1 分钟，使每个请求都会重新交换 session，
+// 便于精确控制后续失败。
 func setupCooledAccountB(t *testing.T) (*poolUpstream, *Pool) {
 	t.Helper()
 	upstream := newPoolUpstream(t)
 	upstream.setSessionTTL(time.Minute)
-	upstream.failGeneration("oauth-b", poolFailure{http.StatusTooManyRequests, `{"error":"limited"}`})
-	p := testPool(t, poolConfigs(t, upstream.client(), "oauth-a", "oauth-b", "oauth-c"))
-	if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK {
-		t.Fatalf("准备请求 1 status=%d body=%s", w.Code, w.Body.String())
-	}
-	if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusTooManyRequests {
-		t.Fatalf("准备请求 2 status=%d body=%s, want 429 使 B 冷却", w.Code, w.Body.String())
-	}
-	if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK {
-		t.Fatalf("准备请求 3 status=%d body=%s", w.Code, w.Body.String())
-	}
-	assertGenerationOrder(t, upstream, "oauth-a", "oauth-b", "oauth-c")
-	upstream.recoverGeneration("oauth-b")
+	p := testPool(t, poolUserConfigs(t, upstream.client(), "a", "b", "c"))
+	p.findAccount("b").service.setCooldown(time.Now().Add(time.Hour))
 	return upstream, p
 }
 
@@ -830,10 +754,10 @@ func TestPoolRequestNeverRetriesAccountWithinOneRequest(t *testing.T) {
 			t.Fatalf("status=%d body=%s, want 200 由冷却中的 B 处理", w.Code, w.Body.String())
 		}
 		// A、C 各只在本请求内尝试一次（失败即冷却，之后不会再被选中）；
-		// B 作为最后的候选被尝试并成功处理。B 成功时请求处理函数还会再读取一次 session，
-		// 因此这里用生成请求的账号顺序判断 B 恰好处理了一次，而不用 session 计数。
+		// B 处于冷却档，只在 A、C 都被排除后才作为最后的候选被尝试，并成功处理。
+		// 本请求只有 B 的生成请求，因此生成请求的账号顺序只含一次 oauth-b。
 		assertSessionAttempts(t, upstream, before, map[string]int{"oauth-a": 1, "oauth-c": 1})
-		assertGenerationOrder(t, upstream, "oauth-a", "oauth-b", "oauth-c", "oauth-b")
+		assertGenerationOrder(t, upstream, "oauth-b")
 	})
 	t.Run("every-account-attempted-exactly-once", func(t *testing.T) {
 		upstream, p := setupCooledAccountB(t)
@@ -856,7 +780,7 @@ func TestPoolGenerationLargeRateLimitBodyPassesThroughAndCoolsAccount(t *testing
 	upstream := newPoolUpstream(t)
 	upstream.failGenerationWithHeader("oauth-a", poolFailure{http.StatusTooManyRequests, body},
 		http.Header{"Retry-After": {"120"}})
-	p := testPool(t, poolConfigs(t, upstream.client(), "oauth-a", "oauth-b"))
+	p := testPool(t, poolUserConfigs(t, upstream.client(), "a", "b"))
 
 	w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody)
 	if w.Code != http.StatusTooManyRequests {
@@ -882,7 +806,7 @@ func TestPoolAutoRateLimitPassesThroughAndCoolsAccount(t *testing.T) {
 	const autoBody = `{"model":"auto","messages":[{"role":"user","content":"hi"}]}`
 	upstream := newPoolUpstream(t)
 	upstream.failAuto("oauth-a", poolFailure{http.StatusTooManyRequests, `{"error":"auto limited"}`})
-	p := testPool(t, poolConfigs(t, upstream.client(), "oauth-a", "oauth-b"))
+	p := testPool(t, poolUserConfigs(t, upstream.client(), "a", "b"))
 
 	w := poolRequest(p, "POST", "/v1/chat/completions", autoBody)
 	if w.Code != http.StatusTooManyRequests {
@@ -901,39 +825,17 @@ func TestPoolAutoRateLimitPassesThroughAndCoolsAccount(t *testing.T) {
 	}
 }
 
-// TestPoolSessionFreeRequestsDoNotAdvanceRoundRobin 不访问上游的请求不应推进轮询游标。
-func TestPoolSessionFreeRequestsDoNotAdvanceRoundRobin(t *testing.T) {
-	for _, tc := range []struct{ name, method, path string }{
-		{"healthz", "GET", "/healthz"},
-		{"unknown-path", "GET", "/no-such-route"},
-		{"wrong-method", "GET", "/v1/chat/completions"},
-		{"double-slash-redirect", "GET", "//models"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			upstream := newPoolUpstream(t)
-			p := testPool(t, poolConfigs(t, upstream.client(), "oauth-a", "oauth-b"))
-			// 每轮先发一个不访问上游的请求，再发一个生成请求，共 4 个生成请求，顺序应严格交替。
-			for range 4 {
-				poolRequest(p, tc.method, tc.path, "")
-				if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK {
-					t.Fatalf("生成请求 status=%d body=%s", w.Code, w.Body.String())
-				}
-			}
-			assertGenerationOrder(t, upstream, "oauth-a", "oauth-b", "oauth-a", "oauth-b")
-		})
-	}
-}
-
-// TestPoolUsageAdvancesRoundRobin 对照组：用量查询会访问上游，因此仍按轮询推进游标。
-func TestPoolUsageAdvancesRoundRobin(t *testing.T) {
+// TestPoolUsageUsesSameAccountWhileAvailable 用量查询同样经由账号选择：只要该账号可用，每次都由它处理，
+// 不再轮流使用其他账号。
+func TestPoolUsageUsesSameAccountWhileAvailable(t *testing.T) {
 	upstream := newPoolUpstream(t)
-	p := testPool(t, poolConfigs(t, upstream.client(), "oauth-a", "oauth-b"))
+	p := testPool(t, poolUserConfigs(t, upstream.client(), "a", "b"))
 	for i := range 3 {
 		if w := poolRequest(p, "GET", "/v1/usage", ""); w.Code != http.StatusOK {
 			t.Fatalf("用量请求 %d status=%d body=%s", i, w.Code, w.Body.String())
 		}
 	}
-	if got, want := upstream.usageOrder(), []string{"oauth-a", "oauth-b", "oauth-a"}; !reflect.DeepEqual(got, want) {
+	if got, want := upstream.usageOrder(), []string{"oauth-a", "oauth-a", "oauth-a"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("用量查询的账号顺序 = %v, want %v", got, want)
 	}
 }
@@ -946,10 +848,15 @@ func TestPoolLogsUserAndAccountIndexPerAccount(t *testing.T) {
 	configs := poolConfigs(t, upstream.client(), "oauth-a", "oauth-b")
 	configs[0].User = "alice"
 	p := testPool(t, configs)
-	for i := range 2 {
-		if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK {
-			t.Fatalf("请求 %d status=%d body=%s", i, w.Code, w.Body.String())
-		}
+	// 每次请求只留一个可用账号，使两个账号各处理一次，结果与两者的选择顺序无关。
+	p.accounts[1].service.setCooldown(time.Now().Add(time.Hour))
+	if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK {
+		t.Fatalf("请求 0 status=%d body=%s", w.Code, w.Body.String())
+	}
+	p.accounts[0].service.setCooldown(time.Now().Add(time.Hour))
+	p.accounts[1].service.setCooldown(time.Now().Add(-time.Second))
+	if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK {
+		t.Fatalf("请求 1 status=%d body=%s", w.Code, w.Body.String())
 	}
 
 	wantUser := map[float64]string{0: "alice", 1: ""} // 账号下标 -> 期望的 user 字段（空表示不应出现）
