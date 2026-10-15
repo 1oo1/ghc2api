@@ -6,7 +6,7 @@
 
 ## 适用范围
 
-只对 POST 生成请求（chat completions、responses、`/v1/messages`）生效；模型列表与用量不使用。未配置 `api_key` 时同样生效。
+只对 POST 生成请求（chat completions、responses、`/v1/messages`）生效；模型列表不使用。未配置 `api_key` 时同样生效。
 
 ## 会话键
 

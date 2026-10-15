@@ -16,7 +16,6 @@
 | `POST /v1/chat/completions`、`/chat/completions` | `/chat/completions` | OpenAI Chat Completions |
 | `POST /v1/responses`、`/responses` | `/responses` | OpenAI Responses |
 | `POST /v1/messages` | `/v1/messages` | Anthropic Messages |
-| `GET /usage`、`/v1/usage` | GitHub `/copilot_internal/user` | 原始 `quota_snapshots`，不把 Business/Enterprise 共享额度解释为无限 |
 
 Web 控制台与管理接口见 `management.md`。
 

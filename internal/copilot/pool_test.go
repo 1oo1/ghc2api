@@ -45,7 +45,6 @@ type poolUpstream struct {
 	sessionTTL        time.Duration          // 签发的 session 有效期；短于 2 分钟时客户端每次都会重新交换
 	autoCalls         map[string]int         // 每个账号访问 Auto 接口（/auto、/models/session）的次数
 	autoResult        map[string]poolFailure // 指定账号的 Auto 接口返回该失败
-	usages            []string               // 按到达顺序记录用量查询所属账号的 OAuth token
 	generationHeaders map[string]http.Header // 指定账号生成请求失败时额外返回的响应头
 }
 
@@ -89,9 +88,6 @@ func (u *poolUpstream) serve(w http.ResponseWriter, r *http.Request) {
 			"endpoints": map[string]string{"api": ""},
 		})
 	case "/copilot_internal/user":
-		u.mu.Lock()
-		u.usages = append(u.usages, strings.TrimPrefix(r.Header.Get("Authorization"), poolTokenPrefix))
-		u.mu.Unlock()
 		testJSON(w, map[string]string{"plan": "pool-test"})
 	case "/models":
 		_, _ = io.WriteString(w, testModels)
@@ -178,12 +174,6 @@ func (u *poolUpstream) autoCount(account string) int {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return u.autoCalls[account]
-}
-
-func (u *poolUpstream) usageOrder() []string {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	return append([]string(nil), u.usages...)
 }
 
 func (u *poolUpstream) sessionCount(account string) int {
@@ -359,7 +349,7 @@ func TestPoolHandlerSendsEveryRequestToFirstAccountByFileName(t *testing.T) {
 func TestPoolRoutesEveryPublicEndpoint(t *testing.T) {
 	upstream := newPoolUpstream(t)
 	p := testPool(t, poolConfigs(t, upstream.client(), "oauth-a", "oauth-b"))
-	for _, path := range []string{"/models", "/v1/models", "/usage", "/v1/usage"} {
+	for _, path := range []string{"/models", "/v1/models"} {
 		if w := poolRequest(p, "GET", path, ""); w.Code != http.StatusOK {
 			t.Errorf("GET %s status=%d body=%s", path, w.Code, w.Body.String())
 		}
@@ -380,7 +370,6 @@ func TestPoolWithSingleAccountMatchesService(t *testing.T) {
 	pool := testPool(t, poolConfigs(t, client, "oauth-solo"))
 	for _, tc := range []struct{ method, path, body string }{
 		{"GET", "/v1/models", ""},
-		{"GET", "/v1/usage", ""},
 		{"POST", "/v1/chat/completions", poolChatBody},
 	} {
 		want := testRequest(service, tc.method, tc.path, tc.body)
@@ -536,7 +525,6 @@ func TestPoolAuthenticationAndHealth(t *testing.T) {
 	for _, tc := range []struct{ method, path, auth string }{
 		{"GET", "/v1/models", ""},
 		{"POST", "/v1/chat/completions", ""},
-		{"GET", "/usage", ""},
 		{"GET", "/v1/models", "Bearer wrong-key"},
 		{"GET", "/v1/models", "Basic " + poolLocalAPIKey},
 	} {
@@ -635,9 +623,7 @@ func TestPoolSessionFreeRoutesIgnoreSessionFailures(t *testing.T) {
 	for _, tc := range []struct {
 		name, method, path string
 		wantCode           int
-		wantUpstreamCalls  int // Pool 处理该请求时允许访问上游的次数
 	}{
-		{name: "usage-is-not-session-gated", method: "GET", path: "/v1/usage", wantCode: http.StatusOK, wantUpstreamCalls: 1},
 		{name: "double-slash-redirect", method: "GET", path: "//models", wantCode: http.StatusTemporaryRedirect},
 		{name: "unknown-path", method: "GET", path: "/no-such-route", wantCode: http.StatusNotFound},
 		{name: "wrong-method", method: "GET", path: "/v1/chat/completions", wantCode: http.StatusMethodNotAllowed},
@@ -646,8 +632,8 @@ func TestPoolSessionFreeRoutesIgnoreSessionFailures(t *testing.T) {
 			want := testRequest(reference, tc.method, tc.path, "")
 			before := upstream.requestCount()
 			got := poolRequest(p, tc.method, tc.path, "")
-			if calls := upstream.requestCount() - before; calls != tc.wantUpstreamCalls {
-				t.Errorf("Pool 处理 %s %s 访问上游 %d 次, want %d", tc.method, tc.path, calls, tc.wantUpstreamCalls)
+			if calls := upstream.requestCount() - before; calls != 0 {
+				t.Errorf("Pool 处理 %s %s 访问上游 %d 次, want 0", tc.method, tc.path, calls)
 			}
 			if tc.wantCode != 0 && got.Code != tc.wantCode {
 				t.Errorf("status = %d, want %d; body=%s", got.Code, tc.wantCode, got.Body.String())
@@ -822,21 +808,6 @@ func TestPoolAutoRateLimitPassesThroughAndCoolsAccount(t *testing.T) {
 	assertGenerationOrder(t, upstream, "oauth-b", "oauth-b")
 	if got := upstream.autoCount("oauth-a"); got != autoAfterFirst {
 		t.Errorf("冷却期内仍访问 A 的 Auto 接口: 次数 %d, want %d", got, autoAfterFirst)
-	}
-}
-
-// TestPoolUsageUsesSameAccountWhileAvailable 用量查询同样经由账号选择：只要该账号可用，每次都由它处理，
-// 不再轮流使用其他账号。
-func TestPoolUsageUsesSameAccountWhileAvailable(t *testing.T) {
-	upstream := newPoolUpstream(t)
-	p := testPool(t, poolUserConfigs(t, upstream.client(), "a", "b"))
-	for i := range 3 {
-		if w := poolRequest(p, "GET", "/v1/usage", ""); w.Code != http.StatusOK {
-			t.Fatalf("用量请求 %d status=%d body=%s", i, w.Code, w.Body.String())
-		}
-	}
-	if got, want := upstream.usageOrder(), []string{"oauth-a", "oauth-a", "oauth-a"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("用量查询的账号顺序 = %v, want %v", got, want)
 	}
 }
 

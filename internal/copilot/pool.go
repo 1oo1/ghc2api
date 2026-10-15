@@ -49,7 +49,7 @@ type poolAccount struct {
 	disabled bool
 	priority int // 优先级，见 PoolAccount.Priority
 
-	requests atomic.Uint64 // 分发到该账号的需要账号的请求数（含用量与生成）
+	requests atomic.Uint64 // 分发到该账号的请求数（含模型列表与生成）
 	failures atomic.Uint64 // 其中响应状态 >= 400 的数量
 	lastUsed atomic.Int64  // 最近一次使用的 UnixNano，0 表示从未使用
 
@@ -222,19 +222,12 @@ func (p *Pool) Handler() http.Handler {
 }
 
 // dispatch 按路由登记的上游访问方式分发请求：不访问上游的请求直接处理且不参与账号选择；
-// 需要账号的请求按选择规则选择账号；需要 session 的请求进入 forward。
+// 需要 session 的请求进入 forward。
 func (p *Pool) dispatch(w http.ResponseWriter, r *http.Request) {
 	entry := p.routeOf(r)
 	switch entry.need {
 	case needNone:
 		p.idle.mux.ServeHTTP(w, r)
-	case needAccount:
-		account := p.choose("", nil)
-		if account == nil {
-			writeNoAccount(w)
-			return
-		}
-		p.serve(w, r.WithContext(p.accountContext(r.Context(), account)), account)
 	default:
 		p.forward(w, r, p.affinityKey(r, entry.upstream))
 	}

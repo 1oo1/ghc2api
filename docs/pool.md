@@ -30,7 +30,6 @@ NewManagedPool(PoolConfig, []PoolAccount) (*Pool, error)
 - 没有轮询游标：相同状态下连续请求选中同一账号。
 - 无可选账号时，需要账号的请求返回 503（`没有可用的 GitHub Copilot 账号`）。
 - `/healthz`、404、405、重定向不访问上游，由池直接处理，0 账号也能工作。
-- `GET /usage` 不需要 session，按上述规则落到某账号，失败不切换账号。
 - 模型列表是各账号独立获取的；订阅不同时某模型可能只在部分账号可用，被分到不支持的账号会返回 400。
 
 ## 故障切换
@@ -43,7 +42,6 @@ NewManagedPool(PoolConfig, []PoolAccount) (*Pool, error)
 
 - 以下情况账号冷却 1 分钟，且本请求不换号：生成接口直接返回的 429（原样流式透传）；经错误处理路径透传的 429（如 `/v1/models`、Auto 的 `/models/session`）。
 - Auto 的 `/auto` 返回 429 时兜底请求 `/models/session`：成功则正常响应且不冷却；兜底也 429 才透传并冷却。
-- `GET /usage` 的 429 不冷却，原样返回。
 - 客户端取消不冷却也不计错误。冷却状态仅在内存，重启清空。
 
 ## 测试依赖的内部名字

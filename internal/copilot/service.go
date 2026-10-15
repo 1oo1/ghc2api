@@ -105,8 +105,7 @@ func (s *Service) Handler() http.Handler {
 type routeNeed int
 
 const (
-	needNone    routeNeed = iota // 不访问上游（健康检查、未注册路由、重定向等）：由 routes[0] 直接处理，不参与账号选择
-	needAccount                  // 访问上游但不需要 session（用量）：按账号选择规则选择账号，失败不切换
+	needNone    routeNeed = iota // 不访问上游（健康检查、未注册路由、重定向等）：由 Pool 的 idle 路由直接处理，不参与账号选择
 	needSession                  // 需要 Copilot session（模型列表、生成请求）：预取 session，失败时切换账号
 )
 
@@ -132,9 +131,6 @@ func (s *Service) routes() serviceRoutes {
 	}, routeEntry{need: needNone})
 	for _, path := range []string{"/models", "/v1/models"} {
 		routes.handle("GET", path, s.handleModels, routeEntry{need: needSession})
-	}
-	for _, path := range []string{"/usage", "/v1/usage"} {
-		routes.handle("GET", path, s.handleUsage, routeEntry{need: needAccount})
 	}
 	for local, upstream := range map[string]string{
 		"/chat/completions": "/chat/completions", "/v1/chat/completions": "/chat/completions",
@@ -274,28 +270,6 @@ func (s *Service) fetchJSON(ctx context.Context, session session, method, path s
 		return errors.New("Copilot 返回了无效的 JSON")
 	}
 	return nil
-}
-
-func (s *Service) handleUsage(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-	s.log(ctx, slog.LevelInfo, "开始查询 Copilot 用量")
-	res, err := s.githubRequest(ctx, "/copilot_internal/user", true)
-	if err != nil {
-		s.handleError(ctx, w, err)
-		return
-	}
-	defer res.Body.Close()
-	data, err := readLimited(res.Body, maxMetadataBody)
-	if err != nil {
-		s.handleError(ctx, w, err)
-		return
-	}
-	copyResponseHeaders(w.Header(), res.Header)
-	w.WriteHeader(res.StatusCode)
-	_, _ = w.Write(data)
-	s.log(ctx, apiStatusLogLevel(res.StatusCode), "Copilot 用量响应已返回",
-		"status", res.StatusCode, "bytes", len(data))
 }
 
 func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path string) {

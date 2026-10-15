@@ -39,7 +39,7 @@ func (h *mgmtHold) free() {
 }
 
 // mgmtUpstream 在 poolUpstream 之上模拟 GitHub 账号接口：/user、/copilot_internal/user 与设备登录；
-// 其余路径（session、模型、生成、用量）交给 pool。
+// 其余路径（session、模型、生成）交给 pool。
 type mgmtUpstream struct {
 	t      *testing.T
 	pool   *poolUpstream
@@ -454,10 +454,10 @@ func TestManagementAccountsListShowsQuotaAndRequestStats(t *testing.T) {
 	up.pool.failSession("oauth-carol", poolFailure{http.StatusInternalServerError, `{"message":"carol down"}`})
 
 	// 通过 PATCH 调整优先级，依次让 alice、bob、carol 成为最优账号。
-	// 用量查询由 alice 处理（优先级最高）。
+	// 先由 alice 处理一次生成请求（优先级最高）。
 	mgmtPatchPriority(t, p, "alice", 10)
-	if w := poolRequest(p, "GET", "/v1/usage", ""); w.Code != http.StatusOK {
-		t.Fatalf("用量请求 status=%d body=%s", w.Code, w.Body.String())
+	if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK {
+		t.Fatalf("alice 的生成请求 status=%d body=%s", w.Code, w.Body.String())
 	}
 	// alice 降为 -1 后 bob 最优：生成请求由 bob 处理，上游返回 500。
 	mgmtPatchPriority(t, p, "alice", -1)
@@ -892,7 +892,7 @@ func TestManagementWithoutUsableAccountsReturns503(t *testing.T) {
 			}
 			for _, req := range []struct{ method, path, body string }{
 				{"POST", "/v1/chat/completions", poolChatBody},
-				{"GET", "/v1/usage", ""},
+				{"GET", "/v1/models", ""},
 			} {
 				w := poolRequest(p, req.method, req.path, req.body)
 				if w.Code != http.StatusServiceUnavailable || mgmtErrorMessage(t, w) != "没有可用的 GitHub Copilot 账号" {

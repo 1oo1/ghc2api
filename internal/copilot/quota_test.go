@@ -297,7 +297,7 @@ func TestParseQuotaFieldErrorsAreIsolated(t *testing.T) {
 	})
 }
 
-// TestFetchQuotaReadsCopilotUserEndpoint fetchQuota 与 /usage 一样请求 /copilot_internal/user，并记录获取时间。
+// TestFetchQuotaReadsCopilotUserEndpoint fetchQuota 请求 /copilot_internal/user，并记录获取时间。
 func TestFetchQuotaReadsCopilotUserEndpoint(t *testing.T) {
 	type request struct{ path, authorization string }
 	requests := make(chan request, 1)

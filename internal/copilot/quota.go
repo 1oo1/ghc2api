@@ -221,7 +221,7 @@ func (f quotaFields) number(key string) (float64, bool) {
 	return value, true
 }
 
-// fetchQuota 请求 /copilot_internal/user 获取额度（与 /usage 使用同一接口），成功时设置 ObservedAt。
+// fetchQuota 请求 /copilot_internal/user 获取额度，成功时设置 ObservedAt。
 // 429 返回 errQuotaRateLimited；其他非 2xx 返回 *upstreamError；2xx 但正文非法时返回解析错误。
 func (s *Service) fetchQuota(ctx context.Context) (Quota, error) {
 	res, err := s.githubRequest(ctx, "/copilot_internal/user", true)

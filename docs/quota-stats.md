@@ -43,7 +43,7 @@ JSON 名为小驼峰（如 `remainingFraction`、`observedAt`），完整定义�
 
 ## 请求统计
 
-每账号内存记录 `requests`（分发到该账号的请求数，含用量与生成）、`errors`（响应状态 ≥400）、`last_used_at`，重启清零。
+每账号内存记录 `requests`（分发到该账号的请求数，含模型列表与生成）、`errors`（响应状态 ≥400）、`last_used_at`，重启清零。
 
 - session 失败后切换账号，只计入最终处理的账号；所有账号都失败时计入最后尝试的账号（`requests`、`errors` 各 +1）。
 - 客户端取消不计 `errors`（`requests` 可计）。

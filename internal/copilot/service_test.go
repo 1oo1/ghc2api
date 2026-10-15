@@ -164,7 +164,7 @@ func TestLocalAuthenticationAndHealth(t *testing.T) {
 	if w := testRequest(s, "GET", "/healthz", ""); w.Code != 200 {
 		t.Fatalf("health status = %d", w.Code)
 	}
-	for _, path := range []string{"/v1/models", "/models", "/usage", "/v1/usage", "/v1/chat/completions", "/v1/responses", "/v1/messages"} {
+	for _, path := range []string{"/v1/models", "/models", "/v1/chat/completions", "/v1/responses", "/v1/messages"} {
 		if w := testRequest(s, "GET", path, ""); w.Code != 401 {
 			t.Fatalf("%s without key: status = %d", path, w.Code)
 		}
