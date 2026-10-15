@@ -1,0 +1,49 @@
+# 额度与请求统计
+
+代码：`internal/copilot/quota.go`（解析、获取、缓存、持久化）、`weight.go`（权重）、`pool.go`（统计）。
+
+## 额度数据结构与解析
+
+```go
+type Quota struct { Subscription *QuotaSubscription; Groups []QuotaGroup; Summary []QuotaMetric; Stale bool; ObservedAt time.Time }
+type QuotaGroup struct { DisplayName string; Buckets []QuotaBucket }
+type QuotaBucket struct { Window, Description string; RemainingFraction float64; ResetTime string }
+type QuotaMetric struct { Key, Label string; Value float64; Format string }
+parseQuota(raw []byte) (Quota, error)
+```
+
+JSON 名为小驼峰（如 `remainingFraction`、`observedAt`），完整定义见 `quota.go`。解析规则：
+
+- 计划名由 `access_type_sku`/`copilot_plan` 映射。`token_based_billing=true` 时主额度为 `credits`/`Credits`，否则 `premium_requests`/`Premium requests`；Copilot Free 用 `chat` 快照（`Chat messages`，`token_based_billing=true` 时仍为 `credits`），无该快照时由 `monthly_quotas.chat` 与 `limited_user_quotas.chat` 计算。
+- `unlimited=true` 不产生 bucket；`credits_used`（`has_quota` 缺失或为 true）输出到 Summary（`Key=credits_used`、`Label=Credits Used`、`Format=number`）。
+- Additional Budget：`premium_interactions.overage_count`、`overage_entitlement` 均为合法非负数且 entitlement>0 时输出 `additional_budget` 桶，`RemainingFraction=max(0, 1-count/entitlement)`；非法或 entitlement 为 0 时不输出，不影响主额度。
+- 重置时间：`quota_reset_at`（Unix 秒）优先，其次 `quota_reset_date_utc`/`quota_reset_date`/`limited_user_reset_date`（RFC3339 转 UTC，或保留 `YYYY-MM-DD`；无法解析的跳过）。
+- 字段逐个容错；顶层不是 JSON 对象（含 `null`）返回错误。
+
+## 获取与节流
+
+`(*Service).fetchQuota(ctx) (Quota, error)` 请求 GitHub `/copilot_internal/user`：2xx 解析并设置 `ObservedAt`；429 或带 `Retry-After` 的 403 返回 `errQuotaRateLimited`（用 `errors.Is` 判断）；其他非 2xx 返回 `*upstreamError`；2xx 但正文非法返回解析错误。
+
+- 按账号 `checkedAt`（最近一次**尝试**）节流：不足 2 小时不重复请求（强制刷新除外），失败和超时也算一次尝试。
+- 调用方取消（`context.Canceled`）不算尝试：不更新 `checkedAt`、不写 `quota_error`，下次列表请求重新请求。
+- 限流：保留旧数据并 `Stale=true`；其他失败保留旧数据并设 `quota_error`（无旧数据则只设 `quota_error`）。
+
+## 刷新入口
+
+- `GET /v0/management/accounts`：对从未获取或超过 2 小时未尝试的账号并发刷新，总超时 10 秒；失败不影响 200。
+- `POST /v0/management/quota/refresh`（强制刷新，忽略节流）：429 返回 200 + `Stale`；其他错误有旧数据返回 200 + 非空 `quota_error`，无旧数据返回 502；超时按其他错误处理，`quota_error="额度查询超时"`（固定中文，不含上游细节）。
+- 超时时长为包级变量 `var quotaRefreshTimeout = 10 * time.Second`（测试可临时改小，不得改为常量）。
+
+## 持久化
+
+- 每次有结果的刷新（成功、429、其他错误含超时）后，经 `writeCache("quota", ...)` 把 `{"quota","checked_at","error"}` 写入账号缓存目录 `<缓存根>/<账号哈希>/quota.json`（`0600`，在 `quotaCache.mu` 内写盘）；无数据/无错误时省略对应字段；调用方取消不写；写失败只记 Warn。
+- `newPoolAccount` 时恢复额度、`checked_at`、`error`：文件不存在静默忽略；损坏或超过 8 MiB 记 Warn（不含 token）并按无缓存处理；`checked_at` 晚于当前时间视为无效（立即允许刷新），额度与 `error` 仍恢复。因此 2 小时节流跨重启生效。
+- 删除账号后不重建缓存目录；无缓存目录时额度只在内存。
+- 测试可读 `(*poolAccount).quota`（`quotaCache`）及其 `snapshot() (*Quota, string)`。
+
+## 请求统计
+
+每账号内存记录 `requests`（分发到该账号的请求数，含用量与生成）、`errors`（响应状态 ≥400）、`last_used_at`，重启清零。
+
+- session 失败后切换账号，只计入最终处理的账号；所有账号都失败时计入最后尝试的账号（`requests`、`errors` 各 +1）。
+- 客户端取消不计 `errors`（`requests` 可计）。

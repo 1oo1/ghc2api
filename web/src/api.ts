@@ -1,4 +1,4 @@
-// 管理接口客户端：封装 /v0/management 下的请求与错误处理，接口定义见 docs/management-design.md 第 7 节。
+// 管理接口客户端：封装 /v0/management 下的请求与错误处理，接口定义见 docs/management.md。
 import type { Quota } from "./quota";
 
 /** 账号视图，与服务端 AccountView 的 JSON 结构一致。 */
