@@ -54,9 +54,11 @@ type poolAccount struct {
 	quota quotaCache
 }
 
-// newPoolAccount 为 Service 创建账号运行时状态。
+// newPoolAccount 为 Service 创建账号运行时状态，并从缓存目录恢复额度（见 restoreQuota）。
 func newPoolAccount(service *Service, id string) *poolAccount {
-	return &poolAccount{id: id, service: service, routes: service.routes()}
+	account := &poolAccount{id: id, service: service, routes: service.routes()}
+	account.restoreQuota()
+	return account
 }
 
 // Pool 以 round-robin 方式在多个 GitHub 账号之间分发请求，并负责会话亲和、账号的运行时增删与禁用。
@@ -290,7 +292,7 @@ func (p *Pool) forward(w http.ResponseWriter, r *http.Request, key string) {
 			account.service.log(ctx, slog.LevelWarn, "账号会话获取失败", "error", err, "cooldown", AccountCooldown.String())
 			continue
 		}
-		p.bind(key, account)
+		p.bind(ctx, key, account)
 		p.serve(w, r.WithContext(ctx), account)
 		return
 	}
@@ -320,9 +322,24 @@ func (a *poolAccount) track(reqCtx context.Context, w http.ResponseWriter, handl
 }
 
 // bind 把会话键绑定（或续期）到实际处理请求的账号。键为空或未开启亲和时不做任何事。
-func (p *Pool) bind(key string, account *poolAccount) {
-	if key != "" && p.affinity != nil {
-		p.affinity.bind(key, account.id, time.Now())
+// 绑定前先查询原绑定，并按结果输出亲和日志：没有有效原绑定为 Info「新建绑定」，原绑定即该账号为 Debug「命中」，
+// 原绑定是其他账号为 Info「切换账号」。日志只含会话键前 12 个字符与账号 ID，不含完整会话键。
+// lookup 与 bind 之间的并发竞争只影响日志，可以忽略。
+func (p *Pool) bind(ctx context.Context, key string, account *poolAccount) {
+	if key == "" || p.affinity == nil {
+		return
+	}
+	now := time.Now()
+	previous, bound := p.affinity.lookup(key, now)
+	p.affinity.bind(key, account.id, now)
+	prefix := key[:12]
+	switch {
+	case !bound:
+		p.log(ctx, slog.LevelInfo, "会话亲和：新建绑定", "session", prefix, "bound_account", account.id)
+	case previous == account.id:
+		p.log(ctx, slog.LevelDebug, "会话亲和：命中", "session", prefix, "bound_account", account.id)
+	default:
+		p.log(ctx, slog.LevelInfo, "会话亲和：切换账号", "session", prefix, "from", previous, "to", account.id)
 	}
 }
 

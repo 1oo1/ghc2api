@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 )
@@ -247,7 +249,8 @@ func (s *Service) fetchQuota(ctx context.Context) (Quota, error) {
 	return quota, nil
 }
 
-// quotaCache 保存账号最近一次的额度结果，由 poolAccount 持有。
+// quotaCache 保存账号最近一次的额度结果，由 poolAccount 持有。每次刷新后写入账号缓存目录的 quota.json，
+// 新建账号时从该文件恢复（见 restoreQuota），因此重启后仍遵守 quotaCacheTTL 的节流。
 type quotaCache struct {
 	mu        sync.Mutex
 	data      *Quota    // 最近一次成功获取的额度；限流时保留旧值并标记 Stale
@@ -255,6 +258,13 @@ type quotaCache struct {
 	errText   string    // 最近一次刷新失败的说明（不含 token）；成功后清空
 	// retry 为 true 表示上一次刷新被调用方取消，它不算一次尝试，因此下一次列表刷新不受节流限制。
 	retry bool
+}
+
+// quotaFile 是 quota.json 的内容，字段名固定：额度（无数据时省略）、最近一次尝试的时间与失败说明（无错误时省略）。
+type quotaFile struct {
+	Quota     *Quota    `json:"quota,omitempty"`
+	CheckedAt time.Time `json:"checked_at"`
+	Error     string    `json:"error,omitempty"`
 }
 
 // snapshot 返回额度的副本与最近一次失败说明，供账号视图使用。
@@ -276,8 +286,42 @@ func (c *quotaCache) hasData() bool {
 	return c.data != nil
 }
 
+// restoreQuota 从账号缓存目录的 quota.json 恢复额度与最近一次尝试的结果，只在账号创建时调用（尚未被并发访问）。
+// 缓存目录为空或文件不存在时静默忽略；其他读取错误（损坏、超过大小限制、权限等）记录 Warn 后同样按没有缓存处理，不影响启动。
+// checked_at 晚于当前时间视为无效，按从未检查处理（零值，立即允许刷新），但额度与 error 文本仍照常恢复。
+func (a *poolAccount) restoreQuota() {
+	path := a.service.cacheFile("quota")
+	if path == "" {
+		return
+	}
+	var file quotaFile
+	if err := readCacheFile(path, &file); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			// 此处没有请求 ctx，使用 Background，日志落到 Service 默认 logger。
+			a.service.log(context.Background(), slog.LevelWarn, "读取额度缓存失败", "error", a.service.redactString(err.Error()))
+		}
+		return
+	}
+	a.quota.data = file.Quota
+	a.quota.checkedAt = file.CheckedAt
+	if a.quota.checkedAt.After(time.Now()) {
+		a.quota.checkedAt = time.Time{}
+	}
+	a.quota.errText = file.Error
+}
+
+// saveQuotaLocked 把当前额度状态写入 quota.json。调用方须持有 a.quota.mu，使并发刷新时文件内容总是最新状态。
+// 写入失败只记录告警，不影响刷新结果；账号已删除时 writeCache 直接跳过。
+func (a *poolAccount) saveQuotaLocked(ctx context.Context) {
+	file := quotaFile{Quota: a.quota.data, CheckedAt: a.quota.checkedAt, Error: a.quota.errText}
+	if err := a.service.writeCache("quota", file); err != nil {
+		a.service.log(ctx, slog.LevelWarn, "写入额度缓存失败", "error", a.service.redactString(err.Error()))
+	}
+}
+
 // refresh 刷新账号额度。force 为 false 时，距上次尝试不足 quotaCacheTTL 则直接返回。
 // 限流（429）保留旧数据并标记 Stale，不视为错误；其他错误保留旧数据并返回错误，由调用方决定如何展示。
+// 每次有结果的刷新（成功、限流或其他错误）后都写入 quota.json；调用方取消时不写入。
 func (a *poolAccount) refresh(ctx context.Context, force bool) error {
 	a.quota.mu.Lock()
 	fresh := !force && !a.quota.retry && !a.quota.checkedAt.IsZero() && time.Since(a.quota.checkedAt) < quotaCacheTTL
@@ -299,11 +343,11 @@ func (a *poolAccount) refresh(ctx context.Context, force bool) error {
 	defer a.quota.mu.Unlock()
 	a.quota.retry = false
 	a.quota.checkedAt = time.Now()
+	var result error
 	switch {
 	case err == nil:
 		a.quota.data = &quota
 		a.quota.errText = ""
-		return nil
 	case errors.Is(err, errQuotaRateLimited):
 		if a.quota.data != nil {
 			stale := *a.quota.data
@@ -313,11 +357,12 @@ func (a *poolAccount) refresh(ctx context.Context, force bool) error {
 		} else {
 			a.quota.errText = errQuotaRateLimited.Error()
 		}
-		return nil
 	default:
 		a.quota.errText = a.quotaErrorText(err)
-		return err
+		result = err
 	}
+	a.saveQuotaLocked(ctx)
+	return result
 }
 
 // quotaErrorText 返回额度刷新失败时展示给用户的文本（quota_error 与 502 响应共用）：

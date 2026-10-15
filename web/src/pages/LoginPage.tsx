@@ -57,8 +57,8 @@ export function LoginPage({
       {notice && <div className="banner error">{notice}</div>}
       {error && <p role="alert" className="hint error">{error}</p>}
       <small>
-        管理密钥即 config.yaml 中的 management_key。密钥只保存在当前页面的内存中，
-        刷新或关闭页面后需要重新输入。
+        管理密钥即 config.yaml 中的 management_key。密钥保存在当前标签页的 sessionStorage 中，
+        刷新页面后仍保持登录，关闭标签页或退出登录后清除。
       </small>
     </main>
   );

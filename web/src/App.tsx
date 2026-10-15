@@ -12,6 +12,7 @@ import { DeviceLoginPanel } from "./components/DeviceLoginPanel";
 import { AccountsPage } from "./pages/AccountsPage";
 import { LoginPage } from "./pages/LoginPage";
 import { OverviewPage } from "./pages/OverviewPage";
+import { clearSessionKey, loadSessionKey, saveSessionKey } from "./session";
 
 /** 账号列表自动刷新间隔（毫秒）。 */
 const REFRESH_INTERVAL_MS = 15_000;
@@ -24,19 +25,25 @@ const pages: { id: Page; label: string; icon: string }[] = [
 ];
 
 export function App() {
-  // 管理密钥只保存在 React state 中，不写入 localStorage、cookie 或 URL。
-  const [managementKey, setManagementKey] = useState("");
+  // 管理密钥保存在 React state 中，并同步到当前标签页的 sessionStorage（见 session.ts），
+  // 因此刷新页面后仍保持登录；关闭标签页或退出登录、密钥失效时清除。不写入 localStorage、cookie 或 URL。
+  const [managementKey, setManagementKey] = useState(loadSessionKey);
   const [loginNotice, setLoginNotice] = useState("");
 
   const onLogin = useCallback((key: string) => {
     setLoginNotice("");
+    saveSessionKey(key);
     setManagementKey(key);
   }, []);
   const onExpire = useCallback((message: string) => {
     setLoginNotice(message);
+    clearSessionKey();
     setManagementKey("");
   }, []);
-  const onLogout = useCallback(() => setManagementKey(""), []);
+  const onLogout = useCallback(() => {
+    clearSessionKey();
+    setManagementKey("");
+  }, []);
 
   if (!managementKey)
     return <LoginPage notice={loginNotice} onLogin={onLogin} />;

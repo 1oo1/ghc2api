@@ -86,6 +86,11 @@ func NewManagedPool(config PoolConfig, accounts []PoolAccount) (*Pool, error)
   且不推进轮询游标；否则按原有轮询规则选择。成功取得 session 后把会话键绑定（或续期）到最终使用的账号。
 - 绑定的账号 session 获取失败时，照原规则冷却并切换账号，切换后的账号成为新的绑定。
 - 会话键为 `""` 时不使用亲和、也不绑定。
+- 亲和日志（`Pool.bind`，携带账号信息的 ctx 输出，只在会话键非空且开启亲和时输出，共三种）：
+  - 没有有效原绑定：Info `会话亲和：新建绑定`，属性 `session`（会话键前 12 个字符）、`bound_account`（账号 ID）；
+  - 原绑定即本次使用的账号：Debug `会话亲和：命中`，属性同上；
+  - 原绑定是其他账号（原账号不可用后切换）：Info `会话亲和：切换账号`，属性 `session`、`from`（原账号 ID）、`to`（新账号 ID）。
+  日志中不得出现完整会话键、客户端密钥或请求正文。
 
 ## 4. 额度解析（internal/copilot/quota.go）
 
@@ -142,6 +147,13 @@ func parseQuota(raw []byte) (Quota, error)
     `quota_error = "额度查询超时"`（固定中文文本，不含 URL 等上游细节），没有旧数据时返回 502。超时总时长为包级变量
     `quotaRefreshTimeout = 10 * time.Second`（测试中可临时改小，实现不得改为常量）。
   - 调用方取消（`context.Canceled`）：不更新 `checkedAt`、不写入 `quota_error`；响应由实现自行决定（客户端已断开），之后的列表请求会重新请求上游。
+- 持久化：每次有结果的刷新（成功、429、其他错误含超时）后，把 `{"quota": ..., "checked_at": ..., "error": ...}` 写入账号缓存目录
+  （`<cacheDir>`，即 `<缓存根目录>/<账号哈希>`）下的 `quota.json`，经 `writeCache("quota", ...)` 写入（权限 0600，在 `quotaCache.mu` 内写盘以保证并发刷新时文件是最新状态）。
+  `quota` 无数据时省略，`error` 无错误时省略；调用方取消不写入；写入失败只记 Warn 日志，不影响刷新结果。
+  新建账号（`newPoolAccount`）时从该文件恢复额度、`checked_at` 与 `error`；文件不存在时静默忽略，损坏或超过 8 MiB 等其他读取错误记 Warn 日志（不含 token）后同样按没有缓存处理，不影响启动。
+  `checked_at` 晚于当前时间视为无效，按从未检查处理（立即允许刷新），但额度与 `error` 仍照常恢复。
+  由于 `checked_at` 一并恢复，2 小时节流跨重启生效：距上次尝试不足 2 小时时重启后直接使用恢复的额度，不请求上游。
+  删除账号后不重建缓存目录（由 `writeCache` 的已删除标记保证）；没有缓存目录时（`cache_dir` 未配置且系统缓存目录不可用）不读写文件，额度只保存在内存中。
 
 ## 5. 请求统计
 
@@ -250,7 +262,10 @@ session_affinity_ttl: "2h"
   `web/dist/index.html` 提交到 git，`web/embed.go`（`package web`，导入路径 `ghc2api/web`）提供 `func Index() ([]byte, error)`。
 - 页面：「概览」（可用账号数、累计请求、错误数、各账号请求统计表）与「账号与额度」（账号卡片：状态、
   Credits/Premium/Additional Budget 进度条与重置时间、请求统计；操作：刷新额度、启用/禁用、删除；
-  工具栏：导入凭证 JSON、GitHub 设备登录）。登录页输入管理密钥，密钥只保存在内存中。
+  工具栏：导入凭证 JSON、GitHub 设备登录）。登录页输入管理密钥，密钥保存在当前标签页的 sessionStorage 中
+  （`web/src/session.ts`，键名 `ghc2api.managementKey`），刷新页面后仍保持登录；关闭标签页、退出登录或密钥失效时清除。
+  存储不可用时所有存取静默忽略，登录状态退化为只保存在 React state 中。
+  安全说明：管理密钥存于 sessionStorage 意味着同源脚本可读取该密钥，且关闭标签页后失效；此风险已接受，控制台不得引入第三方脚本。
 - 不包含参考项目中的 API Keys、运行日志、设置、优先级、模型列表、刷新凭据等功能。
 - Makefile 新增 `web` 目标：`cd web && npm ci && npm run build`；`build` 不依赖 Node。
 
