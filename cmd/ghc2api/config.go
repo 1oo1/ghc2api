@@ -50,6 +50,9 @@ type appConfig struct {
 	LogMaxBackupsValue      *string       `yaml:"log_max_backups"` // 显式解析以区分缺省值和非法输入。
 	LogMaxSizeMB            int64         `yaml:"-"`
 	LogMaxBackups           int           `yaml:"-"`
+	// SessionAffinityMaxPerAccountValue 保留原值以区分缺省值和非法输入（同 log_max_backups）。
+	SessionAffinityMaxPerAccountValue *string `yaml:"session_affinity_max_per_account"`
+	SessionAffinityMaxPerAccount      int     `yaml:"-"`
 
 	CacheDir            string      `yaml:"-"`
 	configMode          os.FileMode `yaml:"-"`
@@ -139,6 +142,14 @@ func loadConfig(path string) (appConfig, error) {
 		}
 		config.SessionAffinityTTL = ttl
 	}
+	config.SessionAffinityMaxPerAccount = copilot.DefaultSessionAffinityMaxPerAccount
+	if value := config.SessionAffinityMaxPerAccountValue; value != nil {
+		limit, err := strconv.Atoi(strings.TrimSpace(*value))
+		if err != nil || limit < 0 {
+			return appConfig{}, fmt.Errorf("无效的 session_affinity_max_per_account %q，必须是大于等于 0 的整数（0 表示不限制）", *value)
+		}
+		config.SessionAffinityMaxPerAccount = limit
+	}
 	config.LogLevel = strings.ToLower(strings.TrimSpace(config.LogLevel))
 	if config.LogLevel == "" {
 		config.LogLevel = "info"
@@ -214,7 +225,7 @@ func loadConfig(path string) (appConfig, error) {
 }
 
 // poolConfig 生成账号池的服务级配置；账号相关的设置由 poolAccounts 提供。
-// 关闭会话亲和时 SessionAffinityTTL 为 0。
+// 关闭会话亲和时 SessionAffinityTTL 为 0；每账号绑定上限原样传入，0 表示不限制。
 func (c appConfig) poolConfig(logger *slog.Logger) copilot.PoolConfig {
 	affinityTTL := c.SessionAffinityTTL
 	if !c.SessionAffinity {
@@ -224,7 +235,7 @@ func (c appConfig) poolConfig(logger *slog.Logger) copilot.PoolConfig {
 		APIKey: c.APIKey, ManagementKey: c.ManagementKey,
 		CredentialsDir: filepath.Join(c.DataPath, credentialsDirName), CacheDir: c.CacheDir,
 		Host: c.Host, ModelsCacheTTL: c.ModelsCacheTTL, QuotaRefreshInterval: c.QuotaRefreshInterval,
-		SessionAffinityTTL: affinityTTL, Logger: logger,
+		SessionAffinityTTL: affinityTTL, SessionAffinityMaxPerAccount: c.SessionAffinityMaxPerAccount, Logger: logger,
 	}
 }
 

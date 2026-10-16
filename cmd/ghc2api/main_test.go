@@ -1319,6 +1319,50 @@ func TestSessionAffinityConfig(t *testing.T) {
 	}
 }
 
+// TestSessionAffinityMaxPerAccountConfig session_affinity_max_per_account 缺省为 5，0 表示不限制，并透传到账号池的配置。
+// 负数、非整数（abc、1.5）与显式空串启动失败（关闭会话亲和时同样校验），且错误信息包含字段名。
+func TestSessionAffinityMaxPerAccountConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		contents string
+		want     int
+		wantErr  bool
+	}{
+		{name: "default", contents: minimalConfig, want: 5},
+		{name: "zero-unlimited", contents: "session_affinity_max_per_account: 0\n", want: 0},
+		{name: "custom", contents: "session_affinity_max_per_account: 3\n", want: 3},
+		{name: "negative", contents: "session_affinity_max_per_account: -1\n", wantErr: true},
+		{name: "non-integer", contents: "session_affinity_max_per_account: abc\n", wantErr: true},
+		{name: "fractional", contents: "session_affinity_max_per_account: 1.5\n", wantErr: true},
+		{name: "empty", contents: "session_affinity_max_per_account: \"\"\n", wantErr: true},
+		{name: "invalid-with-affinity-off", contents: "session_affinity: false\nsession_affinity_max_per_account: -1\n", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			configPath := writeConfigWithAccount(t, "affinity-max", accountJSON("affinity-max-token"), tc.contents)
+			config, err := loadConfig(configPath)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("非法的 session_affinity_max_per_account 未被拒绝")
+				}
+				// 字段尚未被识别时 YAML 解码就会失败，错误信息同样含字段名；这里要求失败来自字段自身的校验。
+				if strings.Contains(err.Error(), "不是有效 YAML") {
+					t.Fatalf("session_affinity_max_per_account 未被识别（YAML 解码失败）: %v", err)
+				}
+				if !strings.Contains(err.Error(), "session_affinity_max_per_account") {
+					t.Fatalf("错误未指出字段 session_affinity_max_per_account: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadConfig() error = %v", err)
+			}
+			if got := config.poolConfig(nil).SessionAffinityMaxPerAccount; got != tc.want {
+				t.Fatalf("PoolConfig.SessionAffinityMaxPerAccount = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestAccountDisabledFlagIsLoaded 凭证文件中的 disabled 被读取到账号配置中，省略时账号为启用状态。
 func TestAccountDisabledFlagIsLoaded(t *testing.T) {
 	configDir := isolatedConfigDir(t)

@@ -30,12 +30,14 @@ make build
 management_key: ""            # 空则禁用控制台与管理接口；必须与 api_key 不同
 session_affinity: true        # 默认 true
 session_affinity_ttl: "2h"    # Go duration，必须 > 0，默认 2h
+session_affinity_max_per_account: 5   # 整数，>= 0，默认 5；0 表示不限制
 quota_refresh_interval: "1h"  # Go duration，必须 >= 1m，默认 1h
 ```
 
 - `management_key` 去除首尾空白；非空且与 `api_key` 相同时启动失败。
 - 设置了 `management_key` 时，凭证目录不存在会自动创建（0700），允许 0 个账号启动。
 - `session_affinity: false` 时传给 Pool 的 `SessionAffinityTTL` 为 0；TTL 非法（含 `0s`、负值）启动失败。
+- `session_affinity_max_per_account` 是每个账号的有效会话绑定数上限（见 `session-affinity.md`），缺省为 `5`，`0` 表示不限制。负数、非整数（如 `abc`、`1.5`）与显式空值（`""`）启动失败，错误信息包含字段名 `session_affinity_max_per_account`。关闭 `session_affinity` 时该项不生效，但仍会校验。传给 Pool 的 `PoolConfig.SessionAffinityMaxPerAccount` 与之相同。
 - `quota_refresh_interval` 是额度的节流窗口，也是后台定时刷新的判断依据（见 `quota-stats.md`）。无法解析、非正或小于 `1m` 的值启动失败，错误信息包含字段名 `quota_refresh_interval`；省略时为 `1h`。它与是否设置 `management_key` 无关。
 - `appConfig.poolConfig(logger)` 生成 `copilot.PoolConfig`（`CredentialsDir=DataPath/credentials`、`CacheDir=DataPath/cache`、`QuotaRefreshInterval` 等），`poolAccounts()` 把凭证转换为 `[]copilot.PoolAccount`（保持文件名顺序）；`loadConfig` 与 `serve` 都经 `NewManagedPool` 建池。
 - `serve` 在 HTTP 服务开始监听后启动 `pool.RunQuotaRefresh`，随退出信号（或 serve 返回）取消；它不参与 HTTP 关闭等待，也不影响会话亲和的保存顺序。

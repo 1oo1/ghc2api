@@ -2,7 +2,7 @@
 
 代码：`internal/copilot/affinity.go`（绑定表、`sessionKey`）、`affinity_store.go`（持久化）、`pool.go`（`forward`、`Pool.bind`）。
 
-目的：同一客户端会话固定使用同一账号，提高上游提示词缓存命中率。配置见 `config.md`（`session_affinity`、`session_affinity_ttl`，默认开启、2h，每次使用续期）。
+目的：同一客户端会话固定使用同一账号，提高上游提示词缓存命中率。配置见 `config.md`（`session_affinity`、`session_affinity_ttl`，默认开启、2h，每次使用续期；`session_affinity_max_per_account`，见下文「绑定上限」）。
 
 ## 适用范围
 
@@ -23,13 +23,23 @@
 
 ## 选择规则
 
-- 键已绑定且账号存在、未禁用、未冷却、未耗尽、本请求未尝试过 → 直接使用，不参与 `pickLocked`；否则按 `pool.md` 的规则选择。
+- 键已绑定且账号存在、未禁用、未冷却、未耗尽、本请求未尝试过 → 直接使用，不参与 `pickLocked`，也不推进轮询，且不受绑定上限限制；否则为无可用绑定的会话选择账号：先排除已达上限的账号（见下文「绑定上限」），再按 `pool.md` 的规则选择。
 - 成功取得 session 后，把键绑定（或续期）到最终使用的账号；绑定账号 session 失败则按规则冷却并切换，新账号成为新绑定。
+
+## 绑定上限
+
+- 配置 `session_affinity_max_per_account`，对应 `PoolConfig.SessionAffinityMaxPerAccount`。缺省为 `DefaultSessionAffinityMaxPerAccount = 5`，`0` 表示不限制，负数与非整数启动失败。
+- 账号的有效绑定数由 `(*affinityTable).activeCounts(now) map[string]int` 统计（键为账号 ID）。只计截止时刻之后的绑定，与 `lookup` 的规则一致：过期项不占名额，恰好到截止时刻的绑定也不计数。
+- 键非空、开启亲和且没有可用绑定（新会话，或绑定账号不可用后的故障切换）时，`Pool.choose` 排除有效绑定数达到上限的账号，再在最优档内轮询。
+- 回退：排除后没有候选，或排除后最优档的冷却状态与原最优档不同（即从未冷却降为冷却中）时，忽略上限，按原最优档选择。这样上限不会把会话推向冷却中的账号；所有账号都已满时也照常分配，不会因上限返回 503。
+- 选中账号后照常绑定，即使回退使该账号超过上限。
+- 已有的绑定不受影响：超限账号的既有绑定仍可续期；降低上限只影响之后的新会话。键为空（没有会话信号）或关闭亲和时上限无效。
+- 并发：`choose` 与 `bind` 之间不持有同一把锁（`bind` 在 session 取得之后才执行），同时到达的多个新会话可能读到相同计数，实际绑定数可能略超上限。上限用于分散负载，不是硬性配额，这一点可以接受。
 
 ## 绑定表
 
 - `const DefaultSessionAffinityTTL = 2 * time.Hour`，`const maxSessionBindings = 500`。
-- `newAffinityTable(ttl)`；`bind(key, accountID, now)` 新建/续期（截止 `now+ttl`）；`lookup(key, now)` 截止时刻及之后视为不存在；`count()` 含未清理的过期项；并发安全。
+- `newAffinityTable(ttl)`；`bind(key, accountID, now)` 新建/续期（截止 `now+ttl`）；`lookup(key, now)` 截止时刻及之后视为不存在；`count()` 含未清理的过期项；`activeCounts(now)` 按账号 ID 统计有效绑定数（见「绑定上限」）；并发安全。
 - 满表插入：先清过期项，仍满则淘汰最早过期的一条（并列按键字典序）；续期已有键不触发淘汰。
 
 ## 持久化

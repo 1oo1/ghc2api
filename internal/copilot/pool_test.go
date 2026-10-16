@@ -327,22 +327,20 @@ func TestServiceCooldownFollowsDeadline(t *testing.T) {
 	}
 }
 
-func TestPoolHandlerSendsEveryRequestToFirstAccountByFileName(t *testing.T) {
+// TestPoolHandlerRoundRobinsAccountsByFileName 账号按 b、a、c 加入，但同档内的 SWRR 按凭证文件名轮流：
+// 三者权重都为 1，因此请求依次由 a、b、c 处理并循环。每个账号的 session 只交换一次（之后复用）。
+func TestPoolHandlerRoundRobinsAccountsByFileName(t *testing.T) {
 	upstream := newPoolUpstream(t)
-	// 账号按 b、a、c 加入，但选择只看凭证文件名：a.json 最小，之后的请求不会轮流到其他账号。
 	p := testPool(t, poolUserConfigs(t, upstream.client(), "b", "a", "c"))
 	for i := range 6 {
 		if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK {
 			t.Fatalf("请求 %d status=%d body=%s", i, w.Code, w.Body.String())
 		}
 	}
-	assertGenerationOrder(t, upstream, "oauth-a", "oauth-a", "oauth-a", "oauth-a", "oauth-a", "oauth-a")
-	if got := upstream.sessionCount("oauth-a"); got != 1 {
-		t.Errorf("oauth-a session 交换 %d 次, want 1（session 应按账号复用）", got)
-	}
-	for _, account := range []string{"oauth-b", "oauth-c"} {
-		if got := upstream.sessionCount(account); got != 0 {
-			t.Errorf("%s 未被选中却发生了 %d 次 session 交换", account, got)
+	assertGenerationOrder(t, upstream, "oauth-a", "oauth-b", "oauth-c", "oauth-a", "oauth-b", "oauth-c")
+	for _, account := range []string{"oauth-a", "oauth-b", "oauth-c"} {
+		if got := upstream.sessionCount(account); got != 1 {
+			t.Errorf("%s session 交换 %d 次, want 1（session 应按账号复用）", account, got)
 		}
 	}
 }
@@ -389,19 +387,25 @@ func TestPoolSessionFailureSwitchesAccountInSameRequestAndCoolsDown(t *testing.T
 	upstream.failSession("oauth-a", poolFailure{http.StatusInternalServerError, `{"message":"a down"}`})
 	p := testPool(t, poolUserConfigs(t, upstream.client(), "a", "b", "c"))
 
-	// 第一次请求由文件名最小的 A 处理，A 的 session 失败后同一请求改用 B；之后 A 冷却，仍由 B 处理，A 不再被尝试。
+	// 第一次请求先由 A 尝试（同档权重相同，按文件名），A 的 session 失败后同一请求改用其他账号，三次请求都必须成功。
+	// A 冷却后不再被尝试；B、C 之间的轮询顺序由 SWRR 决定，这里只断言 A 不再出现，不固定 B、C 的先后。
 	for i := range 3 {
 		w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody)
 		if w.Code != http.StatusOK {
 			t.Fatalf("请求 %d status=%d body=%s", i, w.Code, w.Body.String())
 		}
-		got := upstream.generationOrder()
-		if len(got) == 0 || got[len(got)-1] != "oauth-b" {
-			t.Fatalf("请求 %d 的生成账号顺序 = %v, want 最后一个为 oauth-b", i, got)
+	}
+	got := upstream.generationOrder()
+	if len(got) != 3 {
+		t.Fatalf("三次请求的生成账号顺序 = %v, want 3 次", got)
+	}
+	for _, account := range got {
+		if account == "oauth-a" {
+			t.Errorf("A 冷却后仍被用于生成请求: %v", got)
 		}
 	}
-	if got := upstream.sessionCount("oauth-a"); got != 1 {
-		t.Errorf("冷却期内 A 的 session 交换 %d 次, want 1", got)
+	if sessions := upstream.sessionCount("oauth-a"); sessions != 1 {
+		t.Errorf("冷却期内 A 的 session 交换 %d 次, want 1", sessions)
 	}
 	warned := false
 	for _, entry := range jsonLogEntries(t, logs.Bytes()) {
@@ -604,8 +608,8 @@ func TestPoolLogsIncreasingRequestIDsAndAccountIndex(t *testing.T) {
 			got = append(got, account)
 		}
 	}
-	// 两个账号按文件名排序，所有请求都由 a（账号下标 0）处理。
-	want := []any{float64(0), float64(0), float64(0), float64(0)}
+	// 两个账号按文件名轮流：请求依次由 a（账号下标 0）、b（账号下标 1）处理。
+	want := []any{float64(0), float64(1), float64(0), float64(1)}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("各请求日志中的 account = %v, want %v", got, want)
 	}

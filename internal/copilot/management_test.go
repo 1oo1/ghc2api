@@ -463,24 +463,25 @@ func TestManagementConsolePageIsPublicAndMatchesEmbeddedHTML(t *testing.T) {
 func TestManagementAccountsListShowsQuotaAndRequestStats(t *testing.T) {
 	up := newMgmtUpstream(t)
 	p, _ := mgmtNewPool(t, up, 0, "alice", "bob", "carol")
-	// 先让三个账号各获取一次额度：数据相同，权重一致。之后 bob 的失败会异步刷新额度（错误触发刷新），
-	// 若只有 bob 有额度权重，选择顺序会改变；三者权重相同时，排序仍由凭证文件名决定，与原用例的预期一致。
+	// 先让三个账号各获取一次额度：数据相同，权重一致（都是 80）。之后 bob 的失败会异步刷新额度（错误触发刷新），
+	// 数据不变、权重也不变；同档等权时 SWRR 按凭证文件名首次选择，之后轮询。
 	mgmtAccounts(t, p)
 	up.pool.failGeneration("oauth-bob", poolFailure{http.StatusInternalServerError, `{"error":"bob down"}`})
 	up.pool.failSession("oauth-carol", poolFailure{http.StatusInternalServerError, `{"message":"carol down"}`})
 
 	// 通过 PATCH 调整优先级，依次让 alice、bob、carol 成为最优账号。
-	// 先由 alice 处理一次生成请求（优先级最高）。
+	// 先由 alice 处理一次生成请求（优先级最高，单独成档）。
 	mgmtPatchPriority(t, p, "alice", 10)
 	if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK {
 		t.Fatalf("alice 的生成请求 status=%d body=%s", w.Code, w.Body.String())
 	}
-	// alice 降为 -1 后 bob 最优：生成请求由 bob 处理，上游返回 500。
+	// alice 降为 -1 后 bob 与 carol 同为优先级 0 的最优档且权重相同，SWRR 首次并列时按文件名选中 bob：上游返回 500。
 	mgmtPatchPriority(t, p, "alice", -1)
 	if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusInternalServerError {
 		t.Fatalf("bob 的生成请求 status=%d, want 500", w.Code)
 	}
-	// bob 也降为 -1 后 carol 最优：carol 的 session 失败并冷却，同一请求改由 alice 处理（alice 与 bob 同为 -1，alice.json 更小）。
+	// bob 也降为 -1 后 carol 最优：carol 的 session 失败并冷却，同一请求改由 alice 处理（alice 与 bob 同为 -1 且权重相同，
+	// 上一次由 bob 处理，因此轮到 alice）。
 	mgmtPatchPriority(t, p, "bob", -1)
 	if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK {
 		t.Fatalf("carol 失败后的生成请求 status=%d body=%s", w.Code, w.Body.String())
@@ -621,7 +622,7 @@ func TestManagementQuotaFailuresKeepOldData(t *testing.T) {
 }
 
 // TestManagementImportAccountAppendsToPool 导入凭证：登录名（保留大小写）决定文件名，ID 为小写，
-// 文件权限为 0600，新账号加入池中并按凭证文件名参与选择。
+// 文件权限为 0600，新账号加入池中并参与选择。
 func TestManagementImportAccountAppendsToPool(t *testing.T) {
 	up := newMgmtUpstream(t)
 	up.setLogin("oauth-carol", "Carol")
@@ -646,12 +647,15 @@ func TestManagementImportAccountAppendsToPool(t *testing.T) {
 	if err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("凭证文件权限 = %v, %v; want 0600", info, err)
 	}
+	// 导入后会异步刷新新账号的额度。等它完成后 carol 才有 80% 的 Credits（有 Credits 档）；
+	// 否则 carol 与 alice 都没有额度数据，会在同档内轮询，结果取决于刷新的时机。
+	quotaWaitAttempt(t, p.findAccount("carol"), time.Time{})
 	for range 4 {
 		if res := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); res.Code != http.StatusOK {
 			t.Fatalf("生成请求 status=%d body=%s", res.Code, res.Body.String())
 		}
 	}
-	// Carol.json 的 'C'（0x43）小于 alice.json 的 'a'（0x61），因此新账号排在前面，所有请求都由它处理。
+	// carol 是唯一有 Credits 的账号，有 Credits 的档位优先于无额度数据的 alice，因此所有请求都由 carol 处理，与文件名无关。
 	assertGenerationOrder(t, up.pool, "oauth-carol", "oauth-carol", "oauth-carol", "oauth-carol")
 }
 
@@ -722,8 +726,9 @@ func TestManagementImportRejectsInvalidCredentials(t *testing.T) {
 	}
 }
 
-// TestManagementDisableExcludesAccountAndPersistsFlag 禁用后账号不参与选择，凭证文件的 disabled 被持久化；启用后恢复。
-// alice 的文件名最小，最先被选中；禁用后由 bob 接替，启用后重新由 alice 处理。
+// TestManagementDisableExcludesAccountAndPersistsFlag 禁用后账号不参与选择，凭证文件的 disabled 被持久化；启用后恢复参与轮询。
+// 三个账号同档等权，第一次请求按文件名由 alice 处理；禁用期间 bob 与 carol 轮流；重新启用后 alice 的轮询状态仍落后
+// （上次被选中后已扣减组总权重），因此先轮到 bob、carol，之后才是 alice。
 func TestManagementDisableExcludesAccountAndPersistsFlag(t *testing.T) {
 	up := newMgmtUpstream(t)
 	p, dir := mgmtNewPool(t, up, 0, "alice", "bob", "carol")
@@ -741,8 +746,8 @@ func TestManagementDisableExcludesAccountAndPersistsFlag(t *testing.T) {
 	for range 4 {
 		poolRequest(p, "POST", "/v1/chat/completions", poolChatBody)
 	}
-	// alice 禁用后 bob 的文件名最小，之后的请求都由 bob 处理，carol 不会被选中。
-	assertGenerationOrder(t, up.pool, mgmtOrder("alice", "bob", "bob", "bob", "bob")...)
+	// alice 禁用后 bob 与 carol 同档等权，按轮询交替，alice 不会被选中。
+	assertGenerationOrder(t, up.pool, mgmtOrder("alice", "bob", "carol", "bob", "carol")...)
 
 	w = mgmtCall(p, "PATCH", "/v0/management/accounts", `{"id":"alice","disabled":false}`, mgmtKey)
 	if w.Code != http.StatusOK || mgmtAccountByID(t, mgmtAccounts(t, p), "alice").Disabled {
@@ -758,8 +763,8 @@ func TestManagementDisableExcludesAccountAndPersistsFlag(t *testing.T) {
 	for range 3 {
 		poolRequest(p, "POST", "/v1/chat/completions", poolChatBody)
 	}
-	// 重新启用后 alice 恢复为最优账号。
-	assertGenerationOrder(t, up.pool, mgmtOrder("alice", "bob", "bob", "bob", "bob", "alice", "alice", "alice")...)
+	// 重新启用后 alice 重新参与轮询：先轮到 bob、carol（轮询状态领先），之后才是 alice。
+	assertGenerationOrder(t, up.pool, mgmtOrder("alice", "bob", "carol", "bob", "carol", "bob", "carol", "alice")...)
 }
 
 // TestManagementDisableWriteFailureKeepsState 凭证写入失败时返回 500，内存中的禁用状态保持不变。
@@ -785,8 +790,8 @@ func TestManagementDisableWriteFailureKeepsState(t *testing.T) {
 	}
 	poolRequest(p, "POST", "/v1/chat/completions", poolChatBody)
 	poolRequest(p, "POST", "/v1/chat/completions", poolChatBody)
-	// alice 仍是最优账号：内存状态未被改动，两次请求都由它处理。
-	assertGenerationOrder(t, up.pool, mgmtOrder("alice", "alice")...)
+	// alice 仍参与轮询（内存状态未被改动）：两次请求依次由 alice、bob 处理。
+	assertGenerationOrder(t, up.pool, mgmtOrder("alice", "bob")...)
 }
 
 // TestManagementDeleteRemovesCredentialAndAccount 删除账号会删除凭证文件，之后不再被选中；文件已不存在时仍然成功。
@@ -803,8 +808,8 @@ func TestManagementDeleteRemovesCredentialAndAccount(t *testing.T) {
 	for range 4 {
 		poolRequest(p, "POST", "/v1/chat/completions", poolChatBody)
 	}
-	// alice 是文件名最小的账号，删除后由 bob 接替，之后不再选中 alice。
-	assertGenerationOrder(t, up.pool, mgmtOrder("bob", "bob", "bob", "bob")...)
+	// alice 删除后 bob 与 carol 同档等权，按轮询交替；之后不再选中 alice。
+	assertGenerationOrder(t, up.pool, mgmtOrder("bob", "carol", "bob", "carol")...)
 
 	if err := os.Remove(filepath.Join(dir, "carol.json")); err != nil {
 		t.Fatal(err)

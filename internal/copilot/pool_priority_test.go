@@ -1,8 +1,9 @@
 package copilot
 
-// 本文件覆盖账号优先级对选择顺序的影响。Pool.choose 对候选账号排序后取第一个，排序键依次为：
-// 冷却档（未冷却优先）、优先级（高者在前）、额度权重（有 Credits 高于无 Credits，同档内值高者在前）、
-// 凭证文件名（用户名 + ".json"）的字节序升序。
+// 本文件覆盖账号优先级对选择顺序的影响。Pool.choose 按档位选出最优的一组账号：
+// 冷却档（未冷却优先）、优先级（高者在前）、是否有 Credits（有者在前）。同一档内的账号按 SWRR 平滑加权轮询，
+// 权重由额度决定（见 quotaWeight.swrrWeight）；权重相同时按凭证文件名（用户名 + ".json"）的字节序升序决定先后。
+// choose 每次调用都会推进轮询状态，因此逐次排除得到的顺序（见 rankedUsers）只对新建的池有意义。
 
 import (
 	"net/http"
@@ -37,8 +38,9 @@ func userOf(account *poolAccount) string {
 	return account.service.config.User
 }
 
-// rankedUsers 通过逐次排除已选中的账号，得到 choose 给出的完整候选顺序（不含禁用账号）。
+// rankedUsers 通过逐次排除已选中的账号，得到一次完整选择的顺序（不含禁用账号）。
 // 冷却档只在未冷却账号耗尽后才会出现，因此冷却账号排在未冷却账号之后。
+// 同档内的顺序来自 SWRR 的轮询状态，每次 choose 都会推进它，因此只对新建的池断言结果。
 func rankedUsers(p *Pool) []string {
 	tried := map[*poolAccount]bool{}
 	var order []string
@@ -57,6 +59,18 @@ func assertRanking(t *testing.T, p *Pool, want ...string) {
 	t.Helper()
 	if got := rankedUsers(p); !slices.Equal(got, want) {
 		t.Fatalf("候选顺序 = %v, want %v", got, want)
+	}
+}
+
+// assertChooseSequence 断言连续 len(want) 次 choose（不排除任何账号）选中的用户名与 want 一致。每次调用都会推进轮询状态。
+func assertChooseSequence(t *testing.T, p *Pool, want ...string) {
+	t.Helper()
+	got := make([]string, 0, len(want))
+	for range want {
+		got = append(got, userOf(p.choose("", nil)))
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("连续 choose 的结果 = %v, want %v", got, want)
 	}
 }
 
@@ -96,16 +110,11 @@ func coolDown(t *testing.T, p *Pool, user string) {
 	account.service.setCooldown(time.Now().Add(time.Hour))
 }
 
-// TestChooseWithoutPriorityOrQuotaPicksSmallestFileName 优先级与额度都相同（或没有额度数据）时，
-// 选择凭证文件名字节序最小的账号；多次选择结果相同，不再轮流使用。
-func TestChooseWithoutPriorityOrQuotaPicksSmallestFileName(t *testing.T) {
+// TestChooseWithoutPriorityOrQuotaRoundRobinsByFileName 优先级与额度都相同（或没有额度数据）时，同一档内的账号按 SWRR 轮流被选中。
+// 三者权重都为 1，因此依次为文件名字节序较小的账号并循环；加入顺序（carol、alice、bob）不影响结果。
+func TestChooseWithoutPriorityOrQuotaRoundRobinsByFileName(t *testing.T) {
 	p := newPriorityPool(t, nil, priorityAccount("carol", 0), priorityAccount("alice", 0), priorityAccount("bob", 0))
-	for i := range 3 {
-		if got := userOf(p.choose("", nil)); got != "alice" {
-			t.Fatalf("第 %d 次 choose = %s, want alice", i, got)
-		}
-	}
-	assertRanking(t, p, "alice", "bob", "carol")
+	assertChooseSequence(t, p, "alice", "bob", "carol", "alice", "bob", "carol")
 }
 
 // TestChoosePriorityOutranksQuotaWeight 优先级高的账号排在前面，即使另一个账号的额度权重更高。
@@ -122,17 +131,20 @@ func TestChoosePriorityBoundaries(t *testing.T) {
 	assertRanking(t, p, "carol", "alice", "bob")
 }
 
-// TestChooseEqualPriorityBrokenByQuotaWeight 优先级相同时，额度权重高的账号在前；没有额度数据的账号权重为 0。
+// TestChooseEqualPriorityBrokenByQuotaWeight 优先级相同时，有 Credits 的账号先于无 Credits 的账号；
+// 无 Credits 的账号（Credits 为 0 且没有 budget，或没有额度数据）权重都为 1，同档内按 SWRR 与文件名依次选择。
 func TestChooseEqualPriorityBrokenByQuotaWeight(t *testing.T) {
 	p := newPriorityPool(t, nil, priorityAccount("alice", 3), priorityAccount("bob", 3), priorityAccount("carol", 3))
 	setQuota(t, p, "bob", quotaOf(creditsBucket(0.2)))
-	// alice 的 Credits 为 0 且没有 budget，与没有额度数据的 carol 同为权重 0，按文件名排序。
+	// alice 的 Credits 为 0 且没有 budget，与没有额度数据的 carol 同为无 Credits 档、权重 1，按文件名排序。
 	setQuota(t, p, "alice", quotaOf(creditsBucket(0)))
 	assertRanking(t, p, "bob", "alice", "carol")
 }
 
 // TestChooseQuotaWeightSpecExample 规格中的例子：A（credits 0.1）> B（credits 0，budget 0.9）
-// > C（credits 0，budget 0.5）> D（无额度数据）。账号名的字节序与权重顺序相反，排序必须以权重为先。
+// > C（credits 0，budget 0.5）> D（无额度数据）。A 是唯一的有 Credits 账号，因此排在最前；
+// B、C、D 同为无 Credits 档，按 SWRR 以权重 90、50、1 轮流，首次选中权重最大的 B。
+// 账号名的字节序与权重顺序相反（D 的文件名最小、权重最小），排序以档位与权重为先。
 func TestChooseQuotaWeightSpecExample(t *testing.T) {
 	p := newPriorityPool(t, nil,
 		priorityAccount("alpha", 0),   // D：无额度数据
@@ -146,8 +158,8 @@ func TestChooseQuotaWeightSpecExample(t *testing.T) {
 	assertRanking(t, p, "delta", "charlie", "bravo", "alpha")
 }
 
-// TestChooseQuotaWeightRules 额度权重的档位与取值规则。三个账号优先级相同，alpha、bravo、charlie 的文件名字节序固定，
-// 因此结果只取决于权重。
+// TestChooseQuotaWeightRules 额度权重的档位与取值规则。三个账号优先级相同，alpha、bravo、charlie 的文件名字节序固定。
+// 有 Credits 的账号先于无 Credits 的账号；同档内 SWRR 的首次选择即权重最大者（权重并列时按文件名），之后的位置按轮询继续。
 func TestChooseQuotaWeightRules(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -284,8 +296,9 @@ func TestChooseSkipsTriedAccounts(t *testing.T) {
 	}
 }
 
-// TestChooseConcurrentCallsAgreeOnOneAccount 选择没有轮询游标，并发调用得到的结果一致。
-func TestChooseConcurrentCallsAgreeOnOneAccount(t *testing.T) {
+// TestChooseConcurrentCallsSplitEvenly 并发调用 choose 时，选择在 p.mu 下串行推进轮询状态，因此结果仍按权重均分：
+// 三个等权账号共 1500 次选择，每个账号恰好 500 次，与调用的先后无关。
+func TestChooseConcurrentCallsSplitEvenly(t *testing.T) {
 	p := newPriorityPool(t, nil, priorityAccount("carol", 0), priorityAccount("alice", 0), priorityAccount("bob", 0))
 	const workers, perWorker = 30, 50
 	results := make(chan string, workers*perWorker)
@@ -301,9 +314,14 @@ func TestChooseConcurrentCallsAgreeOnOneAccount(t *testing.T) {
 	}
 	wait.Wait()
 	close(results)
+	counts := map[string]int{}
 	for user := range results {
-		if user != "alice" {
-			t.Fatalf("并发 choose 返回 %s, want alice", user)
+		counts[user]++
+	}
+	const want = workers * perWorker / 3
+	for _, user := range []string{"alice", "bob", "carol"} {
+		if counts[user] != want {
+			t.Errorf("并发 choose 中 %s 被选中 %d 次, want %d（counts = %v）", user, counts[user], want, counts)
 		}
 	}
 }

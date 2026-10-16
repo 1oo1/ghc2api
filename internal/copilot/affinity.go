@@ -14,6 +14,9 @@ import (
 // DefaultSessionAffinityTTL 是会话绑定的默认有效期。
 const DefaultSessionAffinityTTL = 2 * time.Hour
 
+// DefaultSessionAffinityMaxPerAccount 是每个账号的有效会话绑定数上限的缺省值（见 PoolConfig.SessionAffinityMaxPerAccount）。
+const DefaultSessionAffinityMaxPerAccount = 5
+
 // maxSessionBindings 限制绑定表的条数为 500（内存与绑定文件的规模上限，加载时也按此截断）；
 // 表满时先清理过期项，仍满则淘汰最早过期的一条。
 const maxSessionBindings = 500
@@ -236,4 +239,18 @@ func (t *affinityTable) count() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return len(t.bindings)
+}
+
+// activeCounts 统计每个账号在 now 时仍有效的绑定数（键为账号 ID），有效规则与 lookup 相同：截止时刻及之后的绑定不计数。
+// 没有有效绑定的账号不出现在结果中。结果是调用时刻的快照，供选择时判断每账号绑定数上限（见 Pool.choose）。
+func (t *affinityTable) activeCounts(now time.Time) map[string]int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	counts := make(map[string]int)
+	for _, binding := range t.bindings {
+		if now.Before(binding.expires) {
+			counts[binding.accountID]++
+		}
+	}
+	return counts
 }

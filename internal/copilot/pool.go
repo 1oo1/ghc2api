@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"slices"
 	"strconv"
@@ -29,8 +30,12 @@ type PoolConfig struct {
 	ModelsCacheTTL       time.Duration // 非正值使用默认的模型列表缓存有效期
 	QuotaRefreshInterval time.Duration // 非正值使用默认的额度刷新间隔（DefaultQuotaRefreshInterval）
 	SessionAffinityTTL   time.Duration // <=0 表示关闭会话亲和（不创建绑定表）
-	Client               *http.Client  // 访问 GitHub/Copilot 的客户端（测试注入），新增账号与设备登录也使用它
-	Logger               *slog.Logger
+	// SessionAffinityMaxPerAccount 是每个账号的有效会话绑定数上限：新会话与故障切换时优先排除已达上限的账号，
+	// 排除后没有候选或会降为冷却档时忽略上限（见 Pool.choose）。
+	// <=0 表示不限制；缺省值 DefaultSessionAffinityMaxPerAccount 由 cmd 层设置。
+	SessionAffinityMaxPerAccount int
+	Client                       *http.Client // 访问 GitHub/Copilot 的客户端（测试注入），新增账号与设备登录也使用它
+	Logger                       *slog.Logger
 }
 
 // PoolAccount 是启动时载入的一个账号。
@@ -42,13 +47,14 @@ type PoolAccount struct {
 	Priority int // 优先级，取值 MinPriority 到 MaxPriority；数值越大越优先被选择
 }
 
-// poolAccount 是池内一个账号的运行时状态。id、service 与 routes 创建后不再变化；disabled 与 priority 由 Pool.mu 保护。
+// poolAccount 是池内一个账号的运行时状态。id、service 与 routes 创建后不再变化；disabled、priority 与 swrrCurrent 由 Pool.mu 保护。
 type poolAccount struct {
-	id       string        // 账号 ID：GitHub 用户名的小写形式；无用户名时为初始下标
-	service  *Service      // 账号的 Copilot 服务
-	routes   serviceRoutes // 账号的业务路由，闭包捕获 service
-	disabled bool
-	priority int // 优先级，见 PoolAccount.Priority
+	id          string        // 账号 ID：GitHub 用户名的小写形式；无用户名时为初始下标
+	service     *Service      // 账号的 Copilot 服务
+	routes      serviceRoutes // 账号的业务路由，闭包捕获 service
+	disabled    bool
+	priority    int // 优先级，见 PoolAccount.Priority
+	swrrCurrent int // 平滑加权轮询的当前值，见 swrrPickLocked
 
 	requests atomic.Uint64 // 分发到该账号的请求数（含模型列表与生成）
 	failures atomic.Uint64 // 其中响应状态 >= 400 的数量
@@ -64,7 +70,7 @@ func newPoolAccount(service *Service, id string) *poolAccount {
 	return account
 }
 
-// Pool 在多个 GitHub 账号之间分发请求：按优先级与额度权重选择最优的可用账号，并负责会话亲和、账号的运行时增删、禁用与调整优先级。
+// Pool 在多个 GitHub 账号之间分发请求：按优先级与额度档位分出最优档，档内做平滑加权轮询选择可用账号，并负责会话亲和（含每账号绑定数上限）、账号的运行时增删、禁用与调整优先级。
 type Pool struct {
 	apiKey     string // 所有账号共用的服务访问密钥
 	logger     *slog.Logger
@@ -77,14 +83,14 @@ type Pool struct {
 	requestSeq atomic.Uint64
 
 	adminMu  sync.Mutex // 串行化账号的增删、禁用、优先级与凭证文件写入
-	mu       sync.Mutex // 保护 accounts 与各账号的 disabled、priority
+	mu       sync.Mutex // 保护 accounts 与各账号的 disabled、priority、swrrCurrent（选择会推进轮询状态，因此 choose 也持有它）
 	accounts []*poolAccount
 
 	loginMu sync.Mutex
 	logins  map[string]*deviceLogin // 设备登录状态，见 management_login.go
 }
 
-// NewPool 校验所有账号配置并创建账号池，账号顺序即加入顺序（选择只看优先级、额度权重与文件名，与顺序无关）。会话亲和与管理接口均关闭。
+// NewPool 校验所有账号配置并创建账号池，账号顺序即加入顺序（选择只看优先级、额度与文件名，与顺序无关）。会话亲和与管理接口均关闭。
 // 所有账号的服务访问密钥去除首尾空白后必须一致，GitHub 账号（Host 规范化后与 Token）不能重复。
 func NewPool(configs []Config) (*Pool, error) {
 	if len(configs) == 0 {
@@ -390,24 +396,35 @@ func (p *Pool) services() []*Service {
 	return services
 }
 
-// choose 选择处理本次请求的账号。会话键已绑定且该账号仍可用（未禁用、未冷却、未耗尽、本请求未尝试过）时优先使用它；
-// 否则按 pickLocked 的排序选择最优账号。没有候选时返回 nil。
+// choose 选择处理本次请求的账号。键非空且开启亲和时：会话已绑定且该账号仍可用（未禁用、未冷却、未耗尽、本请求未尝试过）则直接使用它，且不推进轮询；
+// 否则为无可用绑定的会话（新会话或故障切换）选择：先取最优档，排除有效绑定数已达上限的账号后再在档内轮询，见下方说明。
+// 键为空或未开启亲和时按 pickLocked 选择。没有候选时返回 nil。
 func (p *Pool) choose(key string, tried map[*poolAccount]bool) *poolAccount {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
-	if key != "" && p.affinity != nil {
-		if id, ok := p.affinity.lookup(key, now); ok {
-			if account := p.findLocked(id); account != nil && !account.disabled &&
-				!tried[account] && account.service.available(now) && !account.exhausted(now) {
-				return account
-			}
+	if key == "" || p.affinity == nil {
+		return p.pickLocked(now, tried)
+	}
+	if id, ok := p.affinity.lookup(key, now); ok {
+		if account := p.findLocked(id); account != nil && !account.disabled &&
+			!tried[account] && account.service.available(now) && !account.exhausted(now) {
+			return account
 		}
 	}
-	return p.pickLocked(now, tried)
+	// 排除已满账号后，若没有候选，或最优档的冷却状态与原最优档不同（即从未冷却降为冷却中），则忽略上限，仍按原最优档轮询，
+	// 避免把会话推向冷却中的账号。上限为 0 时 overCapLocked 返回 nil，不做排除。
+	group := p.topGroupLocked(now, tried)
+	if skip := p.overCapLocked(now, tried); skip != nil && len(group) > 0 {
+		if capped := p.topGroupLocked(now, skip); len(capped) > 0 && capped[0].key.cooling == group[0].key.cooling {
+			group = capped
+		}
+	}
+	return swrrPickLocked(group)
 }
 
-// selectKey 是账号参与选择时的排序键：已冷却的账号靠后，其余字段数值大者优先、文件名小者优先。字段顺序即比较顺序，见 before。
+// selectKey 是账号参与选择时的排序信息：cooling、priority 与 weight.hasCredits 决定档位（见 tierBefore）；
+// weight.fraction 决定档内 SWRR 的权重；file 是 SWRR 当前值并列时的先后。
 type selectKey struct {
 	cooling  bool        // 已冷却的账号排在未冷却的账号之后
 	priority int         // 优先级，数值大者在前
@@ -415,7 +432,7 @@ type selectKey struct {
 	file     string      // 凭证文件名（用户名 + ".json"，无用户名时用 ID），字节序升序
 }
 
-// keyOf 计算账号的排序键。调用方须持有 p.mu（读取 priority）。额度权重只读取缓存，不访问上游。
+// keyOf 计算账号的排序信息。调用方须持有 p.mu（读取 priority）。额度权重只读取缓存，不访问上游。
 func keyOf(a *poolAccount, now time.Time) selectKey {
 	name := a.service.config.User
 	if name == "" {
@@ -430,38 +447,89 @@ func keyOf(a *poolAccount, now time.Time) selectKey {
 	}
 }
 
-// before 报告 k 是否应排在 o 之前：未冷却优先，其次优先级高者在前，再次额度权重高者在前，最后凭证文件名字节序升序。
-func (k selectKey) before(o selectKey) bool {
+// tierBefore 报告 k 的档位是否严格优于 o：未冷却优先，其次优先级高者在前，再次有 Credits 者在前。
+// 档位相同时返回 false，档内的先后由 SWRR 决定。
+func (k selectKey) tierBefore(o selectKey) bool {
 	if k.cooling != o.cooling {
 		return !k.cooling
 	}
 	if k.priority != o.priority {
 		return k.priority > o.priority
 	}
-	switch {
-	case k.weight.better(o.weight):
-		return true
-	case o.weight.better(k.weight):
-		return false
-	}
-	return k.file < o.file
+	return k.weight.hasCredits && !o.weight.hasCredits
 }
 
-// pickLocked 选出本次应使用的账号，调用方须持有 p.mu。候选为未禁用、未耗尽（见 poolAccount.exhausted）且未被 tried 排除的账号，
-// 按 selectKey 排序取最优者。冷却中的账号排在未冷却账号之后，只有没有未冷却候选时才会被选中。没有候选（包括全部耗尽）时返回 nil。
-func (p *Pool) pickLocked(now time.Time, tried map[*poolAccount]bool) *poolAccount {
-	var best *poolAccount
-	var bestKey selectKey
+// candidate 是一次选择中参与比较的账号及其排序信息。
+type candidate struct {
+	account *poolAccount
+	key     selectKey
+}
+
+// topGroupLocked 返回最优档的全部候选，调用方须持有 p.mu。候选为未禁用、未被 skip 排除且未耗尽（见 poolAccount.exhausted）的账号；
+// 按 tierBefore 找出最优档，返回与之同档的全部候选，顺序为账号在池中的顺序。没有候选时返回 nil。只读取状态，不推进轮询。
+func (p *Pool) topGroupLocked(now time.Time, skip map[*poolAccount]bool) []candidate {
+	var group []candidate
 	for _, a := range p.accounts {
-		if a.disabled || tried[a] || a.exhausted(now) {
+		if a.disabled || skip[a] || a.exhausted(now) {
 			continue
 		}
-		key := keyOf(a, now)
-		if best == nil || key.before(bestKey) {
-			best, bestKey = a, key
+		c := candidate{account: a, key: keyOf(a, now)}
+		if len(group) > 0 && group[0].key.tierBefore(c.key) {
+			continue // 比最优档差
+		}
+		if len(group) == 0 || c.key.tierBefore(group[0].key) {
+			group = group[:0] // 出现更优的档，之前的候选全部作废
+		}
+		group = append(group, c)
+	}
+	return group
+}
+
+// swrrPickLocked 在同档的 group 内做一次平滑加权轮询（算法同 nginx），返回被选中的账号；group 为空时返回 nil。调用方须持有 p.mu。
+// 每个成员的 swrrCurrent 加上自身权重（见 quotaWeight.swrrWeight），取 swrrCurrent 最大者，并列时取文件名字节序最小者；
+// 被选中者的 swrrCurrent 再减去组内总权重。只修改组内成员的 swrrCurrent，状态只在内存中，不会因此重置。
+func swrrPickLocked(group []candidate) *poolAccount {
+	if len(group) == 0 {
+		return nil
+	}
+	total := 0
+	var best *candidate
+	for i := range group {
+		c := &group[i]
+		weight := c.key.weight.swrrWeight()
+		c.account.swrrCurrent += weight
+		total += weight
+		if best == nil || c.account.swrrCurrent > best.account.swrrCurrent ||
+			(c.account.swrrCurrent == best.account.swrrCurrent && c.key.file < best.key.file) {
+			best = c
 		}
 	}
-	return best
+	best.account.swrrCurrent -= total
+	return best.account
+}
+
+// pickLocked 选出本次应使用的账号，调用方须持有 p.mu：先由 topGroupLocked 取最优档，再由 swrrPickLocked 在档内轮询。
+// 冷却中的账号排在未冷却账号之后，只有没有未冷却候选时才会被选中。没有候选（包括全部耗尽）时返回 nil。
+func (p *Pool) pickLocked(now time.Time, tried map[*poolAccount]bool) *poolAccount {
+	return swrrPickLocked(p.topGroupLocked(now, tried))
+}
+
+// overCapLocked 返回不应接收无可用绑定会话的账号集合：本请求已尝试过的账号，以及有效绑定数已达 SessionAffinityMaxPerAccount 的账号。
+// 上限 <=0 或未开启亲和时返回 nil，表示不做排除。有效绑定数来自 affinityTable.activeCounts。调用方须持有 p.mu（锁顺序为先 p.mu 后 affinity.mu）。
+func (p *Pool) overCapLocked(now time.Time, tried map[*poolAccount]bool) map[*poolAccount]bool {
+	limit := p.config.SessionAffinityMaxPerAccount
+	if limit <= 0 || p.affinity == nil {
+		return nil
+	}
+	counts := p.affinity.activeCounts(now)
+	skip := make(map[*poolAccount]bool, len(tried))
+	maps.Copy(skip, tried)
+	for _, a := range p.accounts {
+		if counts[a.id] >= limit {
+			skip[a] = true
+		}
+	}
+	return skip
 }
 
 // findLocked 按 ID 查找账号，调用方须持有 p.mu。

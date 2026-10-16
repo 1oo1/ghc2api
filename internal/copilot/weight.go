@@ -1,15 +1,18 @@
 package copilot
 
-import "time"
+import (
+	"math"
+	"time"
+)
 
-// 本文件基于账号缓存的额度，提供两个判断：额度权重，用于在优先级相同的账号之间排序（见 Pool.pickLocked）；
+// 本文件基于账号缓存的额度，提供两个判断：额度权重（档位与剩余比例），用于同一档内的平滑加权轮询，SWRR 权重由 swrrWeight 换算（见 Pool.pickLocked）；
 // 额度耗尽判断，耗尽的账号暂不参与选择，直到主额度的重置时刻（见 poolAccount.exhausted）。
 // 两者都只读取缓存的额度，不访问上游；额度刷新后才会变化，耗尽判断还取决于当前时间。
 
 // additionalBudgetWindow 是 Additional Budget 额度窗口的 window 字段值，它不属于主额度。
 const additionalBudgetWindow = "additional_budget"
 
-// quotaWeight 是账号的额度权重。比较时先看档位（有 Credits 高于无 Credits），同档内剩余比例高者优先。
+// quotaWeight 是账号的额度权重。hasCredits 决定档位，选择时先于其他字段比较；fraction 决定同档内 SWRR 的权重（见 swrrWeight）。
 type quotaWeight struct {
 	hasCredits bool    // 主额度仍有剩余，即“有 Credits”档
 	fraction   float64 // 剩余比例（0 到 1）：有 Credits 档为主额度的比例，否则为 Additional Budget 的比例，都没有时为 0
@@ -49,12 +52,10 @@ func weigh(q *Quota) quotaWeight {
 	return quotaWeight{}
 }
 
-// better 报告 w 是否严格优于 o：有 Credits 档优先，同档内剩余比例高者优先。两者相等时返回 false。
-func (w quotaWeight) better(o quotaWeight) bool {
-	if w.hasCredits != o.hasCredits {
-		return w.hasCredits
-	}
-	return w.fraction > o.fraction
+// swrrWeight 返回账号在同档平滑加权轮询中的权重：max(1, round(fraction*100))。
+// 没有额度数据、剩余比例为 0 或取整后不足 1 时权重为 1，保证同档内每个账号都会轮到（见 swrrPickLocked）。
+func (w quotaWeight) swrrWeight() int {
+	return max(1, int(math.Round(w.fraction*100)))
 }
 
 // exhaustedUntil 判断额度是否耗尽：主额度与 Additional Budget 的剩余比例都不大于 0（没有 Additional Budget 窗口视为没有剩余），
