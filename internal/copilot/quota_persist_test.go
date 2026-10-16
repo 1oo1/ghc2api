@@ -49,6 +49,7 @@ func (f *persistFixture) start(t *testing.T) *Pool {
 	if err != nil {
 		t.Fatal(err)
 	}
+	quotaAwaitIdle(t, p)
 	return p
 }
 
@@ -576,9 +577,10 @@ func TestQuotaPersistenceSkippedWithoutCacheDir(t *testing.T) {
 	}
 }
 
-// TestRestoredQuotaAppliesToImportedAndDeviceLoginAccounts 导入与设备登录新增的账号同样从缓存恢复额度。
-// 两种入口在校验时都会请求一次额度接口，因此断言的是列表前后的请求次数不变。
-func TestRestoredQuotaAppliesToImportedAndDeviceLoginAccounts(t *testing.T) {
+// TestImportedAccountsRefreshQuotaOnceAfterAdd 导入与设备登录新增的账号：缓存中恢复的额度（Copilot Student）
+// 会被入池后立即发起的强制刷新覆盖（见 quota_add_test.go）。校验请求 1 次与立即刷新 1 次之后，列表不再请求上游，
+// 展示的是刷新后的额度。
+func TestImportedAccountsRefreshQuotaOnceAfterAdd(t *testing.T) {
 	const token = "oauth-carol"
 	for _, tc := range []struct {
 		name string
@@ -618,14 +620,28 @@ func TestRestoredQuotaAppliesToImportedAndDeviceLoginAccounts(t *testing.T) {
 			persistWriteQuota(t, seed.cacheDir, &restored, time.Now(), "")
 
 			tc.add(t, up, p)
+			carol := p.findAccount("carol")
+			if carol == nil {
+				t.Fatal("导入后账号池缺少 carol")
+			}
+			// 入池后的立即刷新（强制，忽略恢复的 checked_at）用 Copilot Pro 覆盖恢复的额度。
+			quotaWaitFor(t, "入池后恢复的额度未被立即刷新结果替换", func() bool {
+				q, _ := carol.quota.snapshot()
+				return persistPlan(q) == "Copilot Pro"
+			})
+			// 校验请求 1 次（入池之前）+ 立即刷新 1 次（入池之后）。
 			before := up.quotaCount(token)
+			if before != 2 {
+				t.Fatalf("入池后的额度请求次数 = %d, want 2（校验 1 次 + 立即刷新 1 次）", before)
+			}
 			view := mgmtAccountByID(t, mgmtAccounts(t, p), "carol")
 			if got := up.quotaCount(token); got != before {
-				t.Fatalf("列表请求了上游额度接口 %d -> %d, want 不变（应使用恢复的额度）", before, got)
+				t.Fatalf("列表请求了上游额度接口 %d -> %d, want 不变（立即刷新后应使用新鲜的额度）", before, got)
 			}
-			if plan := persistPlan(view.Quota); plan != "Copilot Student" {
-				t.Fatalf("恢复的额度计划 = %q, want Copilot Student", plan)
+			if plan := persistPlan(view.Quota); plan != "Copilot Pro" {
+				t.Fatalf("导入后的额度计划 = %q, want Copilot Pro（恢复的 Copilot Student 应被覆盖）", plan)
 			}
+
 		})
 	}
 }

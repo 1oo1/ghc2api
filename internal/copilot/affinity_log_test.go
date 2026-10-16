@@ -37,6 +37,7 @@ func affinityLogPool(t *testing.T, up *mgmtUpstream, level slog.Level, ttl time.
 	if err != nil {
 		t.Fatal(err)
 	}
+	quotaAwaitIdle(t, p)
 	return p, logs
 }
 

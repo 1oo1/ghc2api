@@ -252,6 +252,7 @@ func mgmtNewPool(t *testing.T, up *mgmtUpstream, ttl time.Duration, users ...str
 	if err != nil {
 		t.Fatal(err)
 	}
+	quotaAwaitIdle(t, p)
 	return p, dir
 }
 

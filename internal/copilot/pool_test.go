@@ -229,6 +229,7 @@ func testPool(t *testing.T, configs []Config) *Pool {
 	if err != nil {
 		t.Fatal(err)
 	}
+	quotaAwaitIdle(t, pool)
 	return pool
 }
 

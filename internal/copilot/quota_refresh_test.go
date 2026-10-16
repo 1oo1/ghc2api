@@ -99,6 +99,33 @@ func quotaStaysAt(t *testing.T, up *mgmtUpstream, token string, want int) {
 	}
 }
 
+// quotaRefreshing 报告账号是否有异步刷新（见 refreshAsync）正在进行，加锁读取。
+func quotaRefreshing(a *poolAccount) bool {
+	a.quota.mu.Lock()
+	defer a.quota.mu.Unlock()
+	return a.quota.refreshing
+}
+
+// quotaAwaitIdle 注册清理函数，测试结束前等待池内所有账号的异步额度刷新结束。
+// 异步刷新由请求失败（非 429）或新增账号触发，结束前会写入账号缓存目录；测试先结束时，t.TempDir 的清理会与写入竞争
+// （RemoveAll: directory not empty）。建池之后立即调用：t.Cleanup 后进先出，因此它先于 t.TempDir 与测试服务器的清理执行。
+// 异步刷新的上游请求受 quotaRefreshTimeout 约束，因此等待上限为 quotaRefreshTimeout 加 quotaAsyncTimeout。
+func quotaAwaitIdle(t *testing.T, p *Pool) {
+	t.Helper()
+	t.Cleanup(func() {
+		deadline := time.Now().Add(quotaRefreshTimeout + quotaAsyncTimeout)
+		for _, a := range p.accountsSnapshot() {
+			for quotaRefreshing(a) {
+				if time.Now().After(deadline) {
+					t.Errorf("测试结束时账号 %s 的异步额度刷新仍未完成", a.id)
+					return
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+	})
+}
+
 // quotaGenerateAsync 在另一个协程发送生成请求，响应通过返回的 channel 交付。ctx 作为请求上下文，可用于模拟客户端断开。
 func quotaGenerateAsync(p *Pool, ctx context.Context) <-chan *httptest.ResponseRecorder {
 	done := make(chan *httptest.ResponseRecorder, 1)
@@ -237,6 +264,7 @@ func TestQuotaRefreshIntervalAppliesToManagementImport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	quotaAwaitIdle(t, p)
 	if w := mgmtCall(p, "POST", "/v0/management/accounts", `{"credential":{"oauth_token":"oauth-carol"}}`, mgmtKey); w.Code != http.StatusOK {
 		t.Fatalf("导入 status=%d body=%s", w.Code, w.Body.String())
 	}
@@ -247,7 +275,8 @@ func TestQuotaRefreshIntervalAppliesToManagementImport(t *testing.T) {
 	if got := carol.service.quotaRefreshInterval; got != 10*time.Minute {
 		t.Fatalf("导入账号的 quotaRefreshInterval = %s, want 10m", got)
 	}
-	// 导入校验会请求一次额度接口，之后的断言以当前次数为基准。
+	// 导入校验请求 1 次（入池之前），入池后的立即刷新 1 次；等它落地后再取基准次数，否则计数会多 1。
+	quotaWaitAttempt(t, carol, time.Time{})
 	before := up.quotaCount("oauth-carol")
 	quotaSetCheckedAt(carol, time.Now().Add(-9*time.Minute))
 	mgmtAccounts(t, p)

@@ -290,6 +290,7 @@ func (p *Pool) handleRefreshQuota(w http.ResponseWriter, r *http.Request) {
 }
 
 // addVerifiedAccount 保存已通过 GitHub 校验的凭证，并把账号追加到池末尾。新账号的优先级为 0。
+// 入池后立即在后台强制刷新一次额度（不阻塞调用方，失败只记入额度缓存），因此响应中的账号视图可能尚无额度。
 // 登录名（忽略大小写）或 Host+Token 已存在、凭证目录中已有同名文件时返回 errAccountExists，且不写入凭证。
 // 登录名须通过 ValidGitHubUserName，因为它会用作凭证文件名。
 func (p *Pool) addVerifiedAccount(token, host, login string) (*poolAccount, error) {
@@ -329,6 +330,8 @@ func (p *Pool) addVerifiedAccount(token, host, login string) (*poolAccount, erro
 	p.mu.Lock()
 	p.accounts = append(p.accounts, account)
 	p.mu.Unlock()
+	// 账号可能从缓存恢复了较新的 checked_at，因此不节流，入池后立即强制刷新。
+	account.refreshAsync(0)
 	return account, nil
 }
 

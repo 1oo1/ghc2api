@@ -161,7 +161,8 @@ func (t serviceRoutes) handle(method, path string, handler http.HandlerFunc, ent
 // Service 与 Pool 共用此中间件，未通过时记录告警并返回 401。
 func requireAPIKey(apiKey string, logf logFunc, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/healthz" && apiKey != "" && !authorizedRequest(apiKey, r) {
+		skipped := r.URL.Path == "/healthz" || r.URL.Path == "/favicon.ico"
+		if !skipped && apiKey != "" && !authorizedRequest(apiKey, r) {
 			logf(r.Context(), slog.LevelWarn, "客户端鉴权失败", "method", r.Method, "path", r.URL.Path)
 			writeError(w, http.StatusUnauthorized, "服务访问密钥无效或缺失")
 			return

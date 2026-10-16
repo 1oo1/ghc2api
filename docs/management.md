@@ -50,12 +50,13 @@ JSON 字段名为 `id`、`user`、`host`、`disabled`、`priority`、`cooldown_u
 
 - 400：`user` 非空且与登录名不一致（忽略大小写）、登录名不合规、上游校验失败（消息不含 token）。
 - 409：登录名或 Host+Token 已在池中，或凭证目录已有同名文件。
-- 成功后写凭证文件、加入池末尾，优先级 0。
+- 成功后写凭证文件、加入池末尾，优先级 0；随即在后台异步强制刷新一次该账号的额度（不节流，忽略从缓存恢复的 `checked_at`；不阻塞响应，失败只记入 `quota_error`，见 `quota-stats.md`）。因此响应里的账号视图可能尚无额度，之后的列表即可看到结果。
 
 ## 设备登录
 
 `POST login` 发起 GitHub Device Flow（用顶层 Host），返回 32 字符十六进制 `state`、验证页 URL、`user_code`；后台 goroutine 按 `login.go` 的轮询规则（slow_down、过期、连续 5 次失败）等待授权，成功后按导入规则保存并加入池。
 
 - 成功 `status=success` 带新账号 `id`；失败 `status=error` 带不含 token 的 `error`（同名冲突亦如此）。
+- 入池后与导入相同，立即异步刷新一次额度；`status=success` 返回时该刷新可能尚未完成。
 - 验证码在授权前过期（`pollCtx` 超时而父上下文未取消）时，错误为 `验证码已过期，请重新登录`（CLI `Login` 与 Web 一致）；父上下文取消仍返回上下文错误。
 - 状态保存在内存，完成后保留 10 分钟。`login.go` 拆出可复用的发起/轮询/校验函数，CLI `Login` 行为不变。

@@ -29,6 +29,7 @@ func newAffinityPriorityPool(t *testing.T, accounts ...PoolAccount) *Pool {
 	if err != nil {
 		t.Fatal(err)
 	}
+	quotaAwaitIdle(t, p)
 	return p
 }
 

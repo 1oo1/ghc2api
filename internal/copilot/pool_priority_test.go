@@ -25,6 +25,7 @@ func newPriorityPool(t *testing.T, client *http.Client, accounts ...PoolAccount)
 	if err != nil {
 		t.Fatal(err)
 	}
+	quotaAwaitIdle(t, p)
 	return p
 }
 

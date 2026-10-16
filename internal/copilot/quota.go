@@ -260,9 +260,10 @@ type quotaCache struct {
 	data      *Quota    // 最近一次成功获取的额度；限流时保留旧值并标记 Stale
 	checkedAt time.Time // 最近一次尝试（成功或失败）的时间，用于刷新间隔内不重复请求
 	errText   string    // 最近一次刷新失败的说明（不含 token）；成功后清空
-	// retry 为 true 表示上一次刷新被调用方取消，它不算一次尝试，因此下一次列表刷新不受节流限制。
+	// retry 为 true 表示上一次刷新被调用方取消，它不算一次尝试，因此下一次列表刷新或后台轮询（最迟一分钟后）不受节流限制。
 	retry bool
-	// refreshing 为 true 表示请求失败后的异步刷新正在进行，同一账号同时只保留一个（见 refreshAfterError）。
+	// refreshing 为 true 表示异步刷新（见 refreshAsync）正在进行，同一账号同时只保留一个。
+	// 它只约束异步刷新（请求失败与新增账号），不约束后台定时刷新与列表刷新。
 	refreshing bool
 }
 
@@ -381,12 +382,19 @@ func (a *poolAccount) quotaErrorText(err error) string {
 	return a.service.redactString(err.Error())
 }
 
-// refreshAfterError 在账号请求失败（非 429）后异步强制刷新额度，不阻塞响应。
-// 同一账号已有刷新进行中，或距上次尝试不足 quotaErrorRefreshInterval 时不触发。
-// 刷新使用独立于请求的 context（总超时 quotaRefreshTimeout），客户端断开不影响它；结果照常写入缓存与 quota.json。
+// refreshAfterError 在账号请求失败（非 429）后异步强制刷新额度，节流规则见 refreshAsync。
 func (a *poolAccount) refreshAfterError() {
+	a.refreshAsync(quotaErrorRefreshInterval)
+}
+
+// refreshAsync 在后台强制刷新额度，不阻塞调用方，忽略 checked_at 的刷新间隔。
+// 距上次尝试不足 throttle 时不启动（throttle 为 0 表示不节流）；同一账号已有异步刷新进行中（refreshing）时也不启动。
+// 两项检查与设置 refreshing 在同一把锁内完成，因此并发调用至多启动一次刷新。
+// 后台定时刷新与列表刷新不设置 refreshing，与它们并发时可能多请求一次上游。
+// 刷新使用独立于调用方的 context（总超时 quotaRefreshTimeout），调用方结束或客户端断开不影响它；结果照常写入缓存与 quota.json。
+func (a *poolAccount) refreshAsync(throttle time.Duration) {
 	a.quota.mu.Lock()
-	if a.quota.refreshing || time.Since(a.quota.checkedAt) < quotaErrorRefreshInterval {
+	if a.quota.refreshing || (throttle > 0 && time.Since(a.quota.checkedAt) < throttle) {
 		a.quota.mu.Unlock()
 		return
 	}

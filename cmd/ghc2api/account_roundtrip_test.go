@@ -73,16 +73,42 @@ func roundTripSetup(t *testing.T, token string) (configPath string, pool *copilo
 	configDir := isolatedConfigDir(t)
 	credentials = filepath.Join(configDir, "data", "credentials")
 	configPath = writeConfigInDir(t, configDir, "management_key: "+roundTripManagementKey+"\n")
+	cacheDir := t.TempDir()
 	pool, err := copilot.NewManagedPool(copilot.PoolConfig{
 		ManagementKey:  roundTripManagementKey,
 		CredentialsDir: credentials,
-		CacheDir:       t.TempDir(),
+		CacheDir:       cacheDir,
 		Client:         &http.Client{Transport: &roundTripGitHub{token: token}},
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	roundTripAwaitQuotaFile(t, cacheDir)
 	return configPath, pool, credentials
+}
+
+// roundTripAwaitQuotaFile 注册清理函数：测试结束前等待导入或设备登录后的异步额度刷新写完 quota.json。
+// 新增账号会立即异步刷新额度，结束前写入缓存目录；测试先结束时，t.TempDir 的清理会与写入竞争。
+// 缓存写入是临时文件加 rename，因此 quota.json 出现且含 quota 字段即表示写入已完成。
+// 注册顺序晚于缓存目录的 t.TempDir，因此先于它的清理执行。
+func roundTripAwaitQuotaFile(t *testing.T, cacheDir string) {
+	t.Helper()
+	t.Cleanup(func() {
+		deadline := time.Now().Add(15 * time.Second)
+		for {
+			matches, _ := filepath.Glob(filepath.Join(cacheDir, "*", "quota.json"))
+			for _, path := range matches {
+				if data, err := os.ReadFile(path); err == nil && strings.Contains(string(data), `"quota"`) {
+					return
+				}
+			}
+			if time.Now().After(deadline) {
+				t.Error("导入或设备登录后异步额度刷新没有写入 quota.json")
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	})
 }
 
 // assertRoundTripAccountLoads 检查凭证文件已写出，且启动加载（loadConfig）能读取该账号及其 token。
