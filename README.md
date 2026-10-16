@@ -2,7 +2,7 @@
 
 从 magpie 的 GitHub Copilot provider 提取的独立 Go HTTP 服务：把一个或多个 GitHub Copilot 账号暴露为
 OpenAI Chat Completions / Responses 与 Anthropic Messages 兼容的接口，支持多账号选择、会话亲和、额度统计和 Web 控制台。
-当前实现以 magpie 上游提交 `a1f7b8c1` 为对照基线，同步流程见 [`docs/magpie-copilot-sync.md`](docs/magpie-copilot-sync.md)。
+当前实现以 magpie 上游提交 `19e9fc47` 为对照基线，同步流程见 [`docs/magpie-copilot-sync.md`](docs/magpie-copilot-sync.md)。
 
 ## 快速开始
 
