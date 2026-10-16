@@ -13,16 +13,20 @@ import (
 // DefaultModelsCacheTTL 是模型列表缓存的默认有效期。
 const DefaultModelsCacheTTL = 2 * time.Hour
 
+// DefaultQuotaRefreshInterval 是额度的默认刷新间隔：距上次尝试不足该时长时不重复请求上游（强制刷新除外）。
+const DefaultQuotaRefreshInterval = time.Hour
+
 // Config 配置单个 Copilot 账号；APIKey 是本服务密钥，不是 GitHub token。
 type Config struct {
-	Token          string
-	Host           string
-	User           string // 账号的 GitHub 用户名，仅用于日志标识，不参与鉴权。
-	APIKey         string
-	CacheDir       string        // 留空时使用系统用户缓存目录；自定义目录应由调用方限制访问权限。
-	ModelsCacheTTL time.Duration // 非正值使用默认的模型列表缓存有效期。
-	Client         *http.Client
-	Logger         *slog.Logger
+	Token                string
+	Host                 string
+	User                 string // 账号的 GitHub 用户名，仅用于日志标识，不参与鉴权。
+	APIKey               string
+	CacheDir             string        // 留空时使用系统用户缓存目录；自定义目录应由调用方限制访问权限。
+	ModelsCacheTTL       time.Duration // 非正值使用默认的模型列表缓存有效期。
+	QuotaRefreshInterval time.Duration // 非正值使用 DefaultQuotaRefreshInterval，见 quota.go。
+	Client               *http.Client
+	Logger               *slog.Logger
 }
 
 var enterpriseLabel = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)

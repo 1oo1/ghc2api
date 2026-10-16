@@ -49,6 +49,7 @@ type mgmtUpstream struct {
 	logins       map[string]string      // OAuth token -> GitHub 登录名；未登记的 token 访问 /user 返回 401
 	quotaCalls   map[string]int         // 每个 token 访问 /copilot_internal/user 的次数
 	quotaFails   map[string]poolFailure // 指定 token 的额度请求返回该失败
+	quotaBodies  map[string]string      // 指定 token 的额度请求返回该正文，未设置时为 mgmtQuotaBody
 	holds        map[string]*mgmtHold   // 指定 token 的生成请求在 hold 释放前阻塞
 	sessionHolds map[string]*mgmtHold   // 指定 token 的 session 交换在 hold 释放前阻塞
 	quotaHolds   map[string]*mgmtHold   // 指定 token 的额度查询在 hold 释放前阻塞
@@ -62,7 +63,7 @@ func newMgmtUpstream(t *testing.T) *mgmtUpstream {
 	m := &mgmtUpstream{
 		t: t, pool: newPoolUpstream(t),
 		logins: map[string]string{}, quotaCalls: map[string]int{},
-		quotaFails: map[string]poolFailure{}, holds: map[string]*mgmtHold{},
+		quotaFails: map[string]poolFailure{}, quotaBodies: map[string]string{}, holds: map[string]*mgmtHold{},
 		sessionHolds: map[string]*mgmtHold{}, quotaHolds: map[string]*mgmtHold{},
 	}
 	m.client = testClient(t, m.serve)
@@ -102,6 +103,7 @@ func (m *mgmtUpstream) serveQuota(w http.ResponseWriter, r *http.Request, token 
 	m.mu.Lock()
 	m.quotaCalls[token]++
 	failure, failing := m.quotaFails[token]
+	body, custom := m.quotaBodies[token]
 	m.mu.Unlock()
 	m.waitOn(m.quotaHolds, token, r)
 	if failing {
@@ -109,7 +111,10 @@ func (m *mgmtUpstream) serveQuota(w http.ResponseWriter, r *http.Request, token 
 		_, _ = io.WriteString(w, failure.body)
 		return
 	}
-	_, _ = io.WriteString(w, mgmtQuotaBody)
+	if !custom {
+		body = mgmtQuotaBody
+	}
+	_, _ = io.WriteString(w, body)
 }
 
 // serveDevicePoll 第一次轮询返回 authorization_pending，之后返回 token；deviceError 非空时直接返回该错误。
@@ -196,6 +201,13 @@ func (m *mgmtUpstream) failQuota(token string, status int, body string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.quotaFails[token] = poolFailure{status, body}
+}
+
+// setQuotaBody 让 token 的额度请求返回 body（成功时），替代默认的个人版正文。
+func (m *mgmtUpstream) setQuotaBody(token, body string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.quotaBodies[token] = body
 }
 
 func (m *mgmtUpstream) quotaCount(token string) int {
@@ -450,6 +462,9 @@ func TestManagementConsolePageIsPublicAndMatchesEmbeddedHTML(t *testing.T) {
 func TestManagementAccountsListShowsQuotaAndRequestStats(t *testing.T) {
 	up := newMgmtUpstream(t)
 	p, _ := mgmtNewPool(t, up, 0, "alice", "bob", "carol")
+	// 先让三个账号各获取一次额度：数据相同，权重一致。之后 bob 的失败会异步刷新额度（错误触发刷新），
+	// 若只有 bob 有额度权重，选择顺序会改变；三者权重相同时，排序仍由凭证文件名决定，与原用例的预期一致。
+	mgmtAccounts(t, p)
 	up.pool.failGeneration("oauth-bob", poolFailure{http.StatusInternalServerError, `{"error":"bob down"}`})
 	up.pool.failSession("oauth-carol", poolFailure{http.StatusInternalServerError, `{"message":"carol down"}`})
 
@@ -505,7 +520,7 @@ func TestManagementAccountsListShowsQuotaAndRequestStats(t *testing.T) {
 	}
 }
 
-// TestManagementQuotaIsCachedUnlessRefreshed 额度在 2 小时内不重复请求上游，强制刷新除外。
+// TestManagementQuotaIsCachedUnlessRefreshed 额度在 1 小时内不重复请求上游，强制刷新除外。
 func TestManagementQuotaIsCachedUnlessRefreshed(t *testing.T) {
 	up := newMgmtUpstream(t)
 	p, _ := mgmtNewPool(t, up, 0, "alice", "bob")
@@ -522,8 +537,8 @@ func TestManagementQuotaIsCachedUnlessRefreshed(t *testing.T) {
 	}
 }
 
-// TestManagementQuotaExpiresAfterCacheTTL 距上次尝试不足 quotaCacheTTL 时不重复请求上游；超过该时长后，列表重新请求一次。
-func TestManagementQuotaExpiresAfterCacheTTL(t *testing.T) {
+// TestManagementQuotaExpiresAfterRefreshInterval 距上次尝试不足 DefaultQuotaRefreshInterval 时不重复请求上游；超过该时长后，列表重新请求一次。
+func TestManagementQuotaExpiresAfterRefreshInterval(t *testing.T) {
 	up := newMgmtUpstream(t)
 	p, _ := mgmtNewPool(t, up, 0, "alice")
 	mgmtAccounts(t, p) // 首次列表：拉取一次额度。
@@ -534,16 +549,16 @@ func TestManagementQuotaExpiresAfterCacheTTL(t *testing.T) {
 		account.quota.mu.Unlock()
 	}
 
-	setCheckedAt(quotaCacheTTL - time.Minute) // 距上次尝试仍不足 TTL：缓存有效，不请求上游。
+	setCheckedAt(DefaultQuotaRefreshInterval - time.Minute) // 距上次尝试仍不足间隔：缓存有效，不请求上游。
 	mgmtAccounts(t, p)
 	if got := up.quotaCount("oauth-alice"); got != 1 {
-		t.Fatalf("TTL 内列表后额度请求次数 = %d, want 1", got)
+		t.Fatalf("间隔内列表后额度请求次数 = %d, want 1", got)
 	}
 
-	setCheckedAt(quotaCacheTTL + time.Second) // 超过 TTL：缓存过期，列表重新请求一次。
+	setCheckedAt(DefaultQuotaRefreshInterval + time.Second) // 超过间隔：缓存过期，列表重新请求一次。
 	mgmtAccounts(t, p)
 	if got := up.quotaCount("oauth-alice"); got != 2 {
-		t.Fatalf("TTL 过期后列表额度请求次数 = %d, want 2", got)
+		t.Fatalf("间隔过期后列表额度请求次数 = %d, want 2", got)
 	}
 }
 

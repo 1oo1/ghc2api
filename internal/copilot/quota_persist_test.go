@@ -201,7 +201,7 @@ func TestQuotaFileLayoutAndPermission(t *testing.T) {
 }
 
 // TestQuotaRestoredAfterRestartWithoutUpstreamCall 刷新成功后重启：额度（含 ObservedAt）从缓存恢复，
-// 2 小时节流窗口内 GET accounts 不再请求上游。
+// 1 小时节流窗口内 GET accounts 不再请求上游。
 func TestQuotaRestoredAfterRestartWithoutUpstreamCall(t *testing.T) {
 	up := newMgmtUpstream(t)
 	f := newPersistFixture(t, up, "alice")
@@ -312,16 +312,16 @@ func TestQuotaErrorPersistsAcrossRestart(t *testing.T) {
 	})
 }
 
-// TestQuotaCheckedAtWindowAcrossRestart 以 checked_at 为准判断节流：距今不足 2 小时时重启后直接使用恢复的额度，
-// 超过 2 小时则重启后的列表重新请求上游。
+// TestQuotaCheckedAtWindowAcrossRestart 以 checked_at 为准判断节流：距今不足 1 小时时重启后直接使用恢复的额度，
+// 超过 1 小时则重启后的列表重新请求上游。
 func TestQuotaCheckedAtWindowAcrossRestart(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		age         time.Duration // checked_at 距重启的时长
 		wantRequest bool          // 重启后的 GET accounts 是否请求上游
 	}{
-		{name: "within-two-hours", age: quotaCacheTTL - time.Minute},
-		{name: "beyond-two-hours", age: quotaCacheTTL + time.Minute, wantRequest: true},
+		{name: "within-one-hour", age: DefaultQuotaRefreshInterval - time.Minute},
+		{name: "beyond-one-hour", age: DefaultQuotaRefreshInterval + time.Minute, wantRequest: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			up := newMgmtUpstream(t)
@@ -338,7 +338,7 @@ func TestQuotaCheckedAtWindowAcrossRestart(t *testing.T) {
 			got := up.quotaCount("oauth-alice")
 			if !tc.wantRequest {
 				if got != 0 {
-					t.Fatalf("checked_at 在 2 小时内时重启后请求了上游 %d 次, want 0", got)
+					t.Fatalf("checked_at 在 1 小时内时重启后请求了上游 %d 次, want 0", got)
 				}
 				if plan := persistPlan(view.Quota); plan != "Copilot Student" {
 					t.Fatalf("应直接返回恢复的额度，计划 = %q, want Copilot Student", plan)
@@ -346,10 +346,10 @@ func TestQuotaCheckedAtWindowAcrossRestart(t *testing.T) {
 				return
 			}
 			if got != 1 {
-				t.Fatalf("checked_at 超过 2 小时后重启请求了上游 %d 次, want 1", got)
+				t.Fatalf("checked_at 超过 1 小时后重启请求了上游 %d 次, want 1", got)
 			}
 			if plan := persistPlan(view.Quota); plan != "Copilot Pro" {
-				t.Fatalf("超过 2 小时后应重新拉取额度，计划 = %q, want Copilot Pro", plan)
+				t.Fatalf("超过 1 小时后应重新拉取额度，计划 = %q, want Copilot Pro", plan)
 			}
 		})
 	}

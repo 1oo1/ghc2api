@@ -19,7 +19,7 @@ import (
 // maxManagementBody 是管理接口请求体的上限。
 const maxManagementBody = 1 << 20
 
-// quotaRefreshTimeout 是一次额度刷新（列表中的并发刷新或单账号强制刷新）的总超时。
+// quotaRefreshTimeout 是一次额度刷新（列表中的并发刷新、后台定时刷新、请求失败后的异步刷新或单账号强制刷新）的总超时。
 // 声明为变量以便测试临时缩短，实现中不得改为常量。
 var quotaRefreshTimeout = 10 * time.Second
 
@@ -112,7 +112,7 @@ func decodeManagementJSON(w http.ResponseWriter, r *http.Request, value any) boo
 	return false
 }
 
-// handleListAccounts 返回全部账号。额度缓存超过 quotaCacheTTL（2 小时）的账号并发刷新（总超时 10 秒），刷新失败不影响结果。
+// handleListAccounts 返回全部账号。距上次尝试已超过刷新间隔的账号并发刷新（总超时 quotaRefreshTimeout），刷新失败不影响结果。
 func (p *Pool) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), quotaRefreshTimeout)
 	defer cancel()
@@ -300,7 +300,8 @@ func (p *Pool) addVerifiedAccount(token, host, login string) (*poolAccount, erro
 	defer p.adminMu.Unlock()
 	service, err := New(Config{
 		Token: token, Host: host, User: login, APIKey: p.apiKey, CacheDir: p.config.CacheDir,
-		ModelsCacheTTL: p.config.ModelsCacheTTL, Client: p.config.Client, Logger: p.logger,
+		ModelsCacheTTL: p.config.ModelsCacheTTL, QuotaRefreshInterval: p.config.QuotaRefreshInterval,
+		Client: p.config.Client, Logger: p.logger,
 	})
 	if err != nil {
 		return nil, err

@@ -87,7 +87,7 @@ func TestManagementRejectsInvalidGitHubLogin(t *testing.T) {
 }
 
 // TestManagementQuotaRefreshTimeoutKeepsOldDataWithQuotaError 强制刷新超过 quotaRefreshTimeout 时，
-// 保留旧额度，返回 200 并带非空 quota_error。超时同样计为一次尝试，2 小时内的列表不再请求上游。
+// 保留旧额度，返回 200 并带非空 quota_error。超时同样计为一次尝试，1 小时内的列表不再请求上游。
 func TestManagementQuotaRefreshTimeoutKeepsOldDataWithQuotaError(t *testing.T) {
 	previous := quotaRefreshTimeout
 	quotaRefreshTimeout = 300 * time.Millisecond
@@ -109,14 +109,14 @@ func TestManagementQuotaRefreshTimeoutKeepsOldDataWithQuotaError(t *testing.T) {
 	before := up.quotaCount("oauth-alice")
 	alice := mgmtAccountByID(t, mgmtAccounts(t, p), "alice")
 	if got := up.quotaCount("oauth-alice"); got != before {
-		t.Fatalf("超时后 2 小时内列表重复请求了上游: %d -> %d", before, got)
+		t.Fatalf("超时后 1 小时内列表重复请求了上游: %d -> %d", before, got)
 	}
 	if alice.Quota == nil || alice.QuotaError != quotaTimeoutMessage {
 		t.Fatalf("超时后列表视图 = %+v, want 保留旧额度且带 quota_error", alice)
 	}
 }
 
-// TestManagementQuotaFailedAttemptIsThrottled 失败的额度请求同样计为一次尝试：2 小时内列表不会重复请求上游，错误仍然展示。
+// TestManagementQuotaFailedAttemptIsThrottled 失败的额度请求同样计为一次尝试：1 小时内列表不会重复请求上游，错误仍然展示。
 func TestManagementQuotaFailedAttemptIsThrottled(t *testing.T) {
 	up := newMgmtUpstream(t)
 	up.failQuota("oauth-alice", http.StatusInternalServerError, `{"error":"down"}`)
@@ -124,7 +124,7 @@ func TestManagementQuotaFailedAttemptIsThrottled(t *testing.T) {
 	first := mgmtAccountByID(t, mgmtAccounts(t, p), "alice")
 	second := mgmtAccountByID(t, mgmtAccounts(t, p), "alice")
 	if got := up.quotaCount("oauth-alice"); got != 1 {
-		t.Fatalf("失败后 2 小时内额度请求 %d 次, want 1", got)
+		t.Fatalf("失败后 1 小时内额度请求 %d 次, want 1", got)
 	}
 	if first.QuotaError == "" || second.QuotaError == "" {
 		t.Fatalf("额度失败未展示 quota_error: first=%+v second=%+v", first, second)

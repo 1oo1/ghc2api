@@ -11,9 +11,13 @@ import (
 	"time"
 )
 
-// quotaCacheTTL 是额度的自动刷新间隔（2 小时）：距上次尝试不足该时长时不重复请求上游；
-// 控制台的「刷新额度」（POST quota/refresh）为强制刷新，不受该间隔限制。
-const quotaCacheTTL = 2 * time.Hour
+// quotaRefreshTick 是后台刷新的检查间隔（见 RunQuotaRefresh）：每次检查都按各账号的 checkedAt 与刷新间隔决定是否请求上游。
+// 声明为变量以便测试临时缩短，实现中不得改为常量。
+var quotaRefreshTick = time.Minute
+
+// quotaErrorRefreshInterval 是请求失败后异步强制刷新额度的节流间隔：距上次尝试不足该时长时不再触发（见 refreshAfterError）。
+// 声明为变量以便测试临时修改，实现中不得改为常量。
+var quotaErrorRefreshInterval = time.Minute
 
 // maxQuotaResetSeconds 是重置时间戳的上限（公元 10000 年），超过则视为无效。
 const maxQuotaResetSeconds = 253402300800
@@ -250,14 +254,16 @@ func (s *Service) fetchQuota(ctx context.Context) (Quota, error) {
 }
 
 // quotaCache 保存账号最近一次的额度结果，由 poolAccount 持有。每次刷新后写入账号缓存目录的 quota.json，
-// 新建账号时从该文件恢复（见 restoreQuota），因此重启后仍遵守 quotaCacheTTL 的节流。
+// 新建账号时从该文件恢复（见 restoreQuota），因此重启后仍遵守刷新间隔的节流。
 type quotaCache struct {
 	mu        sync.Mutex
 	data      *Quota    // 最近一次成功获取的额度；限流时保留旧值并标记 Stale
-	checkedAt time.Time // 最近一次尝试（成功或失败）的时间，用于 quotaCacheTTL 内不重复请求
+	checkedAt time.Time // 最近一次尝试（成功或失败）的时间，用于刷新间隔内不重复请求
 	errText   string    // 最近一次刷新失败的说明（不含 token）；成功后清空
 	// retry 为 true 表示上一次刷新被调用方取消，它不算一次尝试，因此下一次列表刷新不受节流限制。
 	retry bool
+	// refreshing 为 true 表示请求失败后的异步刷新正在进行，同一账号同时只保留一个（见 refreshAfterError）。
+	refreshing bool
 }
 
 // quotaFile 是 quota.json 的内容，字段名固定：额度（无数据时省略）、最近一次尝试的时间与失败说明（无错误时省略）。
@@ -319,12 +325,13 @@ func (a *poolAccount) saveQuotaLocked(ctx context.Context) {
 	}
 }
 
-// refresh 刷新账号额度。force 为 false 时，距上次尝试不足 quotaCacheTTL 则直接返回。
+// refresh 刷新账号额度。force 为 false 时，距上次尝试不足账号的刷新间隔（Service.quotaRefreshInterval）则直接返回。
 // 限流（429）保留旧数据并标记 Stale，不视为错误；其他错误保留旧数据并返回错误，由调用方决定如何展示。
 // 每次有结果的刷新（成功、限流或其他错误）后都写入 quota.json；调用方取消时不写入。
 func (a *poolAccount) refresh(ctx context.Context, force bool) error {
 	a.quota.mu.Lock()
-	fresh := !force && !a.quota.retry && !a.quota.checkedAt.IsZero() && time.Since(a.quota.checkedAt) < quotaCacheTTL
+	fresh := !force && !a.quota.retry && !a.quota.checkedAt.IsZero() &&
+		time.Since(a.quota.checkedAt) < a.service.quotaRefreshInterval
 	a.quota.mu.Unlock()
 	if fresh {
 		return nil
@@ -372,4 +379,44 @@ func (a *poolAccount) quotaErrorText(err error) string {
 		return errQuotaTimeout.Error()
 	}
 	return a.service.redactString(err.Error())
+}
+
+// refreshAfterError 在账号请求失败（非 429）后异步强制刷新额度，不阻塞响应。
+// 同一账号已有刷新进行中，或距上次尝试不足 quotaErrorRefreshInterval 时不触发。
+// 刷新使用独立于请求的 context（总超时 quotaRefreshTimeout），客户端断开不影响它；结果照常写入缓存与 quota.json。
+func (a *poolAccount) refreshAfterError() {
+	a.quota.mu.Lock()
+	if a.quota.refreshing || time.Since(a.quota.checkedAt) < quotaErrorRefreshInterval {
+		a.quota.mu.Unlock()
+		return
+	}
+	a.quota.refreshing = true
+	a.quota.mu.Unlock()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), quotaRefreshTimeout)
+		defer cancel()
+		// 错误已经写入 quota_error 并落盘，这里无需再处理返回值。
+		_ = a.refresh(ctx, true)
+		a.quota.mu.Lock()
+		a.quota.refreshing = false
+		a.quota.mu.Unlock()
+	}()
+}
+
+// RunQuotaRefresh 在后台刷新全部账号（含禁用账号）的额度，阻塞直到 ctx 取消。
+// 启动时立即刷新一轮，之后每隔 quotaRefreshTick 刷新一轮；每轮都重新取账号快照，因此运行期间新增的账号同样被刷新。
+// 刷新是非强制的：距上次尝试不足刷新间隔的账号不请求上游，启动时从缓存恢复的 checked_at 同样生效。
+func (p *Pool) RunQuotaRefresh(ctx context.Context) {
+	ticker := time.NewTicker(quotaRefreshTick)
+	defer ticker.Stop()
+	for {
+		roundCtx, cancel := context.WithTimeout(ctx, quotaRefreshTimeout)
+		refreshQuotas(roundCtx, p.accountsSnapshot())
+		cancel()
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }

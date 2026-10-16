@@ -96,6 +96,11 @@ func serve(ctx context.Context, config appConfig, logger *slog.Logger) error {
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	logger.InfoContext(ctx, "HTTP 服务开始监听", "addr", listener.Addr().String())
+	// 后台额度刷新与 HTTP 服务并行运行：退出信号会取消它，serve 返回时也通过 stopRefresh 取消（异常退出时 ctx 未取消）。
+	// 它不参与 HTTP 关闭等待，也与会话亲和的保存互不影响。
+	refreshCtx, stopRefresh := context.WithCancel(ctx)
+	defer stopRefresh()
+	go pool.RunQuotaRefresh(refreshCtx)
 	// 无论因退出信号还是异常退出，都要等 HTTP 服务关闭（无在途请求）之后再保存会话亲和。
 	defer saveSessionAffinity(pool, config.SessionAffinity, logger)
 	select {

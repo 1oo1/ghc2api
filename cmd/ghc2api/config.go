@@ -24,6 +24,8 @@ const (
 	defaultLogBackups   = 5
 	maxLogMaxSizeMB     = 1 << 20
 	maxLogBackups       = 100
+	// minQuotaRefreshInterval 是 quota_refresh_interval 的下限，避免过于频繁地请求 GitHub 额度接口。
+	minQuotaRefreshInterval = time.Minute
 )
 
 type appConfig struct {
@@ -36,6 +38,9 @@ type appConfig struct {
 	LogLevel            string        `yaml:"log_level"`
 	ModelsCacheTTLValue string        `yaml:"models_cache_ttl"`
 	ModelsCacheTTL      time.Duration `yaml:"-"`
+	// QuotaRefreshIntervalValue 保留原值，解析与校验见 loadConfig。
+	QuotaRefreshIntervalValue string        `yaml:"quota_refresh_interval"`
+	QuotaRefreshInterval      time.Duration `yaml:"-"`
 	// SessionAffinityValue 保留原值以区分缺省（默认开启）与显式关闭。
 	SessionAffinityValue    *bool         `yaml:"session_affinity"`
 	SessionAffinityTTLValue string        `yaml:"session_affinity_ttl"`
@@ -175,6 +180,14 @@ func loadConfig(path string) (appConfig, error) {
 		}
 		config.ModelsCacheTTL = ttl
 	}
+	config.QuotaRefreshInterval = copilot.DefaultQuotaRefreshInterval
+	if value := strings.TrimSpace(config.QuotaRefreshIntervalValue); value != "" {
+		interval, err := time.ParseDuration(value)
+		if err != nil || interval < minQuotaRefreshInterval {
+			return appConfig{}, fmt.Errorf("无效的 quota_refresh_interval %q，必须是不小于 1m 的 Go duration（例如 1h）", value)
+		}
+		config.QuotaRefreshInterval = interval
+	}
 	if err := validateListen(config.Listen, config.APIKey); err != nil {
 		return appConfig{}, err
 	}
@@ -210,8 +223,8 @@ func (c appConfig) poolConfig(logger *slog.Logger) copilot.PoolConfig {
 	return copilot.PoolConfig{
 		APIKey: c.APIKey, ManagementKey: c.ManagementKey,
 		CredentialsDir: filepath.Join(c.DataPath, credentialsDirName), CacheDir: c.CacheDir,
-		Host: c.Host, ModelsCacheTTL: c.ModelsCacheTTL, SessionAffinityTTL: affinityTTL,
-		Logger: logger,
+		Host: c.Host, ModelsCacheTTL: c.ModelsCacheTTL, QuotaRefreshInterval: c.QuotaRefreshInterval,
+		SessionAffinityTTL: affinityTTL, Logger: logger,
 	}
 }
 

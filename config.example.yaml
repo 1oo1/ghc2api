@@ -52,4 +52,9 @@ log_max_backups: 5
 # 模型列表缓存有效期，使用 Go duration 格式；必须大于 0，默认 2h。
 models_cache_ttl: "2h"
 
+# 额度刷新间隔，使用 Go duration 格式；必须不小于 1m，默认 1h。
+# 服务运行期间后台每分钟检查一次，距上次尝试已达到该间隔的账号会刷新额度（无需打开控制台）。
+# 请求失败（非 429）时也会异步刷新该账号的额度，见 docs/quota-stats.md。
+quota_refresh_interval: "1h"
+
 # 配置文件不保存凭证值；仍建议将实际 config.yaml 权限设为 0600（chmod 600）。

@@ -21,15 +21,16 @@ const AccountCooldown = time.Minute
 
 // PoolConfig 是账号池的服务级配置，账号无关的设置都放在这里。
 type PoolConfig struct {
-	APIKey             string        // 客户端访问密钥，空表示不鉴权
-	ManagementKey      string        // 管理密钥；空表示禁用管理接口和控制台（对应路径按普通 404 处理）
-	CredentialsDir     string        // 管理接口新增/删除/禁用账号时读写凭证文件的目录
-	Host               string        // 顶层 host 覆盖；非空时新增账号与设备登录都使用它
-	CacheDir           string        // 缓存根目录；各账号 Service 在其下按账号哈希分子目录（测试必须指向 t.TempDir()）
-	ModelsCacheTTL     time.Duration // 非正值使用默认的模型列表缓存有效期
-	SessionAffinityTTL time.Duration // <=0 表示关闭会话亲和（不创建绑定表）
-	Client             *http.Client  // 访问 GitHub/Copilot 的客户端（测试注入），新增账号与设备登录也使用它
-	Logger             *slog.Logger
+	APIKey               string        // 客户端访问密钥，空表示不鉴权
+	ManagementKey        string        // 管理密钥；空表示禁用管理接口和控制台（对应路径按普通 404 处理）
+	CredentialsDir       string        // 管理接口新增/删除/禁用账号时读写凭证文件的目录
+	Host                 string        // 顶层 host 覆盖；非空时新增账号与设备登录都使用它
+	CacheDir             string        // 缓存根目录；各账号 Service 在其下按账号哈希分子目录（测试必须指向 t.TempDir()）
+	ModelsCacheTTL       time.Duration // 非正值使用默认的模型列表缓存有效期
+	QuotaRefreshInterval time.Duration // 非正值使用默认的额度刷新间隔（DefaultQuotaRefreshInterval）
+	SessionAffinityTTL   time.Duration // <=0 表示关闭会话亲和（不创建绑定表）
+	Client               *http.Client  // 访问 GitHub/Copilot 的客户端（测试注入），新增账号与设备登录也使用它
+	Logger               *slog.Logger
 }
 
 // PoolAccount 是启动时载入的一个账号。
@@ -135,7 +136,7 @@ func NewManagedPool(config PoolConfig, accounts []PoolAccount) (*Pool, error) {
 		err := p.addConfigured(i+1, Config{
 			Token: account.Token, Host: account.Host, User: user, APIKey: p.apiKey,
 			CacheDir: config.CacheDir, ModelsCacheTTL: config.ModelsCacheTTL,
-			Client: config.Client, Logger: p.logger,
+			QuotaRefreshInterval: config.QuotaRefreshInterval, Client: config.Client, Logger: p.logger,
 		}, account.Disabled, account.Priority)
 		if err != nil {
 			return nil, err
@@ -287,6 +288,9 @@ func (p *Pool) forward(w http.ResponseWriter, r *http.Request, key string) {
 			}
 			account.service.setCooldown(time.Now().Add(AccountCooldown))
 			account.service.log(ctx, slog.LevelWarn, "账号会话获取失败", "error", err, "cooldown", AccountCooldown.String())
+			if !isUpstreamRateLimit(err) {
+				account.refreshAfterError()
+			}
 			continue
 		}
 		p.bind(ctx, key, account)
@@ -307,7 +311,8 @@ func (p *Pool) serve(w http.ResponseWriter, r *http.Request, account *poolAccoun
 }
 
 // track 记录账号处理了一次请求：请求数加 1，最近使用时间更新；响应状态 >= 400 时失败数加 1。
-// 客户端已取消（reqCtx 为 context.Canceled）时的失败并非账号的问题，不计入失败数；账号也不会因此冷却。
+// 客户端已取消（reqCtx 为 context.Canceled）时的失败并非账号的问题，不计入失败数；账号也不会因此冷却，且不触发额度刷新。
+// 非 429 的失败会异步刷新该账号额度（见 refreshAfterError）；429 是限流，由冷却处理，不刷新。
 func (a *poolAccount) track(reqCtx context.Context, w http.ResponseWriter, handle func(http.ResponseWriter)) {
 	a.requests.Add(1)
 	a.lastUsed.Store(time.Now().UnixNano())
@@ -315,6 +320,9 @@ func (a *poolAccount) track(reqCtx context.Context, w http.ResponseWriter, handl
 	handle(writer)
 	if writer.status >= http.StatusBadRequest && !errors.Is(reqCtx.Err(), context.Canceled) {
 		a.failures.Add(1)
+		if writer.status != http.StatusTooManyRequests {
+			a.refreshAfterError()
+		}
 	}
 }
 
@@ -340,7 +348,7 @@ func (p *Pool) bind(ctx context.Context, key string, account *poolAccount) {
 	}
 }
 
-// writeNoAccount 在没有任何可选账号（0 个或全部禁用）时返回 503。
+// writeNoAccount 在没有任何可选账号（0 个、全部禁用或全部耗尽）时返回 503。
 func writeNoAccount(w http.ResponseWriter) {
 	writeError(w, http.StatusServiceUnavailable, "没有可用的 GitHub Copilot 账号")
 }
@@ -382,7 +390,7 @@ func (p *Pool) services() []*Service {
 	return services
 }
 
-// choose 选择处理本次请求的账号。会话键已绑定且该账号仍可用（未禁用、未冷却、本请求未尝试过）时优先使用它；
+// choose 选择处理本次请求的账号。会话键已绑定且该账号仍可用（未禁用、未冷却、未耗尽、本请求未尝试过）时优先使用它；
 // 否则按 pickLocked 的排序选择最优账号。没有候选时返回 nil。
 func (p *Pool) choose(key string, tried map[*poolAccount]bool) *poolAccount {
 	p.mu.Lock()
@@ -391,7 +399,7 @@ func (p *Pool) choose(key string, tried map[*poolAccount]bool) *poolAccount {
 	if key != "" && p.affinity != nil {
 		if id, ok := p.affinity.lookup(key, now); ok {
 			if account := p.findLocked(id); account != nil && !account.disabled &&
-				!tried[account] && account.service.available(now) {
+				!tried[account] && account.service.available(now) && !account.exhausted(now) {
 				return account
 			}
 		}
@@ -439,13 +447,13 @@ func (k selectKey) before(o selectKey) bool {
 	return k.file < o.file
 }
 
-// pickLocked 选出本次应使用的账号，调用方须持有 p.mu。候选为未禁用且未被 tried 排除的账号，
-// 按 selectKey 排序取最优者。冷却中的账号排在未冷却账号之后，只有没有未冷却候选时才会被选中。没有候选时返回 nil。
+// pickLocked 选出本次应使用的账号，调用方须持有 p.mu。候选为未禁用、未耗尽（见 poolAccount.exhausted）且未被 tried 排除的账号，
+// 按 selectKey 排序取最优者。冷却中的账号排在未冷却账号之后，只有没有未冷却候选时才会被选中。没有候选（包括全部耗尽）时返回 nil。
 func (p *Pool) pickLocked(now time.Time, tried map[*poolAccount]bool) *poolAccount {
 	var best *poolAccount
 	var bestKey selectKey
 	for _, a := range p.accounts {
-		if a.disabled || tried[a] {
+		if a.disabled || tried[a] || a.exhausted(now) {
 			continue
 		}
 		key := keyOf(a, now)

@@ -30,6 +30,8 @@ type Service struct {
 
 	cacheDir       string
 	modelsCacheTTL time.Duration
+	// quotaRefreshInterval 是额度非强制刷新的节流窗口（见 quota.go 的 refresh）。
+	quotaRefreshInterval time.Duration
 	// cacheMu 串行化缓存写入与账号删除，cacheRemoved 为账号已删除的标记（见 writeCache、removeCache）。
 	cacheMu      sync.RWMutex
 	cacheRemoved bool
@@ -85,10 +87,14 @@ func New(config Config) (*Service, error) {
 	if modelsCacheTTL <= 0 {
 		modelsCacheTTL = DefaultModelsCacheTTL
 	}
+	quotaRefreshInterval := config.QuotaRefreshInterval
+	if quotaRefreshInterval <= 0 {
+		quotaRefreshInterval = DefaultQuotaRefreshInterval
+	}
 	service := &Service{
 		config: config, client: safeClient(config.Client), refused: make(map[string]time.Time),
 		logger: config.Logger, secrets: make(map[string]struct{}),
-		cacheDir: cacheDir, modelsCacheTTL: modelsCacheTTL,
+		cacheDir: cacheDir, modelsCacheTTL: modelsCacheTTL, quotaRefreshInterval: quotaRefreshInterval,
 		sessionMu: make(contextMutex, 1), modelsMu: make(contextMutex, 1), autoMu: make(contextMutex, 1),
 	}
 	service.addSecret(config.Token)
@@ -198,6 +204,12 @@ type upstreamError struct {
 
 func (e *upstreamError) Error() string {
 	return fmt.Sprintf("上游请求失败（HTTP %d）", e.status)
+}
+
+// isUpstreamRateLimit 报告错误是否为上游返回的 429（限流）。
+func isUpstreamRateLimit(err error) bool {
+	var upstream *upstreamError
+	return errors.As(err, &upstream) && upstream.status == http.StatusTooManyRequests
 }
 
 func (s *Service) handleError(ctx context.Context, w http.ResponseWriter, err error) {

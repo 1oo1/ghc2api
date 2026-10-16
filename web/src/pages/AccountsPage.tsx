@@ -37,7 +37,7 @@ export function AccountsPage({
   return (
     <>
       <div className="toolbar">
-        <p>额度数据来自 GitHub，每 2 小时自动更新，点击「刷新额度」可立即刷新；账号列表每 15 秒自动刷新。</p>
+        <p>额度数据来自 GitHub，由服务端按配置的间隔（默认 1 小时）在后台自动更新，点击「刷新额度」可立即刷新；账号列表每 15 秒自动刷新。</p>
         <div>
           <label className="button">
             导入凭证 JSON
