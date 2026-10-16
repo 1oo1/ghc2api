@@ -22,7 +22,7 @@ func priorityAccount(user string, priority int) PoolAccount {
 // client 为 nil 时池不会访问上游，只用于测试 choose；需要请求上游时传入测试客户端。
 func newPriorityPool(t *testing.T, client *http.Client, accounts ...PoolAccount) *Pool {
 	t.Helper()
-	p, err := NewManagedPool(PoolConfig{CacheDir: t.TempDir(), Client: client}, accounts)
+	p, err := NewManagedPool(PoolConfig{APIKey: testAPIKey, CacheDir: t.TempDir(), Client: client}, accounts)
 	if err != nil {
 		t.Fatal(err)
 	}

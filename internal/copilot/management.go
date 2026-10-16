@@ -47,7 +47,11 @@ type AccountView struct {
 	QuotaError string `json:"quota_error,omitempty"`
 }
 
-// newManagementHandler 注册管理路由。控制台页面无需鉴权，其余接口要求 Authorization: Bearer <管理密钥>。
+// managementAPIPrefix 是需要管理密钥的接口路径前缀；控制台页面 /management 不需要鉴权。
+const managementAPIPrefix = "/v0/management/"
+
+// newManagementHandler 注册管理路由。控制台页面无需鉴权，managementAPIPrefix 下的接口要求 Authorization: Bearer <管理密钥>。
+// 鉴权位于请求日志之外：未通过鉴权的请求只输出鉴权告警；其余请求（包括 ServeMux 自身产生的 405、404 与路径清理重定向）都输出请求日志。
 func (p *Pool) newManagementHandler() http.Handler {
 	api := http.NewServeMux()
 	api.HandleFunc("GET /v0/management/accounts", p.handleListAccounts)
@@ -60,22 +64,28 @@ func (p *Pool) newManagementHandler() http.Handler {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /management", serveConsole)
-	mux.Handle("/v0/management/", requireManagementKey(p.config.ManagementKey, p.log, api))
-	return mux
+	mux.Handle(managementAPIPrefix, api)
+	return requireManagementKey(p.config.ManagementKey, p.log, withRequestLog(p.log, mux))
 }
 
-// isManagementPath 报告路径是否属于管理接口（控制台页面或 /v0/management/ 下的接口）。
+// isManagementPath 报告路径是否属于管理接口（控制台页面或 managementAPIPrefix 下的接口）。
 func isManagementPath(path string) bool {
-	return path == "/management" || strings.HasPrefix(path, "/v0/management/")
+	return path == "/management" || strings.HasPrefix(path, managementAPIPrefix)
 }
 
-// requireManagementKey 校验管理密钥。只接受 Authorization: Bearer，不接受 X-Api-Key，
-// 因此服务访问密钥无法用来访问管理接口。
+// requireManagementKey 校验管理接口的管理密钥，只作用于 managementAPIPrefix 下的路径，其他路径直接交给 next。
+// 只接受 Authorization: Bearer，不接受 X-Api-Key，因此服务访问密钥无法用来访问管理接口。
+// 校验在 next（含请求日志）之外，因此路径清理等 ServeMux 行为不会绕过它。
+// key 为空时拒绝所有管理接口请求（空密钥与 "Bearer " 后的空值哈希相同，不能交给 secretMatches）。
 func requireManagementKey(key string, logf logFunc, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, managementAPIPrefix) {
+			next.ServeHTTP(w, r)
+			return
+		}
 		value, found := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if !found || !secretMatches(key, value) {
-			logf(r.Context(), slog.LevelWarn, "管理接口鉴权失败", "method", r.Method, "path", r.URL.Path)
+		if key == "" || !found || !secretMatches(key, value) {
+			logAuthFailure(logf, r, "管理接口鉴权失败")
 			writeError(w, http.StatusUnauthorized, "管理密钥无效或缺失")
 			return
 		}

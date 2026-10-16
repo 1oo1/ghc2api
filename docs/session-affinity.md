@@ -6,7 +6,7 @@
 
 ## 适用范围
 
-只对 POST 生成请求（chat completions、responses、`/v1/messages`）生效；模型列表不使用。未配置 `api_key` 时同样生效。
+只对 POST 生成请求（chat completions、responses、`/v1/messages`）生效；模型列表不使用。生成请求的 `api_key` 必填且已通过鉴权，会话键的 `clientKey` 取自请求头（`Authorization: Bearer` 优先，否则 `X-Api-Key`）；请求已通过鉴权，因此它总是非空。
 
 ## 会话键
 
@@ -19,6 +19,8 @@
   3. 兜底：`model` + 第一条 user 消息文本（content 为字符串或按序拼接的 `type=text` 片段；Responses 的 `input` 为字符串或 `input[]` 第一条 user 项）。无 user 消息则无信号。兜底与 Claude 会话信号的编码互不混淆。
 - 无信号或非法 JSON 返回 `""`：不使用亲和、不绑定。
 - 内容兜底只看第一条 user 消息，开头相同的不同会话会落到同一账号，只影响缓存命中，不影响正确性。
+- `messages`（或 `input[]`）中的非对象元素（数字等）被跳过，不影响第一条 user 消息的查找。
+- 字段类型错误的消息或内容块整项按无效处理并跳过（已接受的语义变化）：`role` 不是字符串的消息不算 user 消息，`text` 或 `type` 类型错误的内容块不计入文本，其余项照常参与查找。与按通用 JSON 解析的旧实现相比，这会改变兜底信号的取值（见 `http-api.md`「上游请求头与消息解析」）。
 - Pool 选账号前读取请求体（≤16 MiB）并原样还给下游；超限时不计算键，下游仍返回原有 413。
 
 ## 选择规则

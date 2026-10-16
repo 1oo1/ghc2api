@@ -13,9 +13,10 @@ NewPool(configs []Config) (*Pool, error)   // 亲和与管理关闭，至少 1 �
 NewManagedPool(PoolConfig, []PoolAccount) (*Pool, error)
 ```
 
-- `PoolConfig`：`APIKey`、`ManagementKey`、`CredentialsDir`、`Host`（顶层覆盖）、`CacheDir`（测试须指向 `t.TempDir()`）、`ModelsCacheTTL`、`SessionAffinityTTL`（≤0 关闭亲和）、`SessionAffinityMaxPerAccount`（每账号有效绑定数上限，≤0 不限制；缺省 5 由 cmd 层设置，见 `session-affinity.md`）、`Client`（测试注入）、`Logger`。
+- `PoolConfig`：`APIKey`、`ManagementKey`、`CredentialsDir`、`Host`（顶层覆盖）、`CacheDir`（测试须指向 `t.TempDir()`）、`ModelsCacheTTL`、`SessionAffinityTTL`（≤0 关闭亲和）、`SessionAffinityMaxPerAccount`（每账号有效绑定数上限，≤0 不限制；缺省 5 由 cmd 层设置，见 `session-affinity.md`）、`MaxConcurrentRequests`（生成请求并发上限，≤0 不限制；缺省 32 由 cmd 层设置，见下文「分发」流程）、`Client`（测试注入）、`Logger`。
+- `APIKey` 必填（失败即拒绝）：`New`、`NewPool`、`NewManagedPool` 在 `APIKey` 去首尾空白后为空时返回错误；`requireAPIKey` 收到空密钥时拒绝除 `/healthz`、`/favicon.ico` 外的所有请求，`requireManagementKey` 收到空管理密钥时同样拒绝（空密钥与空请求头的哈希相同，不能交给 `secretMatches` 比较）。库层只要求非空，32 字节的长度下限由 cmd 配置层（`loadConfig`）强制。
 - `PoolAccount`：`Token`、`Host`、`User`（必填）、`Disabled`、`Priority`。
-- `NewManagedPool`：仅 `ManagementKey` 非空时允许 0 账号；账号重复（Host+Token 相同）或用户名忽略大小写重复、`ManagementKey` 与 `APIKey`（去首尾空白）相同、用户名不合规，均返回错误。
+- `NewManagedPool`：`APIKey` 为空时返回错误；仅 `ManagementKey` 非空时允许 0 账号；账号重复（Host+Token 相同）或用户名忽略大小写重复、`ManagementKey` 与 `APIKey`（去首尾空白）相同、用户名不合规，均返回错误。
 
 ## 流程图
 
@@ -25,7 +26,9 @@ NewManagedPool(PoolConfig, []PoolAccount) (*Pool, error)
 flowchart TD
     A["业务请求（已通过 api_key 鉴权）"] --> B{"routeOf：需要访问上游？"}
     B -- "否：healthz / 404 / 405 / 重定向" --> B1["idle 路由直接处理<br/>不选账号，0 账号也可用"]
-    B -- 是 --> C["affinityKey：计算会话键<br/>仅生成请求且开启亲和；请求体 ≤16 MiB<br/>否则 key 为空"]
+    B -- 是 --> B2{"生成接口（登记了 upstream）？<br/>占用并发名额 MaxConcurrentRequests"}
+    B2 -- "名额已满" --> B3["503 生成请求并发数已达上限<br/>不读取请求体、不选账号、不访问上游"]
+    B2 -- "非生成接口，或占用成功" --> C["affinityKey：计算会话键<br/>仅生成请求且开启亲和；请求体 ≤16 MiB<br/>否则 key 为空"]
     C --> D["tried = 空集"]
     D --> E["choose(key, tried)"]
     E --> F{"key 非空、开启亲和且已绑定，<br/>绑定账号存在、未禁用、未冷却、<br/>未耗尽、本请求未尝试？"}
@@ -53,6 +56,9 @@ flowchart TD
     R -- "其他 ≥400" --> R2["失败数 +1，异步刷新额度<br/>（客户端取消时不计数、不刷新）"]
     R -- "成功" --> R3["结束"]
 ```
+
+生成请求占用的并发名额在 `dispatch` 返回时释放（流式响应写完之后），因此名额覆盖整个流式响应的时长。名额只用缓冲 channel 做信号量，不排队等待；名额已满时立即 503，与账号选择、会话亲和互不影响。
+生成响应向客户端写入时每次写入都续期 60 秒的写超时（`generationWriteTimeout`，见 `http-api.md`）：客户端长时间不读取导致写超时后，请求结束并释放名额，因此一个不读取响应的客户端不会永久占用名额。
 
 ### 候选过滤、分档与轮询（`pickLocked`）
 
@@ -112,4 +118,4 @@ flowchart TD
 
 ## 测试依赖的内部名字
 
-`Pool.accounts`、`pickLocked(now, tried map[*poolAccount]bool)`、`(*Pool).choose(key string, tried map[*poolAccount]bool)`、`(quotaWeight).swrrWeight() int`、`DefaultSessionAffinityMaxPerAccount`、`PoolConfig.SessionAffinityMaxPerAccount`、`(*affinityTable).activeCounts(time.Time) map[string]int`、`MinPriority`/`MaxPriority`、`quotaWeight`/`weigh(*Quota)`、`exhaustedUntil(*Quota)`、`(*poolAccount).exhausted(time.Time) bool`、`(*Service).setCooldown(time.Time)`/`available(time.Time) bool`、`(*Pool).findAccount(id)`（忽略大小写）、`(*Service).cacheDir`、`(*Pool).Handler()`；额度刷新相关的 `DefaultQuotaRefreshInterval`、`(*Service).quotaRefreshInterval`、`quotaRefreshTick`、`quotaErrorRefreshInterval`、`quotaRefreshTimeout`、`(*Pool).RunQuotaRefresh(ctx)`、`(*poolAccount).refreshAfterError()`、`quotaCache.refreshing`；测试辅助 `testClient`、`testJSON`、`testService`、`testDevice`（login_test.go）、`poolUpstream`（pool_test.go）、`quotaTimeoutMessage`（management_review_test.go）。其余名字见 `session-affinity.md`、`quota-stats.md`、`management.md`。
+`Pool.accounts`、`pickLocked(now, tried map[*poolAccount]bool)`、`(*Pool).choose(key string, tried map[*poolAccount]bool)`、`(quotaWeight).swrrWeight() int`、`DefaultSessionAffinityMaxPerAccount`、`PoolConfig.SessionAffinityMaxPerAccount`、`(*affinityTable).activeCounts(time.Time) map[string]int`、`MinPriority`/`MaxPriority`、`quotaWeight`/`weigh(*Quota)`、`exhaustedUntil(*Quota)`、`(*poolAccount).exhausted(time.Time) bool`、`(*Service).setCooldown(time.Time)`/`available(time.Time) bool`、`(*Pool).findAccount(id)`（忽略大小写）、`(*Service).cacheDir`、`(*Pool).Handler()`、`generationWriteTimeout`；额度刷新相关的 `DefaultQuotaRefreshInterval`、`(*Service).quotaRefreshInterval`、`quotaRefreshTick`、`quotaErrorRefreshInterval`、`quotaRefreshTimeout`、`(*Pool).RunQuotaRefresh(ctx)`、`(*poolAccount).refreshAfterError()`、`quotaCache.refreshing`；测试辅助 `testClient`、`testJSON`、`testService`、`testDevice`（login_test.go）、`poolUpstream`（pool_test.go）、`quotaTimeoutMessage`（management_review_test.go）。其余名字见 `session-affinity.md`、`quota-stats.md`、`management.md`。

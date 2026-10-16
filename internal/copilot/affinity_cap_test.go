@@ -88,6 +88,7 @@ func TestAffinityActiveCountsFollowsRebinding(t *testing.T) {
 func newCapPool(t *testing.T, limit int, accounts ...PoolAccount) *Pool {
 	t.Helper()
 	p, err := NewManagedPool(PoolConfig{
+		APIKey:   testAPIKey,
 		CacheDir: t.TempDir(), SessionAffinityTTL: DefaultSessionAffinityTTL, SessionAffinityMaxPerAccount: limit,
 	}, accounts)
 	if err != nil {
@@ -230,6 +231,7 @@ func TestCapZeroMeansUnlimited(t *testing.T) {
 // 结果与轮询一致（alice、bob），也不会访问不存在的绑定表。
 func TestCapHasNoEffectWhenAffinityDisabled(t *testing.T) {
 	p, err := NewManagedPool(PoolConfig{
+		APIKey:   testAPIKey,
 		CacheDir: t.TempDir(), SessionAffinityTTL: 0, SessionAffinityMaxPerAccount: 1,
 	}, []PoolAccount{priorityAccount("alice", 0), priorityAccount("bob", 0)})
 	if err != nil {
@@ -249,6 +251,7 @@ func TestCapHasNoEffectWhenAffinityDisabled(t *testing.T) {
 func TestCapHTTPSpreadsNewSessionsAcrossAccounts(t *testing.T) {
 	up := newPoolUpstream(t)
 	p, err := NewManagedPool(PoolConfig{
+		APIKey:   testAPIKey,
 		CacheDir: t.TempDir(), Client: up.client(), SessionAffinityTTL: DefaultSessionAffinityTTL, SessionAffinityMaxPerAccount: 1,
 	}, []PoolAccount{priorityAccount("alice", 0), priorityAccount("bob", 0)})
 	if err != nil {

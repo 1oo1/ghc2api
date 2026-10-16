@@ -41,11 +41,15 @@ func validateCredential(c Credential) (Credential, error) {
 	if err := checkPriority(c.Priority); err != nil {
 		return Credential{}, err
 	}
-	config, err := New(Config{Token: c.Token, Host: c.Host})
+	token := strings.TrimSpace(c.Token)
+	if token == "" {
+		return Credential{}, errors.New("缺少 GitHub OAuth token")
+	}
+	host, err := NormalizeHost(c.Host)
 	if err != nil {
 		return Credential{}, err
 	}
-	c.Token, c.Host = config.config.Token, config.config.Host
+	c.Token, c.Host = token, host
 	return c, nil
 }
 

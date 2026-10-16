@@ -97,6 +97,7 @@ func newAddFixture(t *testing.T, gate *addQuotaGate) *addFixture {
 	f := &addFixture{up: up, gate: gate, dir: t.TempDir()}
 	client := newAddClient(t, f)
 	p, err := NewManagedPool(PoolConfig{
+		APIKey:        testAPIKey,
 		ManagementKey: mgmtKey, CredentialsDir: f.dir, CacheDir: t.TempDir(), Client: client,
 	}, nil)
 	if err != nil {

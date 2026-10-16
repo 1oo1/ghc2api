@@ -133,7 +133,7 @@ func quotaGenerateAsync(p *Pool, ctx context.Context) <-chan *httptest.ResponseR
 		r := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(poolChatBody)).WithContext(ctx)
 		r.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
-		p.Handler().ServeHTTP(w, r)
+		withTestAPIKey(p.Handler()).ServeHTTP(w, r)
 		done <- w
 	}()
 	return done
@@ -231,7 +231,8 @@ func TestQuotaRefreshIntervalFromConfig(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			up := newMgmtUpstream(t)
 			service := testService(t, Config{
-				Token: "oauth-alice", User: "alice", Client: up.client, QuotaRefreshInterval: tc.interval,
+				APIKey: testAPIKey,
+				Token:  "oauth-alice", User: "alice", Client: up.client, QuotaRefreshInterval: tc.interval,
 			})
 			assertQuotaIntervalGovernsRefresh(t, newPoolAccount(service, "alice"), up, "oauth-alice", tc.want)
 		})
@@ -244,6 +245,7 @@ func TestQuotaRefreshIntervalFromPoolConfig(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			up := newMgmtUpstream(t)
 			p, err := NewManagedPool(PoolConfig{
+				APIKey:   testAPIKey,
 				CacheDir: t.TempDir(), Client: up.client, QuotaRefreshInterval: tc.interval,
 			}, []PoolAccount{priorityAccount("alice", 0)})
 			if err != nil {
@@ -313,7 +315,7 @@ func TestRunQuotaRefreshStartupHonoursRestoredCheckedAt(t *testing.T) {
 			up := newMgmtUpstream(t)
 			cacheRoot := t.TempDir()
 			// 先按账号的缓存目录写入 quota.json，再创建池，使账号创建时从缓存恢复 checked_at。
-			seed, err := New(Config{Token: "oauth-alice", CacheDir: cacheRoot})
+			seed, err := New(Config{APIKey: testAPIKey, Token: "oauth-alice", CacheDir: cacheRoot})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -323,7 +325,7 @@ func TestRunQuotaRefreshStartupHonoursRestoredCheckedAt(t *testing.T) {
 				ObservedAt:   checkedAt,
 			}
 			persistWriteQuota(t, seed.cacheDir, &restored, checkedAt, "")
-			p, err := NewManagedPool(PoolConfig{CacheDir: cacheRoot, Client: up.client}, []PoolAccount{priorityAccount("alice", 0)})
+			p, err := NewManagedPool(PoolConfig{APIKey: testAPIKey, CacheDir: cacheRoot, Client: up.client}, []PoolAccount{priorityAccount("alice", 0)})
 			if err != nil {
 				t.Fatal(err)
 			}

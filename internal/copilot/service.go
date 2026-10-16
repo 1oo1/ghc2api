@@ -59,6 +59,10 @@ func New(config Config) (*Service, error) {
 	if config.Token == "" {
 		return nil, errors.New("缺少 GitHub OAuth token")
 	}
+	config.APIKey = strings.TrimSpace(config.APIKey)
+	if config.APIKey == "" {
+		return nil, errors.New("缺少服务访问密钥 APIKey")
+	}
 	host, err := NormalizeHost(config.Host)
 	if err != nil {
 		return nil, err
@@ -102,9 +106,9 @@ func New(config Config) (*Service, error) {
 	return service, nil
 }
 
-// Handler 返回原协议 HTTP 接口，不在三种生成协议之间转换。
+// Handler 返回原协议 HTTP 接口，不在三种生成协议之间转换。鉴权在请求日志之外：未通过鉴权的请求不输出请求日志。
 func (s *Service) Handler() http.Handler {
-	return withRequestLog(s.logger, &s.requestSeq, s.log, requireAPIKey(s.config.APIKey, s.log, s.routes().mux))
+	return withRequestID(s.logger, &s.requestSeq, requireAPIKey(s.config.APIKey, s.log, withRequestLog(s.log, s.routes().mux)))
 }
 
 // routeNeed 描述路由访问上游的方式，决定 Pool 如何分发请求。
@@ -157,13 +161,14 @@ func (t serviceRoutes) handle(method, path string, handler http.HandlerFunc, ent
 	t.entries[pattern] = entry
 }
 
-// requireAPIKey 对除 /healthz 外的请求校验服务访问密钥；apiKey 为空时不鉴权。
-// Service 与 Pool 共用此中间件，未通过时记录告警并返回 401。
+// requireAPIKey 对除 /healthz、/favicon.ico 外的请求校验服务访问密钥。apiKey 为空时拒绝所有需鉴权的请求（失败即拒绝），
+// 构造函数也会拒绝空密钥，这里是第二道防线。
+// Service 与 Pool 共用此中间件，未通过时输出鉴权告警（见 logAuthFailure）并返回 401。
 func requireAPIKey(apiKey string, logf logFunc, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		skipped := r.URL.Path == "/healthz" || r.URL.Path == "/favicon.ico"
-		if !skipped && apiKey != "" && !authorizedRequest(apiKey, r) {
-			logf(r.Context(), slog.LevelWarn, "客户端鉴权失败", "method", r.Method, "path", r.URL.Path)
+		if !skipped && !authorizedRequest(apiKey, r) {
+			logAuthFailure(logf, r, "客户端鉴权失败")
 			writeError(w, http.StatusUnauthorized, "服务访问密钥无效或缺失")
 			return
 		}
@@ -172,7 +177,11 @@ func requireAPIKey(apiKey string, logf logFunc, next http.Handler) http.Handler 
 }
 
 // authorizedRequest 检查请求是否携带与 apiKey 相同的 Bearer 或 X-Api-Key 密钥。
+// apiKey 为空时一律返回 false：否则空密钥与缺失的请求头哈希相同，会被当作匹配。
 func authorizedRequest(apiKey string, r *http.Request) bool {
+	if apiKey == "" {
+		return false
+	}
 	bearer := ""
 	if value := r.Header.Get("Authorization"); strings.HasPrefix(value, "Bearer ") {
 		bearer = strings.TrimPrefix(value, "Bearer ")
@@ -306,7 +315,15 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 		writeError(w, http.StatusBadRequest, "请求必须是 JSON 对象，并包含非空字符串 model")
 		return
 	}
+	// 写超时只针对响应写入，因此包装放在读取请求体之后（读取阶段不写响应）。请求结束时不清除截止时间，见 generationWriter。
+	// 注意：http.MaxBytesReader 超限时只有底层 w 实现 requestTooLarge 才会标记关闭连接（net/http 的 *response 实现了它）。
+	// 这里的 w 已被 withRequestLog（Pool 另有 track）包装为 statusResponseWriter，不实现该方法，
+	// 因此 Service 与 Pool 两条路径下超限都只返回 413，不会由 MaxBytesReader 关闭连接。
+	w = newGenerationWriter(w)
 	isAuto := model == "auto"
+	// X-Initiator 与 Copilot-Vision-Request 只取决于客户端的原始请求体，与 Auto 重试无关，因此在循环外只计算一次。
+	xInitiator := initiator(body)
+	vision := hasVision(body)
 	s.log(r.Context(), slog.LevelInfo, "开始处理生成请求", "model", model, "upstream_path", path, "request_bytes", len(body))
 	for attempt := 0; attempt < 3; attempt++ {
 		current, err := s.getSession(r.Context())
@@ -362,8 +379,8 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 		current.setHeaders(req.Header)
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Openai-Intent", "conversation-panel")
-		req.Header.Set("X-Initiator", initiator(body))
-		if hasVision(body) {
+		req.Header.Set("X-Initiator", xInitiator)
+		if vision {
 			req.Header.Set("Copilot-Vision-Request", "true")
 		}
 		if pick.Token != "" {

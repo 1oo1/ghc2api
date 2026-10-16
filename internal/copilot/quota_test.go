@@ -305,7 +305,7 @@ func TestFetchQuotaReadsCopilotUserEndpoint(t *testing.T) {
 		requests <- request{r.URL.Path, r.Header.Get("Authorization")}
 		_, _ = io.WriteString(w, quotaTestIndividualBody)
 	})
-	s := testService(t, Config{Token: "oauth-quota", Client: client})
+	s := testService(t, Config{APIKey: testAPIKey, Token: "oauth-quota", Client: client})
 	before := time.Now()
 	q, err := s.fetchQuota(context.Background())
 	if err != nil {
@@ -329,7 +329,7 @@ func TestFetchQuotaRateLimitedReturnsSentinel(t *testing.T) {
 		w.Header().Set("Retry-After", "120")
 		w.WriteHeader(http.StatusTooManyRequests)
 	})
-	s := testService(t, Config{Token: "oauth-quota", Client: client})
+	s := testService(t, Config{APIKey: testAPIKey, Token: "oauth-quota", Client: client})
 	q, err := s.fetchQuota(context.Background())
 	if !errors.Is(err, errQuotaRateLimited) {
 		t.Fatalf("fetchQuota() error = %v, want errQuotaRateLimited", err)
@@ -347,7 +347,7 @@ func TestFetchQuotaOtherFailuresAreUpstreamErrors(t *testing.T) {
 				w.WriteHeader(status)
 				_, _ = io.WriteString(w, `{"message":"denied"}`)
 			})
-			s := testService(t, Config{Token: "oauth-quota", Client: client})
+			s := testService(t, Config{APIKey: testAPIKey, Token: "oauth-quota", Client: client})
 			_, err := s.fetchQuota(context.Background())
 			var upstream *upstreamError
 			if !errors.As(err, &upstream) || upstream.status != status {
@@ -362,7 +362,7 @@ func TestFetchQuotaOtherFailuresAreUpstreamErrors(t *testing.T) {
 	client := testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "not json")
 	})
-	s := testService(t, Config{Token: "oauth-quota", Client: client})
+	s := testService(t, Config{APIKey: testAPIKey, Token: "oauth-quota", Client: client})
 	if _, err := s.fetchQuota(context.Background()); err == nil {
 		t.Fatal("2xx 但正文不是合法额度时应返回错误")
 	}
@@ -387,7 +387,7 @@ func TestFetchQuotaForbiddenWithRetryAfterIsRateLimited(t *testing.T) {
 				w.WriteHeader(http.StatusForbidden)
 				_, _ = io.WriteString(w, `{"message":"forbidden"}`)
 			})
-			s := testService(t, Config{Token: "oauth-quota", Client: client})
+			s := testService(t, Config{APIKey: testAPIKey, Token: "oauth-quota", Client: client})
 			_, err := s.fetchQuota(context.Background())
 			if tc.wantLimited {
 				if !errors.Is(err, errQuotaRateLimited) {

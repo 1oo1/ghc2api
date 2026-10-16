@@ -15,10 +15,10 @@ import (
 	"time"
 )
 
-// affinityPoolKey 计算经 Pool 发送的 chat 请求（不带客户端密钥）对应的会话键。
+// affinityPoolKey 计算经 poolRequest 发送的 chat 请求（携带 Bearer testAPIKey）对应的会话键。
 func affinityPoolKey(t *testing.T, body string) string {
 	t.Helper()
-	key := sessionKey(affinityRequest("/v1/chat/completions", "", ""), []byte(body), "/chat/completions")
+	key := sessionKey(affinityRequest("/v1/chat/completions", testAPIKey, ""), []byte(body), "/chat/completions")
 	affinityAssertKeyShape(t, key)
 	return key
 }
@@ -27,6 +27,7 @@ func affinityPoolKey(t *testing.T, body string) string {
 func affinityPersistPool(t *testing.T, up *mgmtUpstream, cacheDir string, accounts []PoolAccount) *Pool {
 	t.Helper()
 	p, err := NewManagedPool(PoolConfig{
+		APIKey:   testAPIKey,
 		CacheDir: cacheDir, Client: up.client, SessionAffinityTTL: DefaultSessionAffinityTTL,
 	}, accounts)
 	if err != nil {
@@ -125,6 +126,7 @@ func TestSaveSessionAffinityIsNoOpWithoutAffinityOrCacheDir(t *testing.T) {
 		}
 		var logs bytes.Buffer
 		p, err := NewManagedPool(PoolConfig{
+			APIKey:        testAPIKey,
 			ManagementKey: mgmtKey, CredentialsDir: t.TempDir(), CacheDir: cacheDir,
 			SessionAffinityTTL: 0, Logger: affinityPersistLogger(&logs, slog.LevelDebug),
 		}, nil)
@@ -145,6 +147,7 @@ func TestSaveSessionAffinityIsNoOpWithoutAffinityOrCacheDir(t *testing.T) {
 
 	t.Run("cache-dir-empty", func(t *testing.T) {
 		p, err := NewManagedPool(PoolConfig{
+			APIKey:        testAPIKey,
 			ManagementKey: mgmtKey, CredentialsDir: t.TempDir(), SessionAffinityTTL: time.Hour,
 		}, nil)
 		if err != nil {
@@ -171,6 +174,7 @@ func TestNewManagedPoolWarnsAndStartsEmptyOnCorruptAffinityFile(t *testing.T) {
 	}
 	var logs bytes.Buffer
 	p, err := NewManagedPool(PoolConfig{
+		APIKey:   testAPIKey,
 		CacheDir: cacheDir, Client: up.client, SessionAffinityTTL: DefaultSessionAffinityTTL,
 		Logger: affinityPersistLogger(&logs, slog.LevelWarn),
 	}, []PoolAccount{{Token: "oauth-alice", User: "alice"}})

@@ -229,6 +229,7 @@ func mgmtOrder(users ...string) []string {
 func mgmtPoolConfig(t *testing.T, up *mgmtUpstream, dir string, ttl time.Duration) PoolConfig {
 	t.Helper()
 	return PoolConfig{
+		APIKey:        testAPIKey,
 		ManagementKey: mgmtKey, CredentialsDir: dir, CacheDir: t.TempDir(),
 		Client: up.client, SessionAffinityTTL: ttl,
 	}
@@ -256,7 +257,7 @@ func mgmtNewPool(t *testing.T, up *mgmtUpstream, ttl time.Duration, users ...str
 	return p, dir
 }
 
-// mgmtCall 通过 Pool 的 HTTP 入口调用接口；key 为空时不带 Authorization 头。
+// mgmtCall 通过 Pool 的 HTTP 入口调用接口；key 为空时不带 Authorization 头（不经 withTestAPIKey，不会补服务密钥）。
 func mgmtCall(p *Pool, method, path, body, key string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, path, strings.NewReader(body))
 	r.Header.Set("Content-Type", "application/json")
@@ -354,10 +355,10 @@ func mgmtIsHex(s string, n int) bool {
 }
 
 func TestNewManagedPoolAcceptsZeroAccountsOnlyWithManagementKey(t *testing.T) {
-	if _, err := NewManagedPool(PoolConfig{ManagementKey: mgmtKey, CredentialsDir: t.TempDir(), CacheDir: t.TempDir()}, nil); err != nil {
+	if _, err := NewManagedPool(PoolConfig{APIKey: testAPIKey, ManagementKey: mgmtKey, CredentialsDir: t.TempDir(), CacheDir: t.TempDir()}, nil); err != nil {
 		t.Fatalf("有管理密钥时 0 个账号应允许启动: %v", err)
 	}
-	if _, err := NewManagedPool(PoolConfig{CredentialsDir: t.TempDir(), CacheDir: t.TempDir()}, nil); err == nil {
+	if _, err := NewManagedPool(PoolConfig{APIKey: testAPIKey, CredentialsDir: t.TempDir(), CacheDir: t.TempDir()}, nil); err == nil {
 		t.Fatal("没有管理密钥且 0 个账号时必须拒绝")
 	}
 }
@@ -378,7 +379,7 @@ func TestNewManagedPoolRejectsInvalidAccounts(t *testing.T) {
 		{name: "invalid-host", accounts: []PoolAccount{{Token: "oauth-a", Host: "evil.example", User: "alice"}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			config := PoolConfig{ManagementKey: mgmtKey, CredentialsDir: t.TempDir(), CacheDir: t.TempDir()}
+			config := PoolConfig{APIKey: testAPIKey, ManagementKey: mgmtKey, CredentialsDir: t.TempDir(), CacheDir: t.TempDir()}
 			if _, err := NewManagedPool(config, tc.accounts); err == nil {
 				t.Fatalf("NewManagedPool(%+v) 必须拒绝", tc.accounts)
 			}
@@ -429,9 +430,13 @@ func TestManagementRoutesAbsentWithoutManagementKey(t *testing.T) {
 		{"GET", "/v0/management/login/status?state=x"},
 		{"POST", "/v0/management/quota/refresh"},
 	} {
-		// 即使携带任意 Authorization，未启用管理接口时也只能得到普通 404。
-		if w := mgmtCall(p, tc.method, tc.path, "", mgmtKey); w.Code != http.StatusNotFound {
-			t.Errorf("%s %s status = %d, want 404", tc.method, tc.path, w.Code)
+		// 未启用管理接口时，这些路径与其他未注册路径一样先校验服务访问密钥：
+		// 携带管理密钥（不是服务密钥）得到 401，携带有效服务密钥只能得到普通 404。
+		if w := mgmtCall(p, tc.method, tc.path, "", mgmtKey); w.Code != http.StatusUnauthorized {
+			t.Errorf("%s %s 携带管理密钥 status = %d, want 401", tc.method, tc.path, w.Code)
+		}
+		if w := mgmtCall(p, tc.method, tc.path, "", testAPIKey); w.Code != http.StatusNotFound {
+			t.Errorf("%s %s 携带服务密钥 status = %d, want 404", tc.method, tc.path, w.Code)
 		}
 	}
 }

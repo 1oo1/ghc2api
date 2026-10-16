@@ -4,8 +4,8 @@
 
 ## 启用与鉴权
 
-- 仅 `management_key` 非空（且不同于 `api_key`）时注册。留空则 `/management` 与 `/v0/management/*` 不存在：未设 `api_key` 返回 404；设了 `api_key` 则与其他未注册路径一样先校验服务密钥，无有效密钥 401、有则 404。
-- 鉴权 `Authorization: Bearer <management_key>`（常量时间比较），失败 401。`api_key` 与 `X-Api-Key` 均不能访问管理接口；`/management` 页面本身无需鉴权。
+- 仅 `management_key` 非空（去除首尾空白后至少 32 字节，且不同于 `api_key`）时注册。留空则 `/management` 与 `/v0/management/*` 不存在：与其他未注册路径一样先校验服务密钥，无有效 `api_key` 返回 401，有则 404。
+- 鉴权 `Authorization: Bearer <management_key>`（常量时间比较），失败 401 并输出一条鉴权失败告警（字段 `method`、`path` 各最多 256 字节，按 UTF-8 字符边界截断，以及 `remote_addr`），不输出请求日志。`api_key` 与 `X-Api-Key` 均不能访问管理接口；`/management` 页面本身无需鉴权。管理密钥校验只作用于 `/v0/management/` 前缀，且位于请求日志之外。路径清理重定向（如 `/v0/management//accounts`）同样发生在该前缀下，因此必须先通过管理密钥校验才会被重定向；`/management` 上由 ServeMux 直接产生的 405、404 不需要管理密钥，照常输出请求日志。
 - 响应均为 JSON，错误格式同 `writeError`；请求体上限 1 MiB。
 - 密钥通过 HTTP 头发送，监听非本机地址时应置于 TLS 反向代理之后。
 - 控制台响应带 `X-Frame-Options: DENY` 与 `Content-Security-Policy`（含 `default-src 'self'`、`frame-ancestors 'none'`；单文件构建内联 script/style，故 script-src、style-src 允许 `'unsafe-inline'`）。

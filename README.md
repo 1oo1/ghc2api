@@ -10,12 +10,14 @@ OpenAI Chat Completions / Responses 与 Anthropic Messages 兼容的接口，支
 
 ```sh
 cp config.example.yaml config.yaml && chmod 600 config.yaml
+# 编辑 config.yaml：api_key 必填，去首尾空白后至少 32 字节，例如 openssl rand -hex 32 的输出
 mkdir -p data/credentials   # 凭证 JSON 放在 data/credentials/<GitHub 用户名>.json，chmod 600
 make build
 ./bin/ghc2api               # 默认读取当前目录 config.yaml；-c 指定其他路径
 ```
 
-默认监听 `127.0.0.1:8080`；设置 `management_key` 后可访问 `http://127.0.0.1:8080/management`。
+默认监听 `127.0.0.1:8080`；设置 `management_key`（同样至少 32 字节）后可访问 `http://127.0.0.1:8080/management`。
+`api_key` 无论监听地址都必须配置，不存在匿名模式。
 真实凭证不要提交到版本库。
 
 ## 文档

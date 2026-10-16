@@ -65,6 +65,20 @@ type persistedSessionForTest struct {
 
 const testModels = `{"data":[{"id":"gpt-4.1","name":"GPT 4.1","model_picker_enabled":true,"is_chat_fallback":true,"capabilities":{"type":"chat","supports":{"reasoning_effort":["low","high"]}},"supported_endpoints":["/chat/completions","/responses","/v1/messages"],"policy":{"state":"enabled"}},{"id":"terms-model","model_picker_enabled":true,"capabilities":{"type":"chat"},"policy":{"state":"disabled","terms":"Accept terms"}},{"id":"blocked","model_picker_enabled":true,"capabilities":{"type":"chat"},"policy":{"state":"disabled"}},{"id":"embed","model_picker_enabled":true,"capabilities":{"type":"embeddings"}},{"id":"copilot-search","model_picker_enabled":true,"capabilities":{"type":"chat"}},{"id":"gpt-secondary","model_picker_enabled":true,"capabilities":{"type":"chat"}},{"id":"hidden","capabilities":{"type":"chat"}},{"id":"experimental","vendor":"Experimental","model_picker_enabled":true,"capabilities":{"type":"chat"}}]}`
 
+// testAPIKey 是测试用的服务访问密钥：库层要求 APIKey 非空，只关心业务逻辑的测试统一使用它。
+const testAPIKey = "test-service-api-key"
+
+// withTestAPIKey 为既没有 Authorization 也没有 X-Api-Key 的请求补上 testAPIKey，
+// 使只关心业务逻辑的测试无需逐个设置鉴权头。已携带任一密钥头的请求原样转发，鉴权相关测试不受影响。
+func withTestAPIKey(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" && r.Header.Get("X-Api-Key") == "" {
+			r.Header.Set("Authorization", "Bearer "+testAPIKey)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func testService(t *testing.T, config Config) *Service {
 	t.Helper()
 	if strings.TrimSpace(config.CacheDir) == "" {
@@ -123,18 +137,18 @@ func testRequest(s *Service, method, path, body string) *httptest.ResponseRecord
 	r := httptest.NewRequest(method, path, strings.NewReader(body))
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, r)
+	withTestAPIKey(s.Handler()).ServeHTTP(w, r)
 	return w
 }
 
 func TestNewRejectsInvalidConfiguration(t *testing.T) {
 	for _, config := range []Config{
-		{}, {Token: "  "},
-		{Token: "token", Host: "evil.example"},
-		{Token: "token", Host: "github.com:443"},
-		{Token: "token", Host: "https://user" + "@" + "github.com"},
-		{Token: "token", Host: "https://github.com/path"},
-		{Token: "token", Host: "api.acme.ghe.com"},
+		{APIKey: testAPIKey}, {APIKey: testAPIKey, Token: "  "},
+		{APIKey: testAPIKey, Token: "token", Host: "evil.example"},
+		{APIKey: testAPIKey, Token: "token", Host: "github.com:443"},
+		{APIKey: testAPIKey, Token: "token", Host: "https://user" + "@" + "github.com"},
+		{APIKey: testAPIKey, Token: "token", Host: "https://github.com/path"},
+		{APIKey: testAPIKey, Token: "token", Host: "api.acme.ghe.com"},
 	} {
 		t.Run(fmt.Sprintf("%s_%s", config.Token, config.Host), func(t *testing.T) {
 			if _, err := New(config); err == nil {
@@ -145,7 +159,7 @@ func TestNewRejectsInvalidConfiguration(t *testing.T) {
 }
 
 func TestConfigDoesNotExposeTokenMode(t *testing.T) {
-	if _, ok := reflect.TypeOf(Config{}).FieldByName("TokenMode"); ok {
+	if _, ok := reflect.TypeOf(Config{APIKey: testAPIKey}).FieldByName("TokenMode"); ok {
 		t.Fatal("Config must not expose token_mode")
 	}
 }
@@ -165,7 +179,10 @@ func TestLocalAuthenticationAndHealth(t *testing.T) {
 		t.Fatalf("health status = %d", w.Code)
 	}
 	for _, path := range []string{"/v1/models", "/models", "/v1/chat/completions", "/v1/responses", "/v1/messages"} {
-		if w := testRequest(s, "GET", path, ""); w.Code != 401 {
+		// 直接调用 Handler（不经 withTestAPIKey），确保请求真的不带任何密钥。
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+		if w.Code != 401 {
 			t.Fatalf("%s without key: status = %d", path, w.Code)
 		}
 	}
@@ -201,7 +218,7 @@ func TestLocalAuthenticationAndHealth(t *testing.T) {
 
 func TestModelsFilterAndPreserveMetadata(t *testing.T) {
 	var modelCalls, tokenCalls atomic.Int32
-	s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/copilot_internal/v2/token":
 			tokenCalls.Add(1)
@@ -269,7 +286,8 @@ func TestModelsCachePersistsAcrossServiceInstances(t *testing.T) {
 		}
 	})
 	config := Config{
-		Token: "github-secret", CacheDir: t.TempDir(), ModelsCacheTTL: time.Hour, Client: client,
+		APIKey: testAPIKey,
+		Token:  "github-secret", CacheDir: t.TempDir(), ModelsCacheTTL: time.Hour, Client: client,
 	}
 
 	var firstService *Service
@@ -320,7 +338,8 @@ func TestModelsCacheRefreshesAfterTTL(t *testing.T) {
 		}
 	})
 	config := Config{
-		Token: "github-secret", CacheDir: t.TempDir(), ModelsCacheTTL: ttl, Client: client,
+		APIKey: testAPIKey,
+		Token:  "github-secret", CacheDir: t.TempDir(), ModelsCacheTTL: ttl, Client: client,
 	}
 
 	s := testService(t, config)
@@ -347,7 +366,7 @@ func TestGenerationRoutesHeadersAndOriginalBody(t *testing.T) {
 	} {
 		t.Run(tc.local, func(t *testing.T) {
 			var generationCalls int
-			s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+			s := testService(t, Config{APIKey: "caller", Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
 				case "/copilot_internal/v2/token":
 					testSession(w, "https://api.githubcopilot.com", time.Now().Add(time.Hour))
@@ -397,7 +416,7 @@ func TestGenerationRoutesHeadersAndOriginalBody(t *testing.T) {
 			r.Header.Set("Anthropic-Version", "2023-06-01")
 			r.Header.Set("Copilot-Session-Token", "injected")
 			w := httptest.NewRecorder()
-			s.Handler().ServeHTTP(w, r)
+			withTestAPIKey(s.Handler()).ServeHTTP(w, r)
 			if w.Code != 429 || w.Body.String() != `{"error":"quota exhausted"}` || w.Header().Get("X-Upstream") != "preserved" || generationCalls != 1 {
 				t.Fatalf("response = %d %s headers=%v calls=%d", w.Code, w.Body.String(), w.Header(), generationCalls)
 			}
@@ -421,7 +440,7 @@ func TestInitiatorAndStructuredVision(t *testing.T) {
 		{"text-not-image", "/v1/chat/completions", `{"model":"gpt-4.1","messages":[{"role":"user","content":"The key \"image_url\" is mentioned as plain text"}]}`, "user", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+			s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
 				case "/copilot_internal/v2/token":
 					testSession(w, "", time.Now().Add(time.Hour))
@@ -494,7 +513,7 @@ func TestDebugLogsRequestStagesAndRedactsSecrets(t *testing.T) {
 		strings.NewReader(`{"model":"auto","messages":[{"role":"user","content":"upstream-request-marker"}]}`))
 	request.Header.Set("Authorization", "Bearer service-api-key-secret")
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, request)
+	withTestAPIKey(s.Handler()).ServeHTTP(w, request)
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "upstream-response-marker") {
 		t.Fatalf("generation response = %d %s", w.Code, w.Body.String())
 	}
@@ -536,7 +555,8 @@ func TestGenerationLogsRedactModelMatchingOAuthToken(t *testing.T) {
 	logs := captureSlog(t, slog.LevelDebug)
 	const oauthToken = "oauth-model-token-secret"
 	s := testService(t, Config{
-		Token: oauthToken,
+		APIKey: testAPIKey,
+		Token:  oauthToken,
 		Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 			switch r.URL.Path {
 			case "/copilot_internal/v2/token":
@@ -573,7 +593,7 @@ func TestGenerationUpstreamFailureStatusesAreLoggedAtFailureLevel(t *testing.T) 
 		t.Run(fmt.Sprint(tc.status), func(t *testing.T) {
 			logs := captureSlog(t, slog.LevelDebug)
 			body := fmt.Sprintf(`{"error":"upstream status %d"}`, tc.status)
-			s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+			s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
 				case "/copilot_internal/v2/token":
 					testSession(w, "https://api.githubcopilot.com", time.Now().Add(time.Hour))
@@ -633,7 +653,7 @@ func TestDebugLogsCompleteLargeAPIRequestInBoundedEvents(t *testing.T) {
 			Request:    r,
 		}, nil
 	})}
-	s := testService(t, Config{Token: "github-secret", Client: client, Logger: logger})
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: client, Logger: logger})
 
 	request, err := http.NewRequest(http.MethodPost,
 		"https://api.githubcopilot.com"+endpoint, strings.NewReader(requestBody))
@@ -730,7 +750,7 @@ func TestDebugLogsCompleteLargeAPIResponse(t *testing.T) {
 		middleMarker +
 		strings.Repeat("x", responseLength-middleOffset-len(middleMarker)) +
 		tailMarker
-	s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/copilot_internal/v2/token":
 			testSession(w, "https://api.githubcopilot.com", time.Now().Add(time.Hour))
@@ -820,7 +840,7 @@ func TestDebugLogsDoNotLeakRegisteredSecretsAcrossChunkBoundaries(t *testing.T) 
 				strings.NewReader(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hello"}]}`))
 			request.Header.Set("Authorization", "Bearer "+tc.apiKey)
 			w := httptest.NewRecorder()
-			s.Handler().ServeHTTP(w, request)
+			withTestAPIKey(s.Handler()).ServeHTTP(w, request)
 			if w.Code != http.StatusOK || w.Body.String() != responseBody {
 				t.Fatalf("upstream response = %d with %d bytes, want %d bytes",
 					w.Code, w.Body.Len(), len(responseBody))
@@ -847,7 +867,7 @@ func TestDebugLogsKeepTailAfterOversizedSensitiveJSONField(t *testing.T) {
 	const tailMarker = "debug-tail-after-oversized-sensitive-field"
 	sensitiveValue := strings.Repeat("s", sensitiveValueLength)
 	responseBody := `{"session_token":"` + sensitiveValue + `","tail":"` + tailMarker + `"}`
-	s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/copilot_internal/v2/token":
 			testSession(w, "https://api.githubcopilot.com", time.Now().Add(time.Hour))
@@ -890,7 +910,7 @@ func TestDebugLogsCompleteOversizedMetadataResponse(t *testing.T) {
 	logs := captureJSONSlog(t, slog.LevelDebug)
 	const tailMarker = "metadata-response-tail-marker"
 	responseBody := strings.Repeat("m", maxMetadataBody+1) + tailMarker
-	s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/copilot_internal/v2/token":
 			testSession(w, "https://api.githubcopilot.com", time.Now().Add(time.Hour))
@@ -952,7 +972,7 @@ func TestDebugLogsCompleteLargeBufferedMetadataResponseInBoundedEvents(t *testin
 			Request:    r,
 		}, nil
 	})}
-	s := testService(t, Config{Token: "github-secret", Client: client, Logger: logger})
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: client, Logger: logger})
 
 	request, err := http.NewRequest(http.MethodGet, "https://api.githubcopilot.com"+endpoint, nil)
 	if err != nil {
@@ -1021,7 +1041,7 @@ func TestDebugLogsCompleteLargeBufferedMetadataResponseInBoundedEvents(t *testin
 
 func TestInfoLogsRequestStagesWithoutDebugBodies(t *testing.T) {
 	logs := captureSlog(t, slog.LevelInfo)
-	s := testService(t, Config{Token: "github-oauth-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-oauth-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/copilot_internal/v2/token":
 			testSession(w, "", time.Now().Add(time.Hour))
@@ -1037,7 +1057,7 @@ func TestInfoLogsRequestStagesWithoutDebugBodies(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"gpt-4.1","messages":[{"role":"user","content":"info-request-body-marker"}]}`))
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, request)
+	withTestAPIKey(s.Handler()).ServeHTTP(w, request)
 	if w.Code != http.StatusOK {
 		t.Fatalf("generation response = %d %s", w.Code, w.Body.String())
 	}
@@ -1105,7 +1125,7 @@ func assertClientRequestHeadersLogged(t *testing.T, output []byte) {
 func TestServiceLogsClientRequestHeadersWithSensitiveRedacted(t *testing.T) {
 	logs := captureJSONSlog(t, slog.LevelInfo)
 	s := testService(t, Config{Token: "github-secret", APIKey: clientHeaderSecret})
-	if w := sendClientHeaderRequest(s.Handler()); w.Code != http.StatusNotFound {
+	if w := sendClientHeaderRequest(withTestAPIKey(s.Handler())); w.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404; body=%s", w.Code, w.Body.String())
 	}
 	assertClientRequestHeadersLogged(t, logs.Bytes())
@@ -1115,7 +1135,7 @@ func TestTermsAcceptedBeforeGenerationAndFailureDoesNotBlock(t *testing.T) {
 	for _, policyStatus := range []int{200, 403} {
 		t.Run(fmt.Sprint(policyStatus), func(t *testing.T) {
 			var events []string
-			s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+			s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 				events = append(events, r.URL.Path)
 				switch r.URL.Path {
 				case "/copilot_internal/v2/token":
@@ -1149,7 +1169,7 @@ func TestTermsAcceptedBeforeGenerationAndFailureDoesNotBlock(t *testing.T) {
 
 func TestManualModelSurvivesModelListFailureAndDoesNotRetry(t *testing.T) {
 	var requests atomic.Int32
-	s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/copilot_internal/v2/token":
 			testSession(w, "", time.Now().Add(time.Hour))
@@ -1190,7 +1210,7 @@ func TestAutoRequiresModelListAfterInitialFetchFailure(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var modelCalls, autoCalls, generationCalls atomic.Int32
-			s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+			s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
 				case "/copilot_internal/v2/token":
 					testSession(w, "", time.Now().Add(time.Hour))
@@ -1277,7 +1297,7 @@ func TestGenerationRejectsModelsUnavailableForPath(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var modelCalls, autoCalls, generationCalls atomic.Int32
-			s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+			s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
 				case "/copilot_internal/v2/token":
 					testSession(w, "", time.Now().Add(time.Hour))
@@ -1322,7 +1342,7 @@ func TestGenerationRejectsModelsUnavailableForPath(t *testing.T) {
 func TestAutoSelectionForUnsupportedPathIsNotCached(t *testing.T) {
 	var autoCalls, generationCalls atomic.Int32
 	var forwardedModel atomic.Value
-	s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/copilot_internal/v2/token":
 			testSession(w, "", time.Now().Add(time.Hour))
@@ -1386,7 +1406,7 @@ func TestSessionReuseRefreshAndEnterpriseHost(t *testing.T) {
 	for _, ttl := range []time.Duration{time.Hour, time.Minute} {
 		t.Run(ttl.String(), func(t *testing.T) {
 			var exchanges atomic.Int32
-			s := testService(t, Config{Token: "github-secret", Host: "https://acme.ghe.com/", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+			s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Host: "https://acme.ghe.com/", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
 				case "/copilot_internal/v2/token":
 					exchanges.Add(1)
@@ -1431,7 +1451,7 @@ func TestSessionCachePersistsAcrossServiceInstances(t *testing.T) {
 		exchanges.Add(1)
 		testSession(w, "https://api.githubcopilot.com", time.Now().Add(time.Hour))
 	})
-	config := Config{Token: "github-secret", CacheDir: t.TempDir(), Client: client}
+	config := Config{APIKey: testAPIKey, Token: "github-secret", CacheDir: t.TempDir(), Client: client}
 
 	firstService := testService(t, config)
 	first, err := firstService.getSession(context.Background())
@@ -1489,7 +1509,7 @@ func TestSessionCacheRefreshesWhenExpiresAtIsPast(t *testing.T) {
 		exchanges.Add(1)
 		testSession(w, "https://api.githubcopilot.com", time.Now().Add(time.Hour))
 	})
-	config := Config{Token: "github-secret", CacheDir: t.TempDir(), Client: client}
+	config := Config{APIKey: testAPIKey, Token: "github-secret", CacheDir: t.TempDir(), Client: client}
 
 	firstService := testService(t, config)
 	first, err := firstService.getSession(context.Background())
@@ -1540,7 +1560,7 @@ func TestRejectUnsafeSessionEndpoints(t *testing.T) {
 	} {
 		t.Run(endpoint, func(t *testing.T) {
 			var downstream atomic.Int32
-			s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+			s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/copilot_internal/v2/token" {
 					testSession(w, endpoint, time.Now().Add(time.Hour))
 					return
@@ -1567,7 +1587,7 @@ func TestRedirectNeverForwardsSecrets(t *testing.T) {
 		http.Redirect(w, r, "https://evil.example/steal", http.StatusFound)
 	})
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return nil }
-	s := testService(t, Config{Token: "github-secret", Client: client})
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: client})
 	if w := testRequest(s, "GET", "/v1/models", ""); w.Code < 400 {
 		t.Fatalf("redirect status = %d", w.Code)
 	}
@@ -1577,7 +1597,7 @@ func TestRedirectNeverForwardsSecrets(t *testing.T) {
 }
 
 func TestNetworkFailureReturnsBadGateway(t *testing.T) {
-	s := testService(t, Config{Token: "github-secret", Client: &http.Client{Transport: testTransport(func(*http.Request) (*http.Response, error) {
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: &http.Client{Transport: testTransport(func(*http.Request) (*http.Response, error) {
 		return nil, errors.New("test network failure")
 	})}})
 	if w := testRequest(s, "GET", "/v1/models", ""); w.Code != 502 {
@@ -1608,7 +1628,7 @@ func TestGenerationNetworkFailureRedactsSensitiveQueryFromLogs(t *testing.T) {
 		}
 		return baseTransport.RoundTrip(r)
 	})}
-	s := testService(t, Config{Token: "github-secret", Client: client})
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: client})
 
 	w := testRequest(s, http.MethodPost,
 		"/v1/chat/completions?access_token="+querySecret,
@@ -1629,7 +1649,7 @@ func TestGenerationNetworkFailureRedactsSensitiveQueryFromLogs(t *testing.T) {
 }
 
 func TestConnectionNominatedProtocolHeaderIsRemoved(t *testing.T) {
-	s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/copilot_internal/v2/token":
 			testSession(w, "", time.Now().Add(time.Hour))
@@ -1646,7 +1666,7 @@ func TestConnectionNominatedProtocolHeaderIsRemoved(t *testing.T) {
 	r.Header.Set("Connection", "Anthropic-Version")
 	r.Header.Set("Anthropic-Version", "2023-06-01")
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, r)
+	withTestAPIKey(s.Handler()).ServeHTTP(w, r)
 	if w.Code != 200 {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
@@ -1654,7 +1674,7 @@ func TestConnectionNominatedProtocolHeaderIsRemoved(t *testing.T) {
 
 func TestConcurrentGenerationSharesSessionAndModelCache(t *testing.T) {
 	var exchanges, models, generations atomic.Int32
-	s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/copilot_internal/v2/token":
 			exchanges.Add(1)
@@ -1688,7 +1708,7 @@ func TestConcurrentGenerationSharesSessionAndModelCache(t *testing.T) {
 
 func TestCancelledRequestDoesNotReachUpstream(t *testing.T) {
 	var calls atomic.Int32
-	s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		t.Error("cancelled request reached upstream")
 		w.WriteHeader(500)
@@ -1698,7 +1718,7 @@ func TestCancelledRequestDoesNotReachUpstream(t *testing.T) {
 	cancel()
 	r = r.WithContext(ctx)
 	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, r)
+	withTestAPIKey(s.Handler()).ServeHTTP(w, r)
 	if w.Code < 400 || calls.Load() != 0 {
 		t.Fatalf("cancelled request=%d, upstream calls=%d", w.Code, calls.Load())
 	}
@@ -1706,7 +1726,7 @@ func TestCancelledRequestDoesNotReachUpstream(t *testing.T) {
 
 func TestOversizedGenerationBodyDoesNotReachUpstream(t *testing.T) {
 	var calls atomic.Int32
-	s := testService(t, Config{Token: "github-secret", Client: &http.Client{Transport: testTransport(func(*http.Request) (*http.Response, error) {
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: &http.Client{Transport: testTransport(func(*http.Request) (*http.Response, error) {
 		calls.Add(1)
 		return nil, errors.New("oversized body must not reach upstream")
 	})}})
@@ -1719,7 +1739,7 @@ func TestOversizedGenerationBodyDoesNotReachUpstream(t *testing.T) {
 
 func TestExpiringAutoSessionIsRefreshed(t *testing.T) {
 	var picks atomic.Int32
-	s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/copilot_internal/v2/token":
 			testSession(w, "", time.Now().Add(time.Hour))
@@ -1751,7 +1771,7 @@ func TestAutoSelectionPreservesProtocolAndCachesSession(t *testing.T) {
 		} {
 			t.Run(tc.path+selected, func(t *testing.T) {
 				var autoCalls, generationCalls atomic.Int32
-				s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+				s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 					switch r.URL.Path {
 					case "/copilot_internal/v2/token":
 						testSession(w, "", time.Now().Add(time.Hour))
@@ -1800,7 +1820,7 @@ func TestAutoLegacyAndManualFallback(t *testing.T) {
 	for _, legacyAvailable := range []bool{true, false} {
 		t.Run(fmt.Sprint(legacyAvailable), func(t *testing.T) {
 			var legacyCalls atomic.Int32
-			s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+			s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
 				case "/copilot_internal/v2/token":
 					testSession(w, "", time.Now().Add(time.Hour))
@@ -1862,7 +1882,7 @@ func TestAutoRetryIsBounded(t *testing.T) {
 		for _, succeeds := range []bool{true, false} {
 			t.Run(rejection+fmt.Sprint(succeeds), func(t *testing.T) {
 				var generationCalls, autoCalls atomic.Int32
-				s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+				s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 					switch r.URL.Path {
 					case "/copilot_internal/v2/token":
 						testSession(w, "", time.Now().Add(time.Hour))
@@ -1904,7 +1924,7 @@ func TestSSEIsFlushedBeforeUpstreamFinishes(t *testing.T) {
 	var once sync.Once
 	finish := func() { once.Do(func() { close(release) }) }
 	defer finish()
-	s := testService(t, Config{Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/copilot_internal/v2/token":
 			testSession(w, "", time.Now().Add(time.Hour))
@@ -1918,7 +1938,7 @@ func TestSSEIsFlushedBeforeUpstreamFinishes(t *testing.T) {
 			_, _ = io.WriteString(w, "data: [DONE]\n\n")
 		}
 	})})
-	server := httptest.NewServer(s.Handler())
+	server := httptest.NewServer(withTestAPIKey(s.Handler()))
 	defer server.Close()
 	defer finish()
 	result := make(chan error, 1)

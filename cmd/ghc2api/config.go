@@ -24,6 +24,10 @@ const (
 	defaultLogBackups   = 5
 	maxLogMaxSizeMB     = 1 << 20
 	maxLogBackups       = 100
+	// defaultMaxConcurrentRequests 是 max_concurrent_requests 缺省值；显式 0 表示不限制。
+	defaultMaxConcurrentRequests = 32
+	// minSecretBytes 是 api_key 与 management_key 去除首尾空白后的最小字节数（非空时）。
+	minSecretBytes = 32
 	// minQuotaRefreshInterval 是 quota_refresh_interval 的下限，避免过于频繁地请求 GitHub 额度接口。
 	minQuotaRefreshInterval = time.Minute
 )
@@ -33,7 +37,7 @@ type appConfig struct {
 	DataPath            string        `yaml:"data_path"`
 	LogsPath            string        `yaml:"logs_path"`
 	Host                string        `yaml:"host"`
-	APIKey              string        `yaml:"api_key"`
+	APIKey              string        `yaml:"api_key"`        // 必填，去除首尾空白后至少 32 字节，与监听地址无关
 	ManagementKey       string        `yaml:"management_key"` // 为空时禁用 Web 控制台与管理接口
 	LogLevel            string        `yaml:"log_level"`
 	ModelsCacheTTLValue string        `yaml:"models_cache_ttl"`
@@ -53,6 +57,9 @@ type appConfig struct {
 	// SessionAffinityMaxPerAccountValue 保留原值以区分缺省值和非法输入（同 log_max_backups）。
 	SessionAffinityMaxPerAccountValue *string `yaml:"session_affinity_max_per_account"`
 	SessionAffinityMaxPerAccount      int     `yaml:"-"`
+	// MaxConcurrentRequestsValue 保留原值以区分缺省值（32）与显式 0（不限制）；非法输入（同 log_max_backups）。
+	MaxConcurrentRequestsValue *string `yaml:"max_concurrent_requests"`
+	MaxConcurrentRequests      int     `yaml:"-"`
 
 	CacheDir            string      `yaml:"-"`
 	configMode          os.FileMode `yaml:"-"`
@@ -127,6 +134,16 @@ func loadConfig(path string) (appConfig, error) {
 	config.Host = strings.TrimSpace(config.Host)
 	config.APIKey = strings.TrimSpace(config.APIKey)
 	config.ManagementKey = strings.TrimSpace(config.ManagementKey)
+	// api_key 永远必填，与监听地址无关；配置文件中的 allow_anonymous 键已被 KnownFields 拒绝。
+	if config.APIKey == "" {
+		return appConfig{}, errors.New("api_key 必填：请设置服务访问密钥，去除首尾空白后至少 32 字节（例如 openssl rand -hex 32 的输出）")
+	}
+	if err := checkSecretLength("api_key", config.APIKey); err != nil {
+		return appConfig{}, err
+	}
+	if err := checkSecretLength("management_key", config.ManagementKey); err != nil {
+		return appConfig{}, err
+	}
 	if config.ManagementKey != "" && config.ManagementKey == config.APIKey {
 		return appConfig{}, errors.New("management_key 必须与 api_key 不同")
 	}
@@ -149,6 +166,14 @@ func loadConfig(path string) (appConfig, error) {
 			return appConfig{}, fmt.Errorf("无效的 session_affinity_max_per_account %q，必须是大于等于 0 的整数（0 表示不限制）", *value)
 		}
 		config.SessionAffinityMaxPerAccount = limit
+	}
+	config.MaxConcurrentRequests = defaultMaxConcurrentRequests
+	if value := config.MaxConcurrentRequestsValue; value != nil {
+		limit, err := strconv.Atoi(strings.TrimSpace(*value))
+		if err != nil || limit < 0 {
+			return appConfig{}, fmt.Errorf("无效的 max_concurrent_requests %q，必须是大于等于 0 的整数（0 表示不限制）", *value)
+		}
+		config.MaxConcurrentRequests = limit
 	}
 	config.LogLevel = strings.ToLower(strings.TrimSpace(config.LogLevel))
 	if config.LogLevel == "" {
@@ -199,7 +224,7 @@ func loadConfig(path string) (appConfig, error) {
 		}
 		config.QuotaRefreshInterval = interval
 	}
-	if err := validateListen(config.Listen, config.APIKey); err != nil {
+	if err := validateListen(config.Listen); err != nil {
 		return appConfig{}, err
 	}
 
@@ -225,7 +250,7 @@ func loadConfig(path string) (appConfig, error) {
 }
 
 // poolConfig 生成账号池的服务级配置；账号相关的设置由 poolAccounts 提供。
-// 关闭会话亲和时 SessionAffinityTTL 为 0；每账号绑定上限原样传入，0 表示不限制。
+// 关闭会话亲和时 SessionAffinityTTL 为 0；每账号绑定上限与生成请求并发上限原样传入，0 表示不限制。
 func (c appConfig) poolConfig(logger *slog.Logger) copilot.PoolConfig {
 	affinityTTL := c.SessionAffinityTTL
 	if !c.SessionAffinity {
@@ -235,7 +260,8 @@ func (c appConfig) poolConfig(logger *slog.Logger) copilot.PoolConfig {
 		APIKey: c.APIKey, ManagementKey: c.ManagementKey,
 		CredentialsDir: filepath.Join(c.DataPath, credentialsDirName), CacheDir: c.CacheDir,
 		Host: c.Host, ModelsCacheTTL: c.ModelsCacheTTL, QuotaRefreshInterval: c.QuotaRefreshInterval,
-		SessionAffinityTTL: affinityTTL, SessionAffinityMaxPerAccount: c.SessionAffinityMaxPerAccount, Logger: logger,
+		SessionAffinityTTL: affinityTTL, SessionAffinityMaxPerAccount: c.SessionAffinityMaxPerAccount,
+		MaxConcurrentRequests: c.MaxConcurrentRequests, Logger: logger,
 	}
 }
 
@@ -251,6 +277,16 @@ func (c appConfig) poolAccounts() []copilot.PoolAccount {
 	return accounts
 }
 
+// checkSecretLength 校验非空的密钥字段（api_key 必填由 loadConfig 单独检查；management_key 为空表示禁用管理接口）：
+// 去除首尾空白后为空时不做长度检查；非空时字节数必须不少于 minSecretBytes。
+// 按字节计算（而非字符），因此多字节字符不会因字符数较少而被误判。
+func checkSecretLength(field, value string) error {
+	if value != "" && len(value) < minSecretBytes {
+		return fmt.Errorf("%s 过短：去除首尾空白后至少需要 %d 字节，请使用随机字符串", field, minSecretBytes)
+	}
+	return nil
+}
+
 func resolveConfigPath(configFile, value string) string {
 	path := filepath.Clean(value)
 	if filepath.IsAbs(path) {
@@ -259,19 +295,15 @@ func resolveConfigPath(configFile, value string) string {
 	return filepath.Join(filepath.Dir(configFile), path)
 }
 
-func validateListen(address, apiKey string) error {
-	host, port, err := net.SplitHostPort(address)
+// validateListen 校验监听地址的格式与端口。api_key 的必填与长度由 loadConfig 检查，与监听地址无关。
+func validateListen(address string) error {
+	_, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return fmt.Errorf("无效的 listen 地址 %q: %w", address, err)
 	}
 	portNumber, err := strconv.Atoi(port)
 	if err != nil || portNumber < 0 || portNumber > 65535 {
 		return fmt.Errorf("listen 端口必须是 0 到 65535 之间的数字: %q", port)
-	}
-	ip := net.ParseIP(strings.Trim(host, "[]"))
-	local := strings.EqualFold(host, "localhost") || (ip != nil && ip.IsLoopback())
-	if !local && strings.TrimSpace(apiKey) == "" {
-		return errors.New("非本机监听地址必须配置 api_key 服务访问密钥")
 	}
 	return nil
 }

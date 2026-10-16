@@ -207,7 +207,7 @@ func poolConfigs(t *testing.T, client *http.Client, tokens ...string) []Config {
 	t.Helper()
 	configs := make([]Config, 0, len(tokens))
 	for _, token := range tokens {
-		configs = append(configs, Config{Token: token, CacheDir: t.TempDir(), Client: client})
+		configs = append(configs, Config{APIKey: testAPIKey, Token: token, CacheDir: t.TempDir(), Client: client})
 	}
 	return configs
 }
@@ -218,7 +218,7 @@ func poolUserConfigs(t *testing.T, client *http.Client, users ...string) []Confi
 	t.Helper()
 	configs := make([]Config, 0, len(users))
 	for _, user := range users {
-		configs = append(configs, Config{Token: "oauth-" + user, User: user, CacheDir: t.TempDir(), Client: client})
+		configs = append(configs, Config{APIKey: testAPIKey, Token: "oauth-" + user, User: user, CacheDir: t.TempDir(), Client: client})
 	}
 	return configs
 }
@@ -238,7 +238,7 @@ func poolRequest(p *Pool, method, path, body string) *httptest.ResponseRecorder 
 	r := httptest.NewRequest(method, path, strings.NewReader(body))
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	p.Handler().ServeHTTP(w, r)
+	withTestAPIKey(p.Handler()).ServeHTTP(w, r)
 	return w
 }
 
@@ -265,11 +265,11 @@ func TestNewPoolRejectsInvalidAccounts(t *testing.T) {
 		configs []Config
 	}{
 		{name: "empty", configs: nil},
-		{name: "empty-token", configs: []Config{{Token: "oauth-a"}, {Token: "  "}}},
-		{name: "invalid-host", configs: []Config{{Token: "oauth-a"}, {Token: "oauth-b", Host: "evil.example"}}},
-		{name: "duplicate-token-after-trim", configs: []Config{{Token: "same"}, {Token: " same "}}},
+		{name: "empty-token", configs: []Config{{APIKey: testAPIKey, Token: "oauth-a"}, {APIKey: testAPIKey, Token: "  "}}},
+		{name: "invalid-host", configs: []Config{{APIKey: testAPIKey, Token: "oauth-a"}, {APIKey: testAPIKey, Token: "oauth-b", Host: "evil.example"}}},
+		{name: "duplicate-token-after-trim", configs: []Config{{APIKey: testAPIKey, Token: "same"}, {APIKey: testAPIKey, Token: " same "}}},
 		{name: "duplicate-after-host-normalization", configs: []Config{
-			{Token: "same", Host: "github.com"}, {Token: "same", Host: "GitHub.com"},
+			{APIKey: testAPIKey, Token: "same", Host: "github.com"}, {APIKey: testAPIKey, Token: "same", Host: "GitHub.com"},
 		}},
 		{name: "api-key-mismatch", configs: []Config{{Token: "oauth-a", APIKey: "one"}, {Token: "oauth-b", APIKey: "two"}}},
 		{name: "api-key-missing-on-one-account", configs: []Config{{Token: "oauth-a", APIKey: "one"}, {Token: "oauth-b"}}},
@@ -309,7 +309,7 @@ func TestServiceCooldownFollowsDeadline(t *testing.T) {
 	if AccountCooldown != time.Minute {
 		t.Fatalf("AccountCooldown = %s, want 1m", AccountCooldown)
 	}
-	s := testService(t, Config{Token: "oauth-a"})
+	s := testService(t, Config{APIKey: testAPIKey, Token: "oauth-a"})
 	now := time.Now()
 	if !s.available(now) {
 		t.Fatal("从未冷却的账号必须可用")
@@ -365,7 +365,7 @@ func TestPoolWithSingleAccountMatchesService(t *testing.T) {
 	captureSlog(t, slog.LevelError)
 	upstream := newPoolUpstream(t)
 	client := upstream.client()
-	service := testService(t, Config{Token: "oauth-solo", Client: client})
+	service := testService(t, Config{APIKey: testAPIKey, Token: "oauth-solo", Client: client})
 	pool := testPool(t, poolConfigs(t, client, "oauth-solo"))
 	for _, tc := range []struct{ method, path, body string }{
 		{"GET", "/v1/models", ""},
@@ -498,7 +498,7 @@ func TestPoolCancelledRequestDoesNotCoolAccounts(t *testing.T) {
 	ctx, cancel := context.WithCancel(r.Context())
 	cancel()
 	w := httptest.NewRecorder()
-	p.Handler().ServeHTTP(w, r.WithContext(ctx))
+	withTestAPIKey(p.Handler()).ServeHTTP(w, r.WithContext(ctx))
 	// 已取消的请求由 handleError 按网络错误处理，返回 502（正文为 context canceled），且不访问上游。
 	if w.Code != http.StatusBadGateway {
 		t.Fatalf("已取消请求 status=%d body=%s, want 502", w.Code, w.Body.String())
@@ -622,7 +622,7 @@ func TestPoolSessionFreeRoutesIgnoreSessionFailures(t *testing.T) {
 	}
 	client := upstream.client()
 	// 参照结果来自单账号 Service.Handler；这些路由不需要 session，两者结果必须一致。
-	reference := testService(t, Config{Token: "oauth-a", Client: client})
+	reference := testService(t, Config{APIKey: testAPIKey, Token: "oauth-a", Client: client})
 	p := testPool(t, poolConfigs(t, client, "oauth-a", "oauth-b"))
 
 	for _, tc := range []struct {
@@ -697,7 +697,7 @@ func TestPoolLogsClientRequestHeadersWithSensitiveRedacted(t *testing.T) {
 		configs[i].APIKey = clientHeaderSecret
 	}
 	p := testPool(t, configs)
-	if w := sendClientHeaderRequest(p.Handler()); w.Code != http.StatusNotFound {
+	if w := sendClientHeaderRequest(withTestAPIKey(p.Handler())); w.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404; body=%s", w.Code, w.Body.String())
 	}
 	assertClientRequestHeadersLogged(t, logs.Bytes())

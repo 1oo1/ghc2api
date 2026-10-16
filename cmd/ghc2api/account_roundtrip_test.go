@@ -19,7 +19,7 @@ import (
 const roundTripLogin = "mona-cat_octo"
 
 // roundTripManagementKey 是 roundTripSetup 使用的管理密钥。
-const roundTripManagementKey = "roundtrip-management-key"
+const roundTripManagementKey = validManagementKey
 
 // roundTripGitHub 是模拟 GitHub 的 RoundTripper：/user 返回 roundTripLogin，
 // 设备登录第一次轮询返回 authorization_pending，之后返回 token。
@@ -72,9 +72,10 @@ func roundTripSetup(t *testing.T, token string) (configPath string, pool *copilo
 	t.Helper()
 	configDir := isolatedConfigDir(t)
 	credentials = filepath.Join(configDir, "data", "credentials")
-	configPath = writeConfigInDir(t, configDir, "management_key: "+roundTripManagementKey+"\n")
+	configPath = writeConfigInDir(t, configDir, "management_key: "+roundTripManagementKey+"\n"+apiKeySetting)
 	cacheDir := t.TempDir()
 	pool, err := copilot.NewManagedPool(copilot.PoolConfig{
+		APIKey:         validAPIKey,
 		ManagementKey:  roundTripManagementKey,
 		CredentialsDir: credentials,
 		CacheDir:       cacheDir,

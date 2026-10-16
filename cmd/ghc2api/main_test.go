@@ -37,8 +37,17 @@ func (b *synchronizedBuffer) String() string {
 	return b.buf.String()
 }
 
+// validAPIKey 与 validManagementKey 是满足最小长度（32 字节）的测试密钥。
+const (
+	validAPIKey        = "test-api-key-0123456789abcdef-xyz"
+	validManagementKey = "test-management-key-0123456789abcdef"
+)
+
+// apiKeySetting 是写入合法 api_key 的 YAML 片段。api_key 必填，所有需要成功启动的配置夹具都应包含它。
+var apiKeySetting = "api_key: " + strconv.Quote(validAPIKey) + "\n"
+
 // minimalConfig 是只改变凭证目录扫描所需内容的最小配置（YAML 不能为空文档）。
-const minimalConfig = "log_level: info\n"
+var minimalConfig = "log_level: info\n" + apiKeySetting
 
 // accountJSON 返回只包含 oauth_token 的凭证文件内容。
 func accountJSON(token string) string {
@@ -109,6 +118,8 @@ func writeConfigAt(t *testing.T, dir, name, contents string) string {
 	return path
 }
 
+// appConfigYAML 生成服务级配置。apiKey 原样写入（为空时写入 api_key: ""，加载会因 api_key 必填而失败）；
+// 需要成功启动的夹具应传入 validAPIKey。
 func appConfigYAML(listen, host, apiKey, logLevel string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "listen: %s\n", strconv.Quote(listen))
@@ -196,7 +207,7 @@ func TestRunUsesDefaultConfigYAML(t *testing.T) {
 	dir := t.TempDir()
 	writeCredentialFile(t, filepath.Join(dir, "data", "credentials", "alice.json"),
 		`{"oauth_token":"default-config-token"}`)
-	configPath := writeConfigInDir(t, dir, "host: evil.example\n")
+	configPath := writeConfigInDir(t, dir, "host: evil.example\n"+apiKeySetting)
 	oldWorkingDirectory, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -239,7 +250,7 @@ func TestConfigYAMLUsesDefaultsForOmittedSettings(t *testing.T) {
 
 func TestLoadConfigUsesDefaultDataAndCredentialsPaths(t *testing.T) {
 	configDir := t.TempDir()
-	configPath := writeConfigInDir(t, configDir, "listen: 127.0.0.1:0\n")
+	configPath := writeConfigInDir(t, configDir, "listen: 127.0.0.1:0\n"+apiKeySetting)
 	dataPath := filepath.Join(configDir, "data")
 	writeCredentialFile(t, filepath.Join(dataPath, "credentials", "alice.json"),
 		`{"oauth_token":"default-data-path-token"}`)
@@ -264,7 +275,7 @@ func TestLoadConfigResolvesRelativeDataAndCredentialsPaths(t *testing.T) {
 	root := t.TempDir()
 	configDir := filepath.Join(root, "config")
 	dataPath := filepath.Join(root, "state")
-	configPath := writeConfigInDir(t, configDir, "data_path: ../state\n")
+	configPath := writeConfigInDir(t, configDir, "data_path: ../state\n"+apiKeySetting)
 	writeCredentialFile(t, filepath.Join(dataPath, "credentials", "alice.json"),
 		`{"oauth_token":"relative-data-path-token"}`)
 
@@ -302,7 +313,7 @@ func TestLoadConfigScansCredentialsUnderCustomDataPath(t *testing.T) {
 			file := filepath.Join(tc.wantData, "credentials", tc.user+".json")
 			writeCredentialFile(t, file, accountJSON(tc.token))
 			configPath := writeConfigInDir(t, filepath.Join(root, "config"),
-				fmt.Sprintf("data_path: %s\n", strconv.Quote(tc.dataPath)))
+				fmt.Sprintf("data_path: %s\n", strconv.Quote(tc.dataPath))+apiKeySetting)
 			config, err := loadConfig(configPath)
 			if err != nil {
 				t.Fatalf("loadConfig() error = %v", err)
@@ -550,7 +561,7 @@ func TestLoadConfigTopLevelHostOverridesEveryAccount(t *testing.T) {
 	credentials := filepath.Join(configDir, "data", "credentials")
 	writeCredentialFile(t, filepath.Join(credentials, "work.json"), accountJSON("host-work-token"))
 	writeCredentialFile(t, filepath.Join(credentials, "team.json"), `{"oauth_token":"host-team-token","host":"github.com"}`)
-	configPath := writeConfigInDir(t, configDir, "host: \"  acme.ghe.com  \"\n")
+	configPath := writeConfigInDir(t, configDir, "host: \"  acme.ghe.com  \"\n"+apiKeySetting)
 	config, err := loadConfig(configPath)
 	if err != nil {
 		t.Fatalf("loadConfig() error = %v", err)
@@ -588,7 +599,7 @@ func TestLoadConfigRejectsRemovedCredentialsField(t *testing.T) {
 
 func TestLogRotationConfigValuesAndValidation(t *testing.T) {
 	configPath := writeConfigWithAccount(t, "log-rotation", accountJSON("log-rotation-config-token"),
-		"log_max_size_mb: 1\nlog_max_backups: 2\n")
+		"log_max_size_mb: 1\nlog_max_backups: 2\n"+apiKeySetting)
 	config, err := loadConfig(configPath)
 	if err != nil {
 		t.Fatalf("loadConfig() with log rotation settings: %v", err)
@@ -612,7 +623,7 @@ func TestLogRotationConfigValuesAndValidation(t *testing.T) {
 		{name: "non-integer-backups", fields: "log_max_backups: invalid\n", field: "log_max_backups"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			invalidConfigPath := writeConfigWithAccount(t, "log-rotation", accountJSON("log-rotation-config-token"), tc.fields)
+			invalidConfigPath := writeConfigWithAccount(t, "log-rotation", accountJSON("log-rotation-config-token"), tc.fields+apiKeySetting)
 			_, err := loadConfig(invalidConfigPath)
 			if err == nil {
 				t.Fatalf("无效的 %s 未被拒绝", tc.field)
@@ -679,7 +690,7 @@ func TestRunWarnsWhenConfigPermissionsAreTooBroad(t *testing.T) {
 	}
 
 	configPath := writeConfigWithAccount(t, "config-permission", accountJSON("permission-warning-oauth-token"),
-		"log_level: info\n")
+		minimalConfig)
 	if err := os.Chmod(configPath, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -731,7 +742,7 @@ func TestRunWarnsWhenCredentialPermissionsAreTooBroad(t *testing.T) {
 		t.Fatalf("credentials file mode = %04o, want 0644", got)
 	}
 
-	configPath := writeConfigInDir(t, configDir, appConfigYAML("127.0.0.1:0", "", "", "info"))
+	configPath := writeConfigInDir(t, configDir, appConfigYAML("127.0.0.1:0", "", validAPIKey, "info"))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var stdout, stderr bytes.Buffer
@@ -817,7 +828,7 @@ func TestRunLoadsYAMLServiceSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	const apiKey = "yaml-api-key-secret"
+	const apiKey = validAPIKey
 	configPath := writeConfigWithAccount(t, "yaml-service", accountJSON("yaml-oauth-token"),
 		appConfigYAML(addr, "acme.ghe.com", apiKey, "info"))
 	ctx, cancel := context.WithCancel(context.Background())
@@ -941,7 +952,7 @@ func TestRunWritesLogToDefaultAndRelativeLogsPaths(t *testing.T) {
 			configDir := t.TempDir()
 			writeCredentialFile(t, filepath.Join(configDir, "data", "credentials", "alice.json"),
 				`{"oauth_token":"log-path-token"}`)
-			configPath := writeConfigInDir(t, configDir, tc.config+"listen: 127.0.0.1:0\n")
+			configPath := writeConfigInDir(t, configDir, tc.config+"listen: 127.0.0.1:0\n"+apiKeySetting)
 
 			err := runWithCancelledContext([]string{"-c", configPath})
 			if !errors.Is(err, context.Canceled) {
@@ -974,7 +985,7 @@ func TestRunWritesLogToDefaultAndRelativeLogsPaths(t *testing.T) {
 }
 
 func TestRunRotatesLogsAndRetainsConfiguredBackups(t *testing.T) {
-	configPath, configDir := writeLongConfigFile(t, "log_max_size_mb: 1\nlog_max_backups: 2\n")
+	configPath, configDir := writeLongConfigFile(t, "log_max_size_mb: 1\nlog_max_backups: 2\n"+apiKeySetting)
 	writeCredentialFile(t, filepath.Join(configDir, "data", "credentials", "alice.json"),
 		`{"oauth_token":"log-rotation-token"}`)
 
@@ -1176,7 +1187,7 @@ func TestRunAcceptsSupportedLogLevels(t *testing.T) {
 	for _, level := range []string{"debug", "info", "warn", "error"} {
 		t.Run(level, func(t *testing.T) {
 			configPath := writeConfigWithAccount(t, "log-level", accountJSON("log-level-token"),
-				appConfigYAML("0.0.0.0:0", "", "test-api-key", level))
+				appConfigYAML("0.0.0.0:0", "", validAPIKey, level))
 			err := runWithCancelledContext([]string{"-c", configPath})
 			if err != nil && !errors.Is(err, context.Canceled) {
 				t.Fatalf("日志级别 %q 未被接受: %v", level, err)
@@ -1194,10 +1205,10 @@ func TestRunRejectsInvalidYAMLAndSettings(t *testing.T) {
 		config string
 	}{
 		{"malformed-yaml", "listen: [\n"},
-		{"invalid-log-level", appConfigYAML("127.0.0.1:0", "", "", "trace")},
-		{"invalid-host", appConfigYAML("127.0.0.1:0", "evil.example", "", "info")},
-		{"legacy-cli-token-mode", appConfigYAML("127.0.0.1:0", "", "", "info") + "token_mode: cli\n"},
-		{"invalid-listen-address", appConfigYAML("not-a-listener", "", "", "info")},
+		{"invalid-log-level", appConfigYAML("127.0.0.1:0", "", validAPIKey, "trace")},
+		{"invalid-host", appConfigYAML("127.0.0.1:0", "evil.example", validAPIKey, "info")},
+		{"legacy-cli-token-mode", appConfigYAML("127.0.0.1:0", "", validAPIKey, "info") + "token_mode: cli\n"},
+		{"invalid-listen-address", appConfigYAML("not-a-listener", "", validAPIKey, "info")},
 		{"non-local-listen-requires-api-key", appConfigYAML("0.0.0.0:0", "", "", "info")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1260,9 +1271,9 @@ func TestManagementKeyConfig(t *testing.T) {
 		wantErr  bool
 	}{
 		{name: "default-empty", contents: minimalConfig, want: ""},
-		{name: "trimmed", contents: "management_key: \"  mgmt-secret  \"\n", want: "mgmt-secret"},
-		{name: "same-as-api-key", contents: "management_key: shared-secret\napi_key: shared-secret\n", wantErr: true},
-		{name: "same-after-trim", contents: "management_key: \" shared-secret \"\napi_key: shared-secret\n", wantErr: true},
+		{name: "trimmed", contents: "management_key: " + strconv.Quote("  "+validManagementKey+"  ") + "\n" + apiKeySetting, want: validManagementKey},
+		{name: "same-as-api-key", contents: "management_key: " + validAPIKey + "\napi_key: " + validAPIKey + "\n", wantErr: true},
+		{name: "same-after-trim", contents: "management_key: \" " + validAPIKey + " \"\napi_key: " + validAPIKey + "\n", wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			configPath := writeConfigWithAccount(t, "mgmt-config", accountJSON("mgmt-config-token"), tc.contents)
@@ -1292,7 +1303,7 @@ func TestSessionAffinityConfig(t *testing.T) {
 		wantTTL  time.Duration
 		wantErr  bool
 	}{
-		{name: "defaults", contents: minimalConfig, wantOn: true, wantTTL: 2 * time.Hour},
+		{name: "defaults", contents: "", wantOn: true, wantTTL: 2 * time.Hour},
 		{name: "disabled", contents: "session_affinity: false\n", wantOn: false, wantTTL: 2 * time.Hour},
 		{name: "custom-ttl", contents: "session_affinity_ttl: \"30m\"\n", wantOn: true, wantTTL: 30 * time.Minute},
 		{name: "invalid-switch", contents: "session_affinity: maybe\n", wantErr: true},
@@ -1301,7 +1312,7 @@ func TestSessionAffinityConfig(t *testing.T) {
 		{name: "negative-ttl", contents: "session_affinity_ttl: \"-1s\"\n", wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			configPath := writeConfigWithAccount(t, "affinity-config", accountJSON("affinity-config-token"), tc.contents)
+			configPath := writeConfigWithAccount(t, "affinity-config", accountJSON("affinity-config-token"), apiKeySetting+tc.contents)
 			config, err := loadConfig(configPath)
 			if tc.wantErr {
 				if err == nil {
@@ -1328,7 +1339,7 @@ func TestSessionAffinityMaxPerAccountConfig(t *testing.T) {
 		want     int
 		wantErr  bool
 	}{
-		{name: "default", contents: minimalConfig, want: 5},
+		{name: "default", contents: "", want: 5},
 		{name: "zero-unlimited", contents: "session_affinity_max_per_account: 0\n", want: 0},
 		{name: "custom", contents: "session_affinity_max_per_account: 3\n", want: 3},
 		{name: "negative", contents: "session_affinity_max_per_account: -1\n", wantErr: true},
@@ -1338,7 +1349,7 @@ func TestSessionAffinityMaxPerAccountConfig(t *testing.T) {
 		{name: "invalid-with-affinity-off", contents: "session_affinity: false\nsession_affinity_max_per_account: -1\n", wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			configPath := writeConfigWithAccount(t, "affinity-max", accountJSON("affinity-max-token"), tc.contents)
+			configPath := writeConfigWithAccount(t, "affinity-max", accountJSON("affinity-max-token"), apiKeySetting+tc.contents)
 			config, err := loadConfig(configPath)
 			if tc.wantErr {
 				if err == nil {
@@ -1390,8 +1401,8 @@ func TestManagementKeyAllowsEmptyCredentialsDirectory(t *testing.T) {
 		createDir bool
 		wantErr   bool
 	}{
-		{name: "management-key-creates-missing-directory", contents: "management_key: mgmt-secret\n"},
-		{name: "management-key-accepts-empty-directory", contents: "management_key: mgmt-secret\n", createDir: true},
+		{name: "management-key-creates-missing-directory", contents: "management_key: " + validManagementKey + "\n" + apiKeySetting},
+		{name: "management-key-accepts-empty-directory", contents: "management_key: " + validManagementKey + "\n" + apiKeySetting, createDir: true},
 		{name: "without-management-key-missing-directory-fails", contents: minimalConfig, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1434,8 +1445,8 @@ func TestPoolConfigMapsServiceSettings(t *testing.T) {
 		contents string
 		wantTTL  time.Duration
 	}{
-		{name: "affinity-enabled", contents: "management_key: mgmt-secret\nhost: acme.ghe.com\n", wantTTL: 2 * time.Hour},
-		{name: "affinity-disabled", contents: "management_key: mgmt-secret\nhost: acme.ghe.com\nsession_affinity: false\n", wantTTL: 0},
+		{name: "affinity-enabled", contents: "management_key: " + validManagementKey + "\nhost: acme.ghe.com\n" + apiKeySetting, wantTTL: 2 * time.Hour},
+		{name: "affinity-disabled", contents: "management_key: " + validManagementKey + "\nhost: acme.ghe.com\nsession_affinity: false\n" + apiKeySetting, wantTTL: 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			configDir := isolatedConfigDir(t)
@@ -1444,8 +1455,8 @@ func TestPoolConfigMapsServiceSettings(t *testing.T) {
 				t.Fatalf("loadConfig() error = %v", err)
 			}
 			pool := config.poolConfig(nil)
-			if pool.ManagementKey != "mgmt-secret" || pool.Host != "acme.ghe.com" || pool.SessionAffinityTTL != tc.wantTTL {
-				t.Fatalf("PoolConfig = %+v, want 管理密钥 mgmt-secret、host acme.ghe.com、亲和 TTL %s", pool, tc.wantTTL)
+			if pool.ManagementKey != validManagementKey || pool.Host != "acme.ghe.com" || pool.SessionAffinityTTL != tc.wantTTL {
+				t.Fatalf("PoolConfig = %+v, want 管理密钥 %s、host acme.ghe.com、亲和 TTL %s", pool, validManagementKey, tc.wantTTL)
 			}
 			if pool.CredentialsDir != filepath.Join(configDir, "data", "credentials") ||
 				pool.CacheDir != filepath.Join(configDir, "data", "cache") {
@@ -1520,9 +1531,9 @@ func startServiceForTest(t *testing.T, configPath, addr string) string {
 func TestRunServesWithoutCredentialsWhenManagementKeySet(t *testing.T) {
 	addr := freeLoopbackAddressForTest(t)
 	configDir := isolatedConfigDir(t)
-	const key = "live-management-key"
+	const key = validManagementKey
 	configPath := writeConfigInDir(t, configDir, fmt.Sprintf("listen: %s\nmanagement_key: %s\n",
-		strconv.Quote(addr), strconv.Quote(key)))
+		strconv.Quote(addr), strconv.Quote(key))+apiKeySetting)
 	baseURL := startServiceForTest(t, configPath, addr)
 
 	page, err := http.Get(baseURL + "/management")

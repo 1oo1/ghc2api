@@ -249,7 +249,7 @@ func TestManagementImportRefusesExistingCredentialFile(t *testing.T) {
 
 // TestManagementConsoleSetsFramingProtection 控制台页面禁止被其他站点嵌入（防点击劫持）。
 func TestManagementConsoleSetsFramingProtection(t *testing.T) {
-	p, err := NewManagedPool(PoolConfig{ManagementKey: mgmtKey, CredentialsDir: t.TempDir(), CacheDir: t.TempDir()}, nil)
+	p, err := NewManagedPool(PoolConfig{APIKey: testAPIKey, ManagementKey: mgmtKey, CredentialsDir: t.TempDir(), CacheDir: t.TempDir()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +350,7 @@ func TestManagementRefreshCancelledByClientKeepsCacheAndRetriesNextList(t *testi
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		p.Handler().ServeHTTP(w, r)
+		withTestAPIKey(p.Handler()).ServeHTTP(w, r)
 	}()
 	reviewAwait(t, hold.started, "强制刷新未到达上游")
 	cancel()
@@ -388,7 +388,7 @@ func TestManagementClientCancelDuringSessionDoesNotCountError(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		p.Handler().ServeHTTP(w, r)
+		withTestAPIKey(p.Handler()).ServeHTTP(w, r)
 	}()
 	reviewAwait(t, hold.started, "请求未到达 session 交换")
 	cancel()

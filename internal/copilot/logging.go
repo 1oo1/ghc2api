@@ -39,20 +39,50 @@ func (s *Service) addSecret(value string) {
 // logFunc 输出请求级日志；实现必须对敏感值脱敏。
 type logFunc func(ctx context.Context, level slog.Level, message string, args ...any)
 
-// withRequestLog 为每个客户端请求分配 request_id（取自 seq 递增），把绑定该 ID 的日志器写入上下文，
-// 记录收到与完成日志后调用 next。Service 与 Pool 共用此包装，只在日志器、序号和输出函数上不同。
-func withRequestLog(logger *slog.Logger, seq *atomic.Uint64, logf logFunc, next http.Handler) http.Handler {
+// withRequestID 为每个客户端请求分配 request_id（取自 seq 递增），把绑定该 ID 的日志器写入上下文。
+// 位于最外层，因此鉴权告警也带有 request_id；本身不输出日志。Service 与 Pool 共用此包装。
+func withRequestID(logger *slog.Logger, seq *atomic.Uint64, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := bindRequestLogger(r.Context(), logger.With("request_id", seq.Add(1)))
-		r = r.WithContext(ctx)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// withRequestLog 输出客户端请求的"收到"与"处理完成"日志，然后调用 next。
+// 它必须位于鉴权之内：鉴权失败的请求在此之前已被拒绝，只输出鉴权告警，不输出这两条日志。
+// 日志器与 request_id 由 withRequestID 绑定。
+func withRequestLog(logf logFunc, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writer := &statusResponseWriter{ResponseWriter: w, status: http.StatusOK}
 		started := time.Now()
-		logf(ctx, slog.LevelInfo, "收到客户端请求", "method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr,
+		logf(r.Context(), slog.LevelInfo, "收到客户端请求", "method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr,
 			"headers", clientHeadersForLog(r.Header))
 		next.ServeHTTP(writer, r)
-		logf(ctx, slog.LevelInfo, "客户端请求处理完成", "method", r.Method, "path", r.URL.Path,
+		logf(r.Context(), slog.LevelInfo, "客户端请求处理完成", "method", r.Method, "path", r.URL.Path,
 			"status", writer.status, "duration_ms", time.Since(started).Milliseconds())
 	})
+}
+
+// maxAuthFailureFieldBytes 是鉴权失败告警中 method 与 path 字段的上限（256 字节），避免未通过鉴权的客户端用超长值撑大日志。
+const maxAuthFailureFieldBytes = 256
+
+// authFailureField 返回鉴权失败告警中使用的字段值：最多 256 字节，按 UTF-8 字符边界截断，不切开多字节字符。
+func authFailureField(value string) string {
+	if len(value) <= maxAuthFailureFieldBytes {
+		return value
+	}
+	end := maxAuthFailureFieldBytes
+	for end > 0 && !utf8.RuneStart(value[end]) {
+		end--
+	}
+	return value[:end]
+}
+
+// logAuthFailure 输出一条鉴权失败告警（WARN），字段为 method、path（均按 authFailureField 截断）与 remote_addr。
+// 鉴权失败的请求不输出请求日志，因此告警是这类请求唯一的记录。
+func logAuthFailure(logf logFunc, r *http.Request, message string) {
+	logf(r.Context(), slog.LevelWarn, message, "method", authFailureField(r.Method), "path", authFailureField(r.URL.Path),
+		"remote_addr", r.RemoteAddr)
 }
 
 // clientHeadersForLog 把客户端请求头转为日志字段：敏感头（鉴权、密钥、cookie 等）整体替换为 [REDACTED]，

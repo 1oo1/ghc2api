@@ -31,6 +31,7 @@ func affinityLogPool(t *testing.T, up *mgmtUpstream, level slog.Level, ttl time.
 	}
 	logs := &bytes.Buffer{}
 	p, err := NewManagedPool(PoolConfig{
+		APIKey:        affinityLogClientKey,
 		ManagementKey: mgmtKey, CredentialsDir: dir, CacheDir: t.TempDir(), Client: up.client,
 		SessionAffinityTTL: ttl, Logger: slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: level})),
 	}, accounts)
@@ -48,7 +49,7 @@ func affinityLogChat(t *testing.T, p *Pool, body string) {
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("Authorization", "Bearer "+affinityLogClientKey)
 	w := httptest.NewRecorder()
-	p.Handler().ServeHTTP(w, r)
+	withTestAPIKey(p.Handler()).ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
 		t.Fatalf("生成请求 status=%d body=%s", w.Code, w.Body.String())
 	}

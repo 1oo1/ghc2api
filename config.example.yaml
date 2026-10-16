@@ -20,12 +20,14 @@ data_path: "./data"
 # 留空时各账号使用凭证中的 host，缺省为 github.com。
 host: ""
 
-# 本服务的访问密钥，不是 GitHub token。非本机监听地址必须设置。
+# 本服务的访问密钥，不是 GitHub token。必填，与监听地址无关：去除首尾空白后至少 32 字节，建议用随机字符串（例如 openssl rand -hex 32）。
+# 留空或不足 32 字节时启动失败。配置文件中不接受 allow_anonymous 键（出现即启动失败），不存在匿名模式。
+# 经反向代理或其他方式对外暴露时，建议在反向代理层对鉴权失败（401）做限速，本服务不做限速。
 api_key: ""
 
 # 管理密钥：用于 Web 控制台（/management）和管理接口（/v0/management/）。留空表示两者都不存在。
-# 必须与 api_key 不同；管理接口只接受 Authorization: Bearer，不接受服务访问密钥。
-# 建议使用至少 32 个字符的随机字符串；服务不对管理接口做失败次数限制。
+# 必须与 api_key 不同；去除首尾空白后非空时至少 32 字节。管理接口只接受 Authorization: Bearer，不接受服务访问密钥。
+# 服务不对管理接口做失败次数限制。
 # 设置后 credentials 目录不存在会自动创建（权限 0700），并允许暂时没有任何账号。
 management_key: ""
 
@@ -40,6 +42,12 @@ session_affinity_ttl: "2h"
 # 新会话（以及绑定账号失败后的切换）优先选择未达上限的账号，以分散负载；已有可用绑定的会话不受此限制，
 # 所有账号都达到上限时照常分配。仅在 session_affinity 开启时生效。
 session_affinity_max_per_account: 5
+
+# 同时处理的生成请求数上限（chat completions、responses、messages），必须是大于等于 0 的整数，默认 32；0 表示不限制。
+# 写成空值（max_concurrent_requests: 即 YAML null）时按未设置处理，取 32。
+# 名额已满时新的生成请求立即返回 503（消息含"并发"），不读取请求体、不选账号、不访问上游。
+# 模型列表、健康检查与管理接口不占用名额；名额在请求结束（含流式响应结束）后释放。
+max_concurrent_requests: 32
 
 # 日志级别：debug、info、warn 或 error。debug 会记录脱敏后的完整上游 API 正文，
 # 会增加内存和日志占用；日志中也可能包含提示词和生成内容等业务数据。

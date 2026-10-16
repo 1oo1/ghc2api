@@ -52,7 +52,8 @@ func TestAcceptTermsDoesNotReuseStalePersistentModelCache(t *testing.T) {
 		}
 	})
 	config := Config{
-		Token: "github-secret", CacheDir: t.TempDir(), ModelsCacheTTL: time.Hour, Client: client,
+		APIKey: testAPIKey,
+		Token:  "github-secret", CacheDir: t.TempDir(), ModelsCacheTTL: time.Hour, Client: client,
 	}
 	current := session{Token: "session-secret", API: "https://api.githubcopilot.com"}
 

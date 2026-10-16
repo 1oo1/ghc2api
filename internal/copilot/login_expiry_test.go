@@ -70,6 +70,7 @@ func TestLoginParentCancellationIsNotReportedAsExpiredCode(t *testing.T) {
 func TestManagementDeviceLoginReportsExpiredCodeInChinese(t *testing.T) {
 	dir := t.TempDir()
 	p, err := NewManagedPool(PoolConfig{
+		APIKey:        testAPIKey,
 		ManagementKey: mgmtKey, CredentialsDir: dir, CacheDir: t.TempDir(), Client: loginExpiryClient(t),
 	}, nil)
 	if err != nil {

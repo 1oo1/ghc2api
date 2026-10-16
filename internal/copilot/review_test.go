@@ -35,7 +35,7 @@ func TestReviewCancelledMetadataWaiterReturnsPromptly(t *testing.T) {
 					return response(fmt.Sprintf(`{"session_token":"auto","selected_model":"gpt-4.1","expires_at":%d}`, time.Now().Add(time.Hour).Unix())), nil
 				}
 			})}
-			s := testService(t, Config{Token: "github-secret", Client: client})
+			s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: client})
 			current := session{Token: "session", API: "https://api.githubcopilot.com"}
 			call := func(ctx context.Context) error {
 				switch kind {
@@ -115,7 +115,7 @@ func TestReviewLastAutoRejectionDoesNotPoisonNextRequest(t *testing.T) {
 		}
 		return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
 	})}
-	s := testService(t, Config{Token: "github-secret", Client: client})
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: client})
 	body := `{"model":"auto","messages":[{"role":"user","content":"hello"}]}`
 	if w := testRequest(s, "POST", "/v1/chat/completions", body); w.Code != http.StatusBadRequest || generations != 3 {
 		t.Fatalf("首次失败请求：状态=%d，生成次数=%d", w.Code, generations)

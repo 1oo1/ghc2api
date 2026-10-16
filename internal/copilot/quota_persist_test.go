@@ -29,6 +29,7 @@ func newPersistFixture(t *testing.T, up *mgmtUpstream, users ...string) *persist
 	t.Helper()
 	dir := t.TempDir()
 	f := &persistFixture{config: PoolConfig{
+		APIKey:        testAPIKey,
 		ManagementKey: mgmtKey, CredentialsDir: dir, CacheDir: t.TempDir(), Client: up.client,
 	}}
 	for _, user := range users {
@@ -496,7 +497,7 @@ func TestCancelledQuotaRefreshDoesNotWriteFile(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			p.Handler().ServeHTTP(httptest.NewRecorder(), r)
+			withTestAPIKey(p.Handler()).ServeHTTP(httptest.NewRecorder(), r)
 		}()
 		reviewAwait(t, hold.started, "额度请求未到达上游")
 		cancel()
@@ -525,7 +526,7 @@ func TestCancelledQuotaRefreshDoesNotWriteFile(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			p.Handler().ServeHTTP(httptest.NewRecorder(), r)
+			withTestAPIKey(p.Handler()).ServeHTTP(httptest.NewRecorder(), r)
 		}()
 		reviewAwait(t, hold.started, "强制刷新未到达上游")
 		cancel()
@@ -551,7 +552,7 @@ func TestQuotaPersistenceSkippedWithoutCacheDir(t *testing.T) {
 	if err := SaveCredential(filepath.Join(dir, "alice.json"), Credential{Token: "oauth-alice", User: "alice"}); err != nil {
 		t.Fatal(err)
 	}
-	config := PoolConfig{ManagementKey: mgmtKey, CredentialsDir: dir, Client: up.client}
+	config := PoolConfig{APIKey: testAPIKey, ManagementKey: mgmtKey, CredentialsDir: dir, Client: up.client}
 	accounts := []PoolAccount{{Token: "oauth-alice", User: "alice"}}
 
 	p1, err := NewManagedPool(config, accounts)
@@ -609,7 +610,7 @@ func TestImportedAccountsRefreshQuotaOnceAfterAdd(t *testing.T) {
 			f := newPersistFixture(t, up)
 			p := f.start(t)
 			// 账号尚未加入池，因此用同样的 Host 与 Token 计算它的缓存目录。
-			seed, err := New(Config{Token: token, CacheDir: f.config.CacheDir})
+			seed, err := New(Config{APIKey: testAPIKey, Token: token, CacheDir: f.config.CacheDir})
 			if err != nil {
 				t.Fatal(err)
 			}

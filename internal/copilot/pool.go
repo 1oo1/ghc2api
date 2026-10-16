@@ -22,7 +22,7 @@ const AccountCooldown = time.Minute
 
 // PoolConfig 是账号池的服务级配置，账号无关的设置都放在这里。
 type PoolConfig struct {
-	APIKey               string        // 客户端访问密钥，空表示不鉴权
+	APIKey               string        // 客户端访问密钥，必填：去除首尾空白后不能为空
 	ManagementKey        string        // 管理密钥；空表示禁用管理接口和控制台（对应路径按普通 404 处理）
 	CredentialsDir       string        // 管理接口新增/删除/禁用账号时读写凭证文件的目录
 	Host                 string        // 顶层 host 覆盖；非空时新增账号与设备登录都使用它
@@ -34,8 +34,12 @@ type PoolConfig struct {
 	// 排除后没有候选或会降为冷却档时忽略上限（见 Pool.choose）。
 	// <=0 表示不限制；缺省值 DefaultSessionAffinityMaxPerAccount 由 cmd 层设置。
 	SessionAffinityMaxPerAccount int
-	Client                       *http.Client // 访问 GitHub/Copilot 的客户端（测试注入），新增账号与设备登录也使用它
-	Logger                       *slog.Logger
+	// MaxConcurrentRequests 是同时处理的生成请求数上限（命中生成接口的请求）；<=0 表示不限制。
+	// 名额已满时立即返回 503，不读取请求体、不选账号；名额在请求处理结束（含流式响应结束）后释放。
+	// 模型列表、健康检查与管理接口不占用名额。缺省值由 cmd 层设置（32）。
+	MaxConcurrentRequests int
+	Client                *http.Client // 访问 GitHub/Copilot 的客户端（测试注入），新增账号与设备登录也使用它
+	Logger                *slog.Logger
 }
 
 // PoolAccount 是启动时载入的一个账号。
@@ -79,6 +83,8 @@ type Pool struct {
 	idle       serviceRoutes  // 不访问上游的路由（健康检查、重定向、404/405），不依赖任何账号
 	affinity   *affinityTable // 会话绑定表；关闭时为 nil
 	management http.Handler   // 管理接口；ManagementKey 为空时为 nil
+	// generations 是生成请求的并发名额（缓冲 channel 作信号量），容量为 MaxConcurrentRequests；不限制时为 nil。
+	generations chan struct{}
 
 	requestSeq atomic.Uint64
 
@@ -91,10 +97,13 @@ type Pool struct {
 }
 
 // NewPool 校验所有账号配置并创建账号池，账号顺序即加入顺序（选择只看优先级、额度与文件名，与顺序无关）。会话亲和与管理接口均关闭。
-// 所有账号的服务访问密钥去除首尾空白后必须一致，GitHub 账号（Host 规范化后与 Token）不能重复。
+// 所有账号的服务访问密钥去除首尾空白后必须一致且非空，GitHub 账号（Host 规范化后与 Token）不能重复。
 func NewPool(configs []Config) (*Pool, error) {
 	if len(configs) == 0 {
 		return nil, errors.New("至少需要一个 GitHub Copilot 账号")
+	}
+	if strings.TrimSpace(configs[0].APIKey) == "" {
+		return nil, errors.New("缺少服务访问密钥 APIKey")
 	}
 	p := &Pool{idle: idleRoutes()}
 	for i, config := range configs {
@@ -115,10 +124,13 @@ func NewPool(configs []Config) (*Pool, error) {
 // NewManagedPool 按服务级配置创建可在运行时管理账号的池。
 // 允许 0 个账号，但仅当 ManagementKey 非空时（否则返回错误“至少需要一个 GitHub Copilot 账号”）。
 // 每个账号的用户名必填且须通过 ValidGitHubUserName；账号重复（Host+Token 相同）或用户名忽略大小写重复时返回错误。
-// ManagementKey 与 APIKey 去除首尾空白后相同时返回错误。
+// APIKey 去除首尾空白后为空，或 ManagementKey 与 APIKey 去除首尾空白后相同时返回错误。
 func NewManagedPool(config PoolConfig, accounts []PoolAccount) (*Pool, error) {
 	config.APIKey = strings.TrimSpace(config.APIKey)
 	config.ManagementKey = strings.TrimSpace(config.ManagementKey)
+	if config.APIKey == "" {
+		return nil, errors.New("缺少服务访问密钥 APIKey")
+	}
 	host, err := NormalizeHost(config.Host)
 	if err != nil {
 		return nil, err
@@ -173,7 +185,7 @@ func (p *Pool) addConfigured(index int, config Config, disabled bool, priority i
 	return nil
 }
 
-// newPool 按服务级配置创建空池，并按配置启用会话亲和与管理接口。开启会话亲和且 CacheDir 非空时，启动即加载绑定文件（见 loadSessionAffinity）。
+// newPool 按服务级配置创建空池，并按配置启用会话亲和、生成请求并发上限与管理接口。开启会话亲和且 CacheDir 非空时，启动即加载绑定文件（见 loadSessionAffinity）。
 func newPool(config PoolConfig) *Pool {
 	logger := config.Logger
 	if logger == nil {
@@ -182,6 +194,9 @@ func newPool(config PoolConfig) *Pool {
 	p := &Pool{
 		apiKey: config.APIKey, logger: logger, config: config, client: safeClient(config.Client),
 		idle: idleRoutes(),
+	}
+	if config.MaxConcurrentRequests > 0 {
+		p.generations = make(chan struct{}, config.MaxConcurrentRequests)
 	}
 	if config.SessionAffinityTTL > 0 {
 		p.affinity = newAffinityTable(config.SessionAffinityTTL)
@@ -213,8 +228,9 @@ func (p *Pool) conflicts(service *Service, id string) bool {
 
 // Handler 返回与单账号 Service 相同的 HTTP 接口：统一鉴权，业务请求按账号选择规则交给某个账号处理。
 // 启用管理接口时，/management 与 /v0/management/ 下的路径改用管理密钥鉴权，不受 api_key 影响。
+// 请求日志位于各自的鉴权之内（见 withRequestLog），未通过鉴权的请求不输出请求日志。
 func (p *Pool) Handler() http.Handler {
-	business := requireAPIKey(p.apiKey, p.log, http.HandlerFunc(p.dispatch))
+	business := requireAPIKey(p.apiKey, p.log, withRequestLog(p.log, http.HandlerFunc(p.dispatch)))
 	var handler http.Handler = business
 	if p.management != nil {
 		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -225,18 +241,46 @@ func (p *Pool) Handler() http.Handler {
 			business.ServeHTTP(w, r)
 		})
 	}
-	return withRequestLog(p.logger, &p.requestSeq, p.log, handler)
+	return withRequestID(p.logger, &p.requestSeq, handler)
 }
 
 // dispatch 按路由登记的上游访问方式分发请求：不访问上游的请求直接处理且不参与账号选择；
-// 需要 session 的请求进入 forward。
+// 需要 session 的请求进入 forward。生成请求（登记了 upstream 的路由）先占用一个并发名额，名额已满时返回 503。
 func (p *Pool) dispatch(w http.ResponseWriter, r *http.Request) {
 	entry := p.routeOf(r)
 	switch entry.need {
 	case needNone:
 		p.idle.mux.ServeHTTP(w, r)
 	default:
+		if entry.upstream != "" {
+			if !p.acquireGeneration() {
+				p.log(r.Context(), slog.LevelWarn, "生成请求并发数已达上限", "limit", p.config.MaxConcurrentRequests)
+				writeError(w, http.StatusServiceUnavailable, "生成请求并发数已达上限，请稍后重试")
+				return
+			}
+			defer p.releaseGeneration()
+		}
 		p.forward(w, r, p.affinityKey(r, entry.upstream))
+	}
+}
+
+// acquireGeneration 尝试占用一个生成请求的名额，不等待；未限制时总是成功。
+func (p *Pool) acquireGeneration() bool {
+	if p.generations == nil {
+		return true
+	}
+	select {
+	case p.generations <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// releaseGeneration 释放 acquireGeneration 占用的名额；只能在成功占用后调用。
+func (p *Pool) releaseGeneration() {
+	if p.generations != nil {
+		<-p.generations
 	}
 }
 

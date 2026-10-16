@@ -25,7 +25,7 @@ func exhaustedQuota(reset string) *Quota {
 // newAffinityPriorityPool 与 newPriorityPool 相同，但开启会话亲和（默认 TTL），用于测试 choose 的亲和分支。
 func newAffinityPriorityPool(t *testing.T, accounts ...PoolAccount) *Pool {
 	t.Helper()
-	p, err := NewManagedPool(PoolConfig{CacheDir: t.TempDir(), SessionAffinityTTL: DefaultSessionAffinityTTL}, accounts)
+	p, err := NewManagedPool(PoolConfig{APIKey: testAPIKey, CacheDir: t.TempDir(), SessionAffinityTTL: DefaultSessionAffinityTTL}, accounts)
 	if err != nil {
 		t.Fatal(err)
 	}

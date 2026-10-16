@@ -120,7 +120,7 @@ func writeAffinityServiceConfig(t *testing.T, addr, extra string) (configPath, c
 	t.Helper()
 	configDir := isolatedConfigDir(t)
 	writeCredentialFile(t, filepath.Join(configDir, "data", "credentials", "alice.json"), accountJSON("affinity-shutdown-token"))
-	configPath = writeConfigInDir(t, configDir, appConfigYAML(addr, "", "", "info")+extra)
+	configPath = writeConfigInDir(t, configDir, appConfigYAML(addr, "", validAPIKey, "info")+extra)
 	return configPath, filepath.Join(configDir, "data", "cache")
 }
 

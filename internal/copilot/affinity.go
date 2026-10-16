@@ -113,12 +113,6 @@ func contentSignal(fields map[string]json.RawMessage, upstreamPath string) strin
 	return "content\x00" + string(raw)
 }
 
-// affinityItem 是 messages 或 Responses input 中的一项，只保留会话判断需要的字段。
-type affinityItem struct {
-	Role    string          `json:"role"`
-	Content json.RawMessage `json:"content"`
-}
-
 // firstUserText 返回第一条 user 消息的文本。Responses 的 input 可以是字符串（即一条 user 消息），
 // 也可以是消息数组；其他接口读取 messages 数组。
 func firstUserText(fields map[string]json.RawMessage, upstreamPath string) (string, bool) {
@@ -135,42 +129,19 @@ func firstUserText(fields map[string]json.RawMessage, upstreamPath string) (stri
 	return firstUserItemText(fields["messages"])
 }
 
-// firstUserItemText 返回数组中第一条 role 为 user 的项的文本。
+// firstUserItemText 返回数组中第一条 role 为 user 的对象项的文本（见 contentText）。非对象元素与字段类型错误的消息
+// 整项跳过（见 eachMessage），数组无效时返回 false。
 func firstUserItemText(raw json.RawMessage) (string, bool) {
-	var items []affinityItem
-	if json.Unmarshal(raw, &items) != nil {
-		return "", false
-	}
-	for _, item := range items {
-		if item.Role == "user" {
-			return contentText(item.Content), true
-		}
-	}
-	return "", false
-}
-
-// contentText 拼接消息内容中的文本：content 为字符串时直接返回；为数组时按顺序拼接 text 类片段，忽略其他片段。
-// input_text 是 Responses 接口的文本片段类型。
-func contentText(raw json.RawMessage) string {
 	var text string
-	if json.Unmarshal(raw, &text) == nil {
-		return text
-	}
-	var parts []json.RawMessage
-	if json.Unmarshal(raw, &parts) != nil {
-		return ""
-	}
-	var builder strings.Builder
-	for _, part := range parts {
-		var block struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
+	found := false
+	eachMessage(raw, func(m message) bool {
+		if m.Role != "user" {
+			return true
 		}
-		if json.Unmarshal(part, &block) == nil && (block.Type == "text" || block.Type == "input_text") {
-			builder.WriteString(block.Text)
-		}
-	}
-	return builder.String()
+		text, found = contentText(m.Content, ""), true
+		return false
+	})
+	return text, found
 }
 
 // affinityTable 保存会话键到账号 ID 的绑定。每条绑定都有截止时间，条数有上限。所有方法并发安全。

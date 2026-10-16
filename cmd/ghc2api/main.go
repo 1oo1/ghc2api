@@ -88,7 +88,9 @@ func serve(ctx context.Context, config appConfig, logger *slog.Logger) error {
 	server := &http.Server{
 		Handler: pool.Handler(), ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout: 30 * time.Second, IdleTimeout: time.Minute,
-		ErrorLog: log.New(slogWriter{logger: logger}, "", 0),
+		// 请求头上限 64 KiB（Go 另有约 4 KiB 余量；默认 1 MiB），防止未鉴权的客户端用超大请求头占用内存。
+		MaxHeaderBytes: 64 << 10,
+		ErrorLog:       log.New(slogWriter{logger: logger}, "", 0),
 		BaseContext: func(net.Listener) context.Context {
 			return ctx
 		},
