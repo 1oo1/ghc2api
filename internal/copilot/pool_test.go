@@ -627,9 +627,11 @@ func TestPoolSessionFreeRoutesIgnoreSessionFailures(t *testing.T) {
 
 	for _, tc := range []struct {
 		name, method, path string
-		wantCode           int
+		wantCode           int    // 0 表示不检查具体状态码
+		wantLocation       string // 非空表示必须是 3xx 重定向且 Location 等于该值
 	}{
-		{name: "double-slash-redirect", method: "GET", path: "//models", wantCode: http.StatusTemporaryRedirect},
+		// 重定向状态码随 Go 版本变化（旧版 301，新版 307），这里只要求是 3xx，具体值由与 Service 的对比保证一致。
+		{name: "double-slash-redirect", method: "GET", path: "//models", wantLocation: "/models"},
 		{name: "unknown-path", method: "GET", path: "/no-such-route", wantCode: http.StatusNotFound},
 		{name: "wrong-method", method: "GET", path: "/v1/chat/completions", wantCode: http.StatusMethodNotAllowed},
 	} {
@@ -642,6 +644,14 @@ func TestPoolSessionFreeRoutesIgnoreSessionFailures(t *testing.T) {
 			}
 			if tc.wantCode != 0 && got.Code != tc.wantCode {
 				t.Errorf("status = %d, want %d; body=%s", got.Code, tc.wantCode, got.Body.String())
+			}
+			if tc.wantLocation != "" {
+				if got.Code < 300 || got.Code >= 400 {
+					t.Errorf("status = %d, want 3xx; body=%s", got.Code, got.Body.String())
+				}
+				if loc := got.Header().Get("Location"); loc != tc.wantLocation {
+					t.Errorf("Location = %q, want %q", loc, tc.wantLocation)
+				}
 			}
 			// 重定向、404、405 需要与单账号 Service 的状态码和关键响应头完全一致。
 			if got.Code != want.Code || got.Header().Get("Location") != want.Header().Get("Location") ||
