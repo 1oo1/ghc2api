@@ -82,6 +82,7 @@ type Pool struct {
 	client     *http.Client   // 新增账号与设备登录访问 GitHub 的客户端
 	idle       serviceRoutes  // 不访问上游的路由（健康检查、重定向、404/405），不依赖任何账号
 	affinity   *affinityTable // 会话绑定表；关闭时为 nil
+	gate       keyGate        // 同一会话键的选账号、取 session、绑定串行化（见 pickSession），零值可用
 	management http.Handler   // 管理接口；ManagementKey 为空时为 nil
 	// generations 是生成请求的并发名额（缓冲 channel 作信号量），容量为 MaxConcurrentRequests；不限制时为 nil。
 	generations chan struct{}
@@ -310,49 +311,79 @@ func (p *Pool) affinityKey(r *http.Request, upstream string) string {
 	return sessionKey(r, body, upstream)
 }
 
-// forward 处理需要 session 的请求。先按会话亲和（已有绑定）或账号选择规则选出账号并预取 session；
-// session 获取失败时冷却该账号，并在同一请求内改用其他尚未尝试的账号，每个账号最多尝试一次。
+// forward 处理需要 session 的请求。先由 pickSession 选出账号、取得 session 并绑定会话键，再把请求交给该账号处理。
 // 全部失败时按最后一个账号的 handleError 规则返回错误；没有任何可选账号时返回 503。
-// 客户端已取消时不冷却账号。
+// 取 session 期间客户端已取消时不冷却账号；等待会话门时客户端已取消则不写响应。
 // 请求体校验（生成接口）在预取 session 之后才执行，因此全部账号的 session 都失败时，
 // 无效请求体会收到 session 错误而不是 400，这是有意的取舍。
 func (p *Pool) forward(w http.ResponseWriter, r *http.Request, key string) {
-	var (
-		ctx     context.Context
-		last    *poolAccount
-		lastErr error
-	)
+	pick, err := p.pickSession(r, key)
+	if err != nil {
+		// 等待同会话门时客户端已取消：不选账号、不冷却、不计数，也不写响应。
+		return
+	}
+	if pick.account != nil {
+		p.serve(w, r.WithContext(pick.ctx), pick.account)
+		return
+	}
+	if pick.last == nil {
+		writeNoAccount(w)
+		return
+	}
+	// 所有账号的 session 都失败：错误计入最后尝试的账号，之前失败的账号不计数。
+	last := pick.last
+	last.track(r.Context(), w, func(w http.ResponseWriter) { last.service.handleError(pick.ctx, w, pick.err) })
+}
+
+// sessionPick 是 pickSession 的结果。
+type sessionPick struct {
+	account *poolAccount    // 取得 session 并已绑定的账号；nil 表示所有尝试的账号都失败，或没有可选账号
+	ctx     context.Context // account 的请求上下文（带账号日志字段）；未尝试任何账号时为 nil
+	last    *poolAccount    // 最后尝试的账号；nil 表示没有任何可选账号
+	err     error           // last 的 session 错误
+}
+
+// pickSession 为请求选出账号、取得 session 并绑定会话键，供 forward 使用。
+// 开启亲和且键非空时，选择、取 session、绑定都在同一会话键的门（keyGate）之内执行：同键的后到请求排队，
+// 先到者完成绑定后，后到者按已有绑定选择同一账号，从而不会因竞争各选各的账号。
+// 门通过 defer 在返回前释放，因此只覆盖选择、取 session 与绑定，不会持有到响应结束。
+// 等待门时 ctx 被取消则返回错误，此时没有选择任何账号。
+// 账号 session 获取失败时冷却该账号，并在同一请求内改用其他尚未尝试的账号，每个账号最多尝试一次。
+func (p *Pool) pickSession(r *http.Request, key string) (sessionPick, error) {
+	if p.affinity != nil && key != "" {
+		release, err := p.gate.acquire(r.Context(), key)
+		if err != nil {
+			return sessionPick{}, err
+		}
+		defer release()
+	}
+
+	var pick sessionPick
 	tried := map[*poolAccount]bool{}
 	for {
 		account := p.choose(key, tried)
 		if account == nil {
-			break
+			return pick, nil
 		}
 		tried[account] = true
-		ctx = p.accountContext(r.Context(), account)
-		last = account
-		if _, err := account.service.getSession(ctx); err != nil {
-			lastErr = err
-			if ctx.Err() != nil {
-				break
+		pick.ctx = p.accountContext(r.Context(), account)
+		pick.last = account
+		if _, err := account.service.getSession(pick.ctx); err != nil {
+			pick.err = err
+			if pick.ctx.Err() != nil {
+				return pick, nil
 			}
 			account.service.setCooldown(time.Now().Add(AccountCooldown))
-			account.service.log(ctx, slog.LevelWarn, "账号会话获取失败", "error", err, "cooldown", AccountCooldown.String())
+			account.service.log(pick.ctx, slog.LevelWarn, "账号会话获取失败", "error", err, "cooldown", AccountCooldown.String())
 			if !isUpstreamRateLimit(err) {
 				account.refreshAfterError()
 			}
 			continue
 		}
-		p.bind(ctx, key, account)
-		p.serve(w, r.WithContext(ctx), account)
-		return
+		p.bind(pick.ctx, key, account)
+		pick.account = account
+		return pick, nil
 	}
-	if last == nil {
-		writeNoAccount(w)
-		return
-	}
-	// 所有账号的 session 都失败：错误计入最后尝试的账号，之前失败的账号不计数。
-	last.track(r.Context(), w, func(w http.ResponseWriter) { last.service.handleError(ctx, w, lastErr) })
 }
 
 // serve 把请求交给已选定的账号处理，并记录该账号的统计。
@@ -379,7 +410,7 @@ func (a *poolAccount) track(reqCtx context.Context, w http.ResponseWriter, handl
 // bind 把会话键绑定（或续期）到实际处理请求的账号。键为空或未开启亲和时不做任何事。
 // 绑定前先查询原绑定，并按结果输出亲和日志：没有有效原绑定为 Info「新建绑定」，原绑定即该账号为 Debug「命中」，
 // 原绑定是其他账号为 Info「切换账号」。日志只含会话键前 12 个字符与账号 ID，不含完整会话键。
-// lookup 与 bind 之间的并发竞争只影响日志，可以忽略。
+// 调用方（pickSession）须持有该会话键的门，使同键的 lookup 与 bind 不交错。
 func (p *Pool) bind(ctx context.Context, key string, account *poolAccount) {
 	if key == "" || p.affinity == nil {
 		return

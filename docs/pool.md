@@ -1,6 +1,6 @@
 # 账号池：选择、故障切换与冷却
 
-代码：`internal/copilot/pool.go`、`weight.go`、`service.go`（`setCooldown`/`available`）。
+代码：`internal/copilot/pool.go`（`forward`、`pickSession`）、`affinity_gate.go`（会话门）、`weight.go`、`service.go`（`setCooldown`/`available`）。
 
 ## 结构与构造
 
@@ -29,7 +29,11 @@ flowchart TD
     B -- 是 --> B2{"生成接口（登记了 upstream）？<br/>占用并发名额 MaxConcurrentRequests"}
     B2 -- "名额已满" --> B3["503 生成请求并发数已达上限<br/>不读取请求体、不选账号、不访问上游"]
     B2 -- "非生成接口，或占用成功" --> C["affinityKey：计算会话键<br/>仅生成请求且开启亲和；请求体 ≤16 MiB<br/>否则 key 为空"]
-    C --> D["tried = 空集"]
+    C --> C1{"key 非空且开启亲和？"}
+    C1 -- 否 --> D["tried = 空集"]
+    C1 -- 是 --> C2["取得会话门 keyGate(key)<br/>同键请求在此排队；等待受 ctx 约束"]
+    C2 -- "等待中客户端取消" --> C3["直接返回<br/>不选账号、不推进轮询、不冷却、不计数、不写响应"]
+    C2 -- 获得门 --> D
     D --> E["choose(key, tried)"]
     E --> F{"key 非空、开启亲和且已绑定，<br/>绑定账号存在、未禁用、未冷却、<br/>未耗尽、本请求未尝试？"}
     F -- 是 --> G["使用绑定账号<br/>（不受上限限制，不推进轮询）"]
@@ -50,7 +54,8 @@ flowchart TD
     N -- 否 --> O["该账号冷却 1 分钟<br/>非 429 时异步刷新额度"]
     O --> E
     M -- 是 --> P["bind：会话键绑定 / 续期到该账号"]
-    P --> Q["serve：账号处理请求（不再换号）<br/>请求数 +1，更新最近使用时间"]
+    P --> P1["释放会话门（返回前，不持有到响应结束）"]
+    P1 --> Q["serve：账号处理请求（不再换号）<br/>请求数 +1，更新最近使用时间"]
     Q --> R{"响应状态"}
     R -- "上游 429" --> R1["冷却 1 分钟，原样透传<br/>失败数 +1，不刷新额度"]
     R -- "其他 ≥400" --> R2["失败数 +1，异步刷新额度<br/>（客户端取消时不计数、不刷新）"]
@@ -59,6 +64,8 @@ flowchart TD
 
 生成请求占用的并发名额在 `dispatch` 返回时释放（流式响应写完之后），因此名额覆盖整个流式响应的时长。名额只用缓冲 channel 做信号量，不排队等待；名额已满时立即 503，与账号选择、会话亲和互不影响。
 生成响应向客户端写入时每次写入都续期 60 秒的写超时（`generationWriteTimeout`，见 `http-api.md`）：客户端长时间不读取导致写超时后，请求结束并释放名额，因此一个不读取响应的客户端不会永久占用名额。
+
+同一会话键的选择、取 session、绑定由 `pickSession` 在会话门（`keyGate`）内串行执行，后到的同键请求等待先到者完成绑定后再选账号（见 `session-affinity.md`「选择规则」）。门在成功绑定之后、`serve` 之前释放；全部失败（503 或最后账号的错误）与客户端取消时，门在 `pickSession` 返回前释放（`defer`），错误响应在门外写入。等待门时客户端取消则直接返回，不选账号、不推进轮询、不写响应。等待时长受请求 ctx 约束、没有服务端总超时，最坏约为账号数 × 单次取 session 超时（30 秒），细则见 `session-affinity.md`。亲和关闭或键为空时不加门。
 
 ### 候选过滤、分档与轮询（`pickLocked`）
 
@@ -118,4 +125,4 @@ flowchart TD
 
 ## 测试依赖的内部名字
 
-`Pool.accounts`、`pickLocked(now, tried map[*poolAccount]bool)`、`(*Pool).choose(key string, tried map[*poolAccount]bool)`、`(quotaWeight).swrrWeight() int`、`DefaultSessionAffinityMaxPerAccount`、`PoolConfig.SessionAffinityMaxPerAccount`、`(*affinityTable).activeCounts(time.Time) map[string]int`、`MinPriority`/`MaxPriority`、`quotaWeight`/`weigh(*Quota)`、`exhaustedUntil(*Quota)`、`(*poolAccount).exhausted(time.Time) bool`、`(*Service).setCooldown(time.Time)`/`available(time.Time) bool`、`(*Pool).findAccount(id)`（忽略大小写）、`(*Service).cacheDir`、`(*Pool).Handler()`、`generationWriteTimeout`；额度刷新相关的 `DefaultQuotaRefreshInterval`、`(*Service).quotaRefreshInterval`、`quotaRefreshTick`、`quotaErrorRefreshInterval`、`quotaRefreshTimeout`、`(*Pool).RunQuotaRefresh(ctx)`、`(*poolAccount).refreshAfterError()`、`quotaCache.refreshing`；测试辅助 `testClient`、`testJSON`、`testService`、`testDevice`（login_test.go）、`poolUpstream`（pool_test.go）、`quotaTimeoutMessage`（management_review_test.go）。其余名字见 `session-affinity.md`、`quota-stats.md`、`management.md`。
+`(*Pool).gate`、`keyGate`（字段 `mu`、`m`）、`gateEntry.waiters`、`Pool.accounts`、`pickLocked(now, tried map[*poolAccount]bool)`、`(*Pool).choose(key string, tried map[*poolAccount]bool)`、`(quotaWeight).swrrWeight() int`、`DefaultSessionAffinityMaxPerAccount`、`PoolConfig.SessionAffinityMaxPerAccount`、`(*affinityTable).activeCounts(time.Time) map[string]int`、`MinPriority`/`MaxPriority`、`quotaWeight`/`weigh(*Quota)`、`exhaustedUntil(*Quota)`、`(*poolAccount).exhausted(time.Time) bool`、`(*Service).setCooldown(time.Time)`/`available(time.Time) bool`、`(*Pool).findAccount(id)`（忽略大小写）、`(*Service).cacheDir`、`(*Pool).Handler()`、`generationWriteTimeout`；额度刷新相关的 `DefaultQuotaRefreshInterval`、`(*Service).quotaRefreshInterval`、`quotaRefreshTick`、`quotaErrorRefreshInterval`、`quotaRefreshTimeout`、`(*Pool).RunQuotaRefresh(ctx)`、`(*poolAccount).refreshAfterError()`、`quotaCache.refreshing`；测试辅助 `testClient`、`testJSON`、`testService`、`testDevice`（login_test.go）、`poolUpstream`（pool_test.go）、`quotaTimeoutMessage`（management_review_test.go）。其余名字见 `session-affinity.md`、`quota-stats.md`、`management.md`。
