@@ -1,0 +1,21 @@
+# docker compose 示例：复制为 docker-compose.yml 后按需修改。
+#   1. 复制 config.example.yaml 为 config.yaml，并至少修改：
+#      - listen: "0.0.0.0:8080"（默认的 127.0.0.1 在容器外不可达）
+#      - api_key（必填，至少 32 字节）；需要 Web 控制台时再设置 management_key
+#   2. 将 config.yaml 属主改为容器用户并收紧权限：sudo chown 65532 config.yaml && chmod 600 config.yaml
+#   3. docker compose up -d
+services:
+  ghc2api:
+    # 将 <owner>/<repo> 替换为实际的 GitHub 仓库（全小写）；生产环境建议固定为具体版本号，例如 :0.0.1。
+    image: ghcr.io/<owner>/<repo>:latest
+    restart: unless-stopped
+    ports:
+      # 只监听本机；需要对外提供服务时改为 "8080:8080"，并建议放在带 TLS 的反向代理之后。
+      - "127.0.0.1:8080:8080"
+    volumes:
+      # 配置文件只读挂载到数据目录中；凭证、会话亲和与额度缓存、日志（默认在 /data/data、/data/logs）保存在命名卷里。
+      - ./config.yaml:/data/config.yaml:ro
+      - ghc2api-data:/data
+
+volumes:
+  ghc2api-data:

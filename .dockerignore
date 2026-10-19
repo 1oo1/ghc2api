@@ -1,0 +1,10 @@
+.git
+.github
+.local
+bin
+data
+logs
+config.yaml
+credentials.json*
+.env
+web/node_modules

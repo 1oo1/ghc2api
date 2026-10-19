@@ -6,6 +6,7 @@
 - 页面：
   - 「概览」：可用账号数、累计请求、错误数、各账号请求统计表。
   - 「账号与额度」：账号卡片显示状态、Credits/Premium/Additional Budget 进度条与重置时间、请求统计；可刷新额度、启用/禁用、改优先级（数字框+保存）、删除；工具栏可导入凭证 JSON、GitHub 设备登录。
+- 版本：侧边栏品牌区显示服务端版本号（`GET /v0/management/version`）；加载失败时不显示。
 - 登录态：管理密钥存于当前标签页 `sessionStorage`（`web/src/session.ts`，键 `ghc2api.managementKey`），刷新保持登录；关闭标签页、退出或密钥失效时清除；存储不可用时静默忽略，退化为只存 React state。
 - 安全：同源脚本可读取该密钥，风险已接受；控制台不得引入第三方脚本。
 - 不包含 API Keys、运行日志、设置、模型列表、刷新凭据等功能。

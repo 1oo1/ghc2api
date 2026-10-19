@@ -15,6 +15,7 @@
 | 方法与路径 | 请求 | 响应 |
 | --- | --- | --- |
 | `GET /management` | — | 控制台 HTML（`web.Index()`） |
+| `GET /v0/management/version` | — | `{"version":"v0.0.1"}`，程序版本号（`copilot.Version`），控制台侧边栏显示 |
 | `GET /v0/management/accounts` | — | `[]AccountView`，顺带刷新过期额度（见 `quota-stats.md`） |
 | `POST /v0/management/accounts` | `{"credential":{"oauth_token":"...","host":"","user":""}}` | `200 AccountView` |
 | `PATCH /v0/management/accounts` | `{"id":"alice","disabled":true,"priority":50}` | `200 AccountView` |

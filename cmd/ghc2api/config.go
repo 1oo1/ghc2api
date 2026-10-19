@@ -33,13 +33,16 @@ const (
 )
 
 type appConfig struct {
-	Listen              string        `yaml:"listen"`
-	DataPath            string        `yaml:"data_path"`
-	LogsPath            string        `yaml:"logs_path"`
-	Host                string        `yaml:"host"`
-	APIKey              string        `yaml:"api_key"`        // 必填，去除首尾空白后至少 32 字节，与监听地址无关
-	ManagementKey       string        `yaml:"management_key"` // 为空时禁用 Web 控制台与管理接口
-	LogLevel            string        `yaml:"log_level"`
+	Listen        string `yaml:"listen"`
+	DataPath      string `yaml:"data_path"`
+	LogsPath      string `yaml:"logs_path"`
+	Host          string `yaml:"host"`
+	APIKey        string `yaml:"api_key"`        // 必填，去除首尾空白后至少 32 字节，与监听地址无关
+	ManagementKey string `yaml:"management_key"` // 为空时禁用 Web 控制台与管理接口
+	LogLevel      string `yaml:"log_level"`
+	// LogToStderrValue 保留原值以区分缺省（默认同时写标准错误）与显式 false。
+	LogToStderrValue    *bool         `yaml:"log_to_stderr"`
+	LogFileOnly         bool          `yaml:"-"` // 为 true 时日志只写文件，不写标准错误
 	ModelsCacheTTLValue string        `yaml:"models_cache_ttl"`
 	ModelsCacheTTL      time.Duration `yaml:"-"`
 	// QuotaRefreshIntervalValue 保留原值，解析与校验见 loadConfig。
@@ -147,6 +150,7 @@ func loadConfig(path string) (appConfig, error) {
 	if config.ManagementKey != "" && config.ManagementKey == config.APIKey {
 		return appConfig{}, errors.New("management_key 必须与 api_key 不同")
 	}
+	config.LogFileOnly = config.LogToStderrValue != nil && !*config.LogToStderrValue
 	config.SessionAffinity = true
 	if config.SessionAffinityValue != nil {
 		config.SessionAffinity = *config.SessionAffinityValue

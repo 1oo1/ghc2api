@@ -29,6 +29,9 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) (runErr error) {
+	if isHealthcheck(args) {
+		return runHealthcheck(ctx, args)
+	}
 	configPath, err := configPath(args)
 	if err != nil {
 		return err
@@ -46,7 +49,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (runErr e
 			runErr = fmt.Errorf("关闭日志文件失败: %w", err)
 		}
 	}()
-	logger.InfoContext(ctx, "配置加载完成", "config_file", configPath, "log_level", config.LogLevel)
+	logger.InfoContext(ctx, "配置加载完成", "version", copilot.Version, "config_file", configPath, "log_level", config.LogLevel)
 	if config.insecurePermissions {
 		logger.WarnContext(ctx, "配置文件权限过宽，建议执行 chmod 600", "config_file", configPath,
 			"mode", fmt.Sprintf("%04o", config.configMode))

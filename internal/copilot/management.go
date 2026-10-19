@@ -54,6 +54,7 @@ const managementAPIPrefix = "/v0/management/"
 // 鉴权位于请求日志之外：未通过鉴权的请求只输出鉴权告警；其余请求（包括 ServeMux 自身产生的 405、404 与路径清理重定向）都输出请求日志。
 func (p *Pool) newManagementHandler() http.Handler {
 	api := http.NewServeMux()
+	api.HandleFunc("GET /v0/management/version", handleVersion)
 	api.HandleFunc("GET /v0/management/accounts", p.handleListAccounts)
 	api.HandleFunc("POST /v0/management/accounts", p.handleImportAccount)
 	api.HandleFunc("PATCH /v0/management/accounts", p.handlePatchAccount)

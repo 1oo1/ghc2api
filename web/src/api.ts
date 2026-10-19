@@ -93,6 +93,8 @@ export function createManagementClient(managementKey: string) {
   }
 
   return {
+    /** 服务端程序版本，例如 v0.0.1。 */
+    getVersion: () => request<{ version: string }>("version"),
     listAccounts: () => request<AccountView[]>("accounts"),
     importAccount: (credential: unknown) =>
       request<AccountView>("accounts", "POST", { credential }),

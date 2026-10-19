@@ -53,6 +53,10 @@ max_concurrent_requests: 32
 # 会增加内存和日志占用；日志中也可能包含提示词和生成内容等业务数据。
 log_level: "info"
 
+# 是否同时把日志输出到标准错误（终端、docker logs）。默认 true；false 时日志只写入日志文件，终端不再打印
+# （启动失败等致命错误仍会输出到标准错误）。注意 false 时日志文件写入失败的记录不会再出现在标准错误中。
+log_to_stderr: true
+
 # 日志目录；相对路径以本配置文件所在目录为基准，默认 ./logs。
 logs_path: "./logs"
 

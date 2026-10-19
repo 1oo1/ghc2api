@@ -76,6 +76,8 @@ function Console({
   );
   const [page, setPage] = useState<Page>("overview");
   const [accounts, setAccounts] = useState<AccountView[]>([]);
+  /** 服务端版本；加载失败时不显示，不影响控制台使用。 */
+  const [version, setVersion] = useState("");
   const [login, setLogin] = useState<LoginStart | null>(null);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
@@ -83,6 +85,13 @@ function Console({
   const [error, setError] = useState("");
   /** 列表刷新错误；下一次刷新成功后清除。 */
   const [syncError, setSyncError] = useState("");
+
+  useEffect(() => {
+    client
+      .getVersion()
+      .then((v) => setVersion(v.version))
+      .catch(() => {});
+  }, [client]);
 
   const reload = useCallback(async () => {
     try {
@@ -142,6 +151,7 @@ function Console({
           <div>
             ghc2api
             <small>GITHUB COPILOT</small>
+            {version && <small className="version">{version}</small>}
           </div>
         </div>
         <nav>

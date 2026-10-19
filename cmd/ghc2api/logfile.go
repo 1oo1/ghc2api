@@ -34,7 +34,11 @@ func newConfiguredLogger(config appConfig, stderr io.Writer) (*slog.Logger, *rot
 		return nil, nil, err
 	}
 
-	logger, err := newLogger(config.LogLevel, logOutputWriter{file: logFile, stderr: stderr})
+	output := logOutputWriter{file: logFile, stderr: stderr}
+	if config.LogFileOnly {
+		output.stderr = nil
+	}
+	logger, err := newLogger(config.LogLevel, output)
 	if err != nil {
 		_ = logFile.Close()
 		return nil, nil, err

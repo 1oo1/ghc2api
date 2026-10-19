@@ -11,8 +11,11 @@ cp config.example.yaml config.yaml && chmod 600 config.yaml
 mkdir -p data/credentials   # 凭证放这里，见 credentials.md
 make build
 ./bin/ghc2api               # 默认读取当前目录 config.yaml
-./bin/ghc2api -c /path/to/config.yaml   # 唯一的命令行参数
+./bin/ghc2api -c /path/to/config.yaml   # 启动服务时唯一的命令行参数
+./bin/ghc2api healthcheck [-c /path/to/config.yaml]   # 健康检查，见下
 ```
+
+- `healthcheck` 子命令（用于容器 `HEALTHCHECK`，见 `development.md`）：用与启动相同的方式加载配置与凭证（`-c` 规则同启动参数），请求其中 `listen` 的本机 `GET /healthz`（未指定的主机换成 `127.0.0.1`；不使用代理、不跟随重定向），请求超时 3 秒；200 退出码为 0，其他情况退出码为 1 并在 stderr 输出错误，不初始化日志文件。因此它判定的是"磁盘上的配置与凭证能被启动流程加载，且该地址上的服务健康"：运行中改坏配置或凭证目录、改了 `listen` 但未重启，都会报不健康。
 
 - `config.yaml` 是唯一配置来源，不支持 flag 或环境变量覆盖。
 - `data_path`（默认 `./data`）、`logs_path`（默认 `./logs`）的相对路径以配置文件所在目录为基准。
@@ -52,7 +55,8 @@ quota_refresh_interval: "1h"  # Go duration，必须 >= 1m，默认 1h
 
 ## 日志
 
-- JSON 格式写入 `<logs_path>/ghc2api.log` 并同步输出到标准错误；级别 `debug`/`info`/`warn`/`error`。
+- JSON 格式写入 `<logs_path>/ghc2api.log` 并默认同步输出到标准错误；`log_to_stderr: false` 时只写文件，终端不再打印（启动失败等致命错误仍输出到标准错误；容器中关闭后 `docker logs` 看不到服务日志，需从 `logs_path` 读取）；级别 `debug`/`info`/`warn`/`error`。
+- `log_to_stderr: false` 时没有兜底：日志文件写入失败（如磁盘满），或单条记录超过 `log_max_size_mb`（`debug` 级别记录完整上游正文时可能发生）时，该记录会被丢弃，且不会输出到标准错误；默认的同时输出模式下标准错误仍有这些记录。
 - 单文件上限默认 10 MiB，保留 5 个备份；用 `log_max_size_mb`、`log_max_backups` 调整（备份数 `0` 表示不保留）。
 - 同一 `logs_path` 只应由一个进程使用。
 - `debug` 记录脱敏后的完整上游请求/响应正文，可能含提示词等业务数据；排障后应恢复 `info`。认证头、凭证字段、已知 token 会脱敏。

@@ -135,6 +135,10 @@ label {
   margin-top: 3px;
   font-weight: 500;
 }
+.brand .version {
+  letter-spacing: 0.3px;
+  font-size: 11px;
+}
 .brand-mark {
   display: grid;
   place-items: center;
