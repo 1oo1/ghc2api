@@ -47,6 +47,16 @@ jobs:
             type=ref,event=branch
             type=sha
 
+      # 标签构建使用标签名作为版本号；分支构建使用 dev-<短 commit>。
+      # 表达式语法没有 substring，因此用 shell 截取短 commit。
+      - id: version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            echo "value=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -54,8 +64,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # 标签构建使用标签名作为版本号；分支构建使用 dev-<短 commit>。
           build-args: |
-            VERSION=${{ github.ref_type == 'tag' && github.ref_name || format('dev-{0}', substring(github.sha, 0, 7)) }}
+            VERSION=${{ steps.version.outputs.value }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
