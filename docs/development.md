@@ -32,4 +32,5 @@ make web          # 仅修改 web/ 后需要，需 Node.js 与 npm
 
 - 原项目 magpie 使用 MIT 许可，版权及许可文本保留在 `LICENSE`。
 - `web/` 改编自 cpa-github-copilot 的 Web 界面，额度相关代码改编自 CPA Management Center（MIT，Router-For.ME 版权，见 `LICENSES/Management-Center.txt`）。
+- 会话亲和键的会话 ID 提取优先级参照 CLIProxyAPI（MIT，Luis Pater 与 Router-For.ME 版权，见 `LICENSES/CLIProxyAPI.txt`），同步流程见 `magpie-copilot-sync.md`。
 - 本服务使用原 provider 的客户端身份头，不是 GitHub 官方服务或受支持的公共 API。使用前请确认 GitHub Copilot 的服务条款、账号权限和额度政策；上游接口或写死的客户端版本变化时需调整实现。

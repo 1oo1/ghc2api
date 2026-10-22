@@ -68,9 +68,9 @@ func affinityClaudeBody(t *testing.T, userID any, text string) []byte {
 
 const affinitySession = "11111111-2222-4333-8444-555555555555"
 
-// TestSessionKeyPromptCacheKeyOnResponses prompt_cache_key 只在 /responses 上作为会话信号；
-// 非字符串或空字符串视为没有该信号，回退到内容兜底。
-func TestSessionKeyPromptCacheKeyOnResponses(t *testing.T) {
+// TestSessionKeyPromptCacheKey prompt_cache_key（及 promptCacheKey）在所有上游路径上作为会话信号，优先于内容兜底；
+// 非字符串或空字符串视为没有该信号，回退到内容兜底。跨路径一致性见 TestSessionKeySignalsApplyToAllPaths。
+func TestSessionKeyPromptCacheKey(t *testing.T) {
 	key := func(fields map[string]any) string {
 		return sessionKey(affinityRequest("/v1/responses", "client-a", ""), affinityBody(t, fields), "/responses")
 	}
@@ -90,8 +90,9 @@ func TestSessionKeyPromptCacheKeyOnResponses(t *testing.T) {
 	}
 }
 
-// TestSessionKeyClaudeSessionFromMetadata /v1/messages 从 metadata.user_id 中读取 Claude Code 会话 UUID。
-// JSON 与旧格式表示同一会话时键相同，UUID 大小写归一，非法 UUID、超长或非字符串的 user_id 都被忽略。
+// TestSessionKeyClaudeSessionFromMetadata metadata.user_id 中的 Claude Code 会话 ID。
+// JSON 与旧格式表示同一会话时键相同；session_id 不要求 UUID 格式，也不做大小写归一（大小写不同是不同会话）；
+// 不再有 user_id 的 4096 字节上限；非字符串的 user_id 视为不存在，回退到内容兜底。
 func TestSessionKeyClaudeSessionFromMetadata(t *testing.T) {
 	claudeKey := func(userID any, text string) string {
 		return sessionKey(affinityRequest("/v1/messages", "client-a", ""), affinityClaudeBody(t, userID, text), "/v1/messages")
@@ -106,30 +107,33 @@ func TestSessionKeyClaudeSessionFromMetadata(t *testing.T) {
 	if got := claudeKey("user_synthetic_account_acct_session_"+affinitySession, "third"); got != want {
 		t.Fatal("旧格式 user_id 与 JSON 格式表示同一会话，键必须相同")
 	}
-	if got := claudeKey(`{"session_id":"`+strings.ToUpper(affinitySession)+`"}`, "fourth"); got != want {
-		t.Fatal("UUID 大小写不同应得到相同的会话键")
+	// 大小写不做归一：用含十六进制字母的 session_id 验证（affinitySession 全是数字，无法区分大小写）。
+	const cased = "aabbccdd-1122-4333-8444-55555555aabb"
+	if got, upper := claudeKey(`{"session_id":"`+cased+`"}`, "fourth"),
+		claudeKey(`{"session_id":"`+strings.ToUpper(cased)+`"}`, "fourth"); got == upper {
+		t.Fatal("session_id 大小写不同应得到不同的会话键")
 	}
 	if got := claudeKey(`{"session_id":"66666666-7777-4888-8999-000000000000"}`, "first"); got == want {
 		t.Fatal("不同会话得到了相同的会话键")
 	}
+	// session_id 不要求 UUID 格式：任意非空 ID 都是有效会话。
+	notUUID := claudeKey(`{"session_id":"not-a-uuid"}`, "first")
+	affinityAssertKeyShape(t, notUUID)
+	if notUUID == want {
+		t.Fatal("不同 session_id 得到了相同的会话键")
+	}
 
 	fallback := claudeKey(nil, "first")
-	if fallback == "" || fallback == want {
+	if fallback == "" || fallback == want || fallback == notUUID {
 		t.Fatalf("没有 metadata 时应回退到内容兜底（非空且与会话键不同），实际 = %q", fallback)
 	}
-	for _, tc := range []struct {
-		name   string
-		userID any
-	}{
-		{name: "invalid-uuid", userID: `{"session_id":"not-a-uuid"}`},
-		{name: "oversized-user-id", userID: `{"pad":"` + strings.Repeat("x", 4096) + `","session_id":"` + affinitySession + `"}`},
-		{name: "non-string-user-id", userID: map[string]string{"session_id": affinitySession}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := claudeKey(tc.userID, "first"); got != fallback {
-				t.Fatal("无效的 user_id 应被忽略，回退到内容兜底")
-			}
-		})
+	// 不再有 4096 字节上限：超长 user_id 中的 session_id 照常生效。
+	if got := claudeKey(`{"pad":"`+strings.Repeat("x", 4096)+`","session_id":"`+affinitySession+`"}`, "fifth"); got != want {
+		t.Fatal("超长 user_id 不再受限，同一 session_id 应得到相同的会话键")
+	}
+	// 非字符串的 user_id 视为不存在。
+	if got := claudeKey(map[string]string{"session_id": affinitySession}, "first"); got != fallback {
+		t.Fatal("非字符串的 user_id 应被忽略，回退到内容兜底")
 	}
 }
 
@@ -195,22 +199,42 @@ func TestSessionKeyWithoutSignalIsEmpty(t *testing.T) {
 	}
 }
 
-// TestSessionKeySignalsAreLimitedToTheirPaths prompt_cache_key 只对 /responses 生效，metadata.user_id 只对 /v1/messages 生效。
-func TestSessionKeySignalsAreLimitedToTheirPaths(t *testing.T) {
+// TestSessionKeySignalsApplyToAllPaths 显式会话信号不再按路径限制：prompt_cache_key 与 metadata.user_id 的
+// Claude 会话在 /chat/completions、/responses、/v1/messages 上都生效，且同一信号在各路径上得到相同的键
+// （键只取决于客户端密钥与信号本身）。
+func TestSessionKeySignalsApplyToAllPaths(t *testing.T) {
+	paths := []string{"/chat/completions", "/responses", "/v1/messages"}
 	user := []any{map[string]string{"role": "user", "content": "first question"}}
-	chatKey := func(fields map[string]any) string {
-		return sessionKey(affinityRequest("/v1/chat/completions", "client-a", ""), affinityBody(t, fields), "/chat/completions")
+
+	cacheKey := func(path, cache string) string {
+		body := affinityBody(t, map[string]any{"model": "gpt-4.1", "messages": user, "prompt_cache_key": cache})
+		return sessionKey(affinityRequest(path, "client-a", ""), body, path)
 	}
-	a := chatKey(map[string]any{"model": "gpt-4.1", "messages": user, "prompt_cache_key": "cache-a"})
-	b := chatKey(map[string]any{"model": "gpt-4.1", "messages": user, "prompt_cache_key": "cache-b"})
-	if a != b {
-		t.Fatal("/chat/completions 不应使用 prompt_cache_key 作为会话信号")
+	a := cacheKey(paths[0], "cache-a")
+	affinityAssertKeyShape(t, a)
+	for _, path := range paths[1:] {
+		if got := cacheKey(path, "cache-a"); got != a {
+			t.Fatalf("%s 的 prompt_cache_key 信号与 %s 不同: %s != %s", path, paths[0], got, a)
+		}
 	}
-	withSession := chatKey(map[string]any{"model": "gpt-4.1", "messages": user,
-		"metadata": map[string]any{"user_id": `{"session_id":"` + affinitySession + `"}`}})
-	plain := chatKey(map[string]any{"model": "gpt-4.1", "messages": user})
-	if withSession != plain {
-		t.Fatal("/chat/completions 不应使用 metadata.user_id 作为会话信号")
+	if got := cacheKey(paths[0], "cache-b"); got == a {
+		t.Fatal("不同 prompt_cache_key 得到了相同的会话键")
+	}
+
+	claudeKey := func(path, session string) string {
+		body := affinityBody(t, map[string]any{"model": "gpt-4.1", "messages": user,
+			"metadata": map[string]any{"user_id": `{"session_id":"` + session + `"}`}})
+		return sessionKey(affinityRequest(path, "client-a", ""), body, path)
+	}
+	c := claudeKey(paths[0], affinitySession)
+	affinityAssertKeyShape(t, c)
+	for _, path := range paths[1:] {
+		if got := claudeKey(path, affinitySession); got != c {
+			t.Fatalf("%s 的 Claude 会话信号与 %s 不同: %s != %s", path, paths[0], got, c)
+		}
+	}
+	if c == a {
+		t.Fatal("prompt_cache_key 与 Claude 会话是不同前缀的信号，不应同键")
 	}
 }
 

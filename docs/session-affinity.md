@@ -1,6 +1,6 @@
 # 会话亲和
 
-代码：`internal/copilot/affinity.go`（绑定表、`sessionKey`）、`affinity_store.go`（持久化）、`affinity_gate.go`（会话门 `keyGate`）、`pool.go`（`forward`、`pickSession`、`Pool.bind`）。
+代码：`internal/copilot/affinity.go`（绑定表）、`affinity_key.go`（`sessionKey`、会话信号来源）、`affinity_store.go`（持久化）、`affinity_gate.go`（会话门 `keyGate`）、`pool.go`（`forward`、`pickSession`、`Pool.bind`）。
 
 目的：同一客户端会话固定使用同一账号，提高上游提示词缓存命中率。配置见 `config.md`（`session_affinity`、`session_affinity_ttl`，默认开启、2h，每次使用续期；`session_affinity_max_per_account`，见下文「绑定上限」）。
 
@@ -13,11 +13,18 @@
 `sessionKey(r, body, upstreamPath) string`：`hex(sha256(json.Marshal([2]string{clientKey, signal})))`，不保留原始密钥与正文。
 
 - `clientKey`：`Authorization: Bearer` 优先，否则 `X-Api-Key`，可为空。
-- `signal` 按优先级：
-  1. `/responses` 的 `prompt_cache_key`（非空字符串）；
-  2. `/v1/messages` 的 `metadata.user_id`（字符串，≤4096 字节）中的 Claude Code 会话 UUID：JSON `{"session_id":"<uuid>"}` 或旧格式 `user_<x>_account_<y>_session_<uuid>`；UUID 转小写，两种格式得到同一键；非法 UUID 视为无信号；
-  3. 兜底：`model` + 第一条 user 消息文本（content 为字符串或按序拼接的 `type=text` 片段；Responses 的 `input` 为字符串或 `input[]` 第一条 user 项）。无 user 消息则无信号。兜底与 Claude 会话信号的编码互不混淆。
-- 无信号或非法 JSON 返回 `""`：不使用亲和、不绑定。
+- `signal` 的来源与优先级参照 CLIProxyAPI（cpa）的 `ExtractSessionInfo`，同步方式与差异见 `magpie-copilot-sync.md`「同步 CLIProxyAPI 会话亲和键」。显式会话 ID 与上游路径无关，形如 `前缀:ID`，按以下顺序取第一个有效值：
+  1. 请求头 `X-Claude-Code-Session-Id` → `claude:`；
+  2. 请求体 `metadata.user_id`（字符串，裁剪空白）中的 Claude Code 会话：以 `{` 开头时取 JSON 的 `session_id`，否则匹配旧格式 `_session_([a-f0-9-]+)$` → `claude:`。请求头与 metadata 中的同一会话得到同一键；
+  3. Codex → `codex:`：会话 ID（请求头 `Session-Id`、`Session_id`、`X-Codex-Turn-Metadata` JSON 的 `session_id`）优先，没有时取线程 ID（`Thread-Id`、`Thread_id`、turn metadata 的 `thread_id`）。子代理与主会话共用会话 ID，因此落到同一账号；
+  4. 通用请求头：`X-Http-Session-Id` → `agy:`，`X-Session-ID` → `header:`，`X-Session-Affinity`（OpenCode）→ `affinity:`，`X-Slot-Session-Id`（pi）→ `slot:`，`X-Task-ID`/`X-Task_ID` → `task:`，`X-Conversation-Id` → `conv:`，`X-Thread-Id` → `thread:`，`X-Client-Request-Id` → `clientreq:`；
+  5. 请求体字段（`a.b` 为 a 对象下的 b）：`thread_id`、`threadId`、`metadata.thread_id` → `thread:`；`session_id`、`sessionId`、`sessionID`、`child_session_id`、`childSessionId` 及其在 `metadata.`、`extra_body.` 下的部分别名 → `session:`；`task_id`、`action_id` 等任务字段（同样含部分 `metadata.`、`extra_body.` 别名）→ `task:`；`prompt_cache_key`、`promptCacheKey` → `pck:`；`conversation.id` 或字符串 `conversation` → `conv:`；未识别出 Claude 会话的 `metadata.user_id` 整串 → `user:`；`conversation_id`、`chat_id` 等 → `conv:`。完整字段表见 `affinity_key.go` 的 `bodySessionSources`；
+  6. 兜底：`model` + 第一条 user 消息文本（content 为字符串或按序拼接的 `type=text` 片段；Responses 的 `input` 为字符串或 `input[]` 第一条 user 项）。无 user 消息则无信号。兜底以 `content\x00` 开头，与显式 ID 互不混淆。
+- 显式 ID 的规范化（同 cpa `NormalizeExplicitID`）：含控制字符无效；裁剪空白后为空或超过 256 字节无效；不要求 UUID、不做大小写归一。无效等同于不存在，继续检查下一来源。请求头名大小写不敏感，同名多值取第一个有效值；请求体字段只接受 JSON 字符串。
+- 前缀相同、ID 相同的不同来源得到同一键（如请求头 `X-Task-ID` 与请求体 `task_id`）；前缀不同则键不同。
+- 请求体不是合法 JSON 对象时跳过请求体来源与兜底，请求头信号仍然有效；无任何信号返回 `""`：不使用亲和、不绑定。
+- 不同步 cpa 的父子会话继承、fork 识别、LCP 前缀匹配与派生会话指纹；绑定表保持扁平。
+- 会话键规则变化后，已持久化的旧绑定不再被命中，按 TTL 过期，属可接受的缓存语义。
 - 内容兜底只看第一条 user 消息，开头相同的不同会话会落到同一账号，只影响缓存命中，不影响正确性。
 - `messages`（或 `input[]`）中的非对象元素（数字等）被跳过，不影响第一条 user 消息的查找。
 - 字段类型错误的消息或内容块整项按无效处理并跳过（已接受的语义变化）：`role` 不是字符串的消息不算 user 消息，`text` 或 `type` 类型错误的内容块不计入文本，其余项照常参与查找。与按通用 JSON 解析的旧实现相比，这会改变兜底信号的取值（见 `http-api.md`「上游请求头与消息解析」）。

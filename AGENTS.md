@@ -24,4 +24,4 @@
 | `docs/web-console.md` | 修改控制台前端或其构建 | `web/` |
 | `docs/upstream.md` | 修改 session 交换、模型列表、Auto、请求身份头 | `internal/copilot/session.go`、`models.go`、`auto.go`、`cache.go` |
 | `docs/development.md` | 运行测试、构建，查看来源与许可 | `Makefile` |
-| `docs/magpie-copilot-sync.md` | 与 magpie 上游同步 | — |
+| `docs/magpie-copilot-sync.md` | 与 magpie 上游同步，同时核对 CLIProxyAPI 会话亲和键 | `internal/copilot/affinity_key.go`（cpa 部分） |
