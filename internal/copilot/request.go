@@ -52,7 +52,7 @@ var generationWriteTimeout = 60 * time.Second
 
 // generationWriter 包装生成接口的 ResponseWriter，每次 Write 与刷新前续期写截止时间。
 // 请求结束时不清除截止时间，依据是 net/http 自身的行为：serve 循环在每个请求的 finishRequest 之后调用
-// c.rwc.SetWriteDeadline(time.Time{})（Go 源码 net/http/server.go，1.23 与 1.27 中均如此，项目最低版本为 1.23）。
+// c.rwc.SetWriteDeadline(time.Time{})（Go 源码 net/http/server.go，1.26.10 与 1.27 中均如此，项目最低版本为 1.26.10）。
 // 因此 handler 返回后 net/http 的最后一次 flush 仍受超时保护，之后复用该连接的请求也不会遇到过期的截止时间。
 type generationWriter struct {
 	http.ResponseWriter

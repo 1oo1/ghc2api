@@ -6,7 +6,7 @@ OpenAI Chat Completions / Responses 与 Anthropic Messages 兼容的接口，支
 
 ## 快速开始
 
-需要 Go 1.23+ 与有效的 GitHub Copilot OAuth 订阅。
+需要 Go 1.26.10+ 与有效的 GitHub Copilot OAuth 订阅。
 
 ```sh
 cp config.example.yaml config.yaml && chmod 600 config.yaml

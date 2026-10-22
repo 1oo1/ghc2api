@@ -4,7 +4,7 @@ package copilot
 // 请求结束时不清除它，因此最后一次 flush（handler 返回后由 net/http 写出残留缓冲与分块结束符）也受截止时间保护。
 //
 // 依赖的 net/http 行为：每个请求在 finishRequest 之后，serve 会调用 c.rwc.SetWriteDeadline(time.Time{}) 清除连接的写截止时间
-// （HTTP/1.1 的 conn.serve；已在 Go 1.23.0 server.go:2099 与 1.27.1 server.go:2145 源码中确认，属于实现细节而非 API 承诺）。
+// （HTTP/1.1 的 conn.serve；已在 Go 1.26.10.0 server.go:2099 与 1.27.1 server.go:2145 源码中确认，属于实现细节而非 API 承诺）。
 // 因此 generationWriter 不自行清除截止时间，连接上也不会遗留过期的截止时间，之后复用该连接的请求不受影响。
 // 测试使用真实 TCP 连接，并把 generationWriteTimeout 缩短为 200ms。
 // 最后一次 flush 是否真正受超时保护难以稳定测试（需要客户端停止读取且缓冲恰好装满），这里不覆盖。

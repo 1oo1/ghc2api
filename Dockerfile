@@ -1,7 +1,7 @@
 # 多架构镜像（linux/amd64、linux/arm64）。
 # 构建阶段固定在构建机原生架构上，通过 GOOS/GOARCH 交叉编译，无需 QEMU 模拟；
 # 管理控制台已内嵌于 web/dist/index.html，构建不依赖 Node。
-FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.10-alpine AS build
 ARG TARGETOS
 ARG TARGETARCH
 # 版本号；未指定时使用源码中的默认值。
