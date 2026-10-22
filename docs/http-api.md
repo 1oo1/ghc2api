@@ -40,7 +40,9 @@ OpenAI 客户端 base URL：`http://127.0.0.1:8080/v1`；Anthropic 客户端 bas
 ## 协议与转发
 
 - 三种生成协议不自动互转，按模型的 `supported_endpoints` 选接口。模型列表可用时，生成前会校验模型与上游路径，不匹配返回 400；旧模型无该字段按 Chat Completions 处理；列表不可用时手选模型交上游判断，Auto 会重试读取列表，仍失败则返回错误。
-- 上游的 HTTP 状态、生成响应和 SSE 原样转发；请求取消传递给上游；生成请求体最大 16 MiB。
+- 上游的 HTTP 状态、生成响应和 SSE 原样转发（例外见下条）；请求取消传递给上游；生成请求体最大 16 MiB。
+- Responses 流的输出项 id 统一：Copilot 的 `/responses` SSE 在同一输出项的每个事件里都给出新的 id（`output_item.added`、各 delta 的 `item_id`、`output_item.done` 的 `item.id` 及 `response.completed` 的 `output[i].id` 互不相同），Codex 按 added 的 id 开始、按 done 的 id 结束一项，会把同一条消息显示两次。因此仅对上游路径 `/responses` 且 `Content-Type` 为 `text/event-stream` 的响应，按 `output_index` 把后续事件及结束事件（`response.completed`/`incomplete`/`failed`）中的 id 改回该项 `output_item.added` 时的 id（项类型不一致时不改）。需改写的事件会重新编码 JSON（键顺序可能变化，数字与 `<`、`>`、`&` 保持原文）；id 已一致、非 JSON 数据（如 `[DONE]`）和其他事件逐字节透传。只输出完整事件，未完整的尾部在上游结束时原样写出。代码见 `itemids.go`、`request.go` 的 `streamResponse`。
+- 无工具时去掉 `tool_choice`：Copilot 的 `/responses` 对设置了 `tool_choice` 却没有声明工具的请求直接返回 400（如 Codex 压缩上下文的请求会去掉 `tools` 但保留 `tool_choice`）。因此转发到上游 `/responses` 的请求（含 Auto），顶层 `tools` 缺失、为 `null` 或空数组时去掉顶层 `tool_choice`；改写时重新编码 JSON（键顺序可能变化，数字与 `<`、`>`、`&` 保持原文）。`tools` 为非空数组或其他类型、请求体不是合法 JSON 对象时原样转发；Chat Completions 与 `/v1/messages` 不做此处理。代码见 `request.go` 的 `withoutLoneToolChoice`。
 - 不转发客户端认证信息、Cookie 和逐跳头；拒绝重定向及不在 GitHub/Copilot 白名单内的 session API 地址。
 - 生成请求体校验在 session 获取之后，故所有账号 session 都失败时，无效请求体收到 session 错误而非 400。
 

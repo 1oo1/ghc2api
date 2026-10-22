@@ -16,7 +16,7 @@
 | `README.md` | 了解项目概况与快速开始 | — |
 | `docs/config.md` | 修改配置项、启动流程、日志 | `cmd/ghc2api/config.go`、`main.go`、`logfile.go` |
 | `docs/credentials.md` | 修改凭证格式、目录扫描、用户名校验、凭证读写 | `cmd/ghc2api/credentials.go`、`internal/copilot/credentials.go`、`username.go` |
-| `docs/http-api.md` | 修改对外接口、鉴权、协议转发 | `internal/copilot/service.go`、`request.go` |
+| `docs/http-api.md` | 修改对外接口、鉴权、协议转发 | `internal/copilot/service.go`、`request.go`、`itemids.go` |
 | `docs/pool.md` | 修改账号选择、故障切换、冷却、Pool 构造 | `internal/copilot/pool.go`、`weight.go` |
 | `docs/session-affinity.md` | 修改会话键、绑定表、持久化 | `internal/copilot/affinity*.go` |
 | `docs/quota-stats.md` | 修改额度解析、刷新节流、持久化、请求统计 | `internal/copilot/quota.go` |

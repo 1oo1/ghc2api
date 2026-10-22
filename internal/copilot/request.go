@@ -85,7 +85,9 @@ func (w *generationWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
 
-func streamResponse(w http.ResponseWriter, res *http.Response) {
+// streamResponse 把上游回复透传给客户端，SSE 回复每读到一段就 flush。
+// tidyItemIDs 为 true 时（仅 /responses），SSE 流经 itemIDTidy 统一输出项 id；非 SSE 回复始终逐字节透传。
+func streamResponse(w http.ResponseWriter, res *http.Response, tidyItemIDs bool) {
 	defer res.Body.Close()
 	copyResponseHeaders(w.Header(), res.Header)
 	stream := strings.HasPrefix(strings.ToLower(res.Header.Get("Content-Type")), "text/event-stream")
@@ -99,18 +101,36 @@ func streamResponse(w http.ResponseWriter, res *http.Response) {
 	}
 	controller := http.NewResponseController(w)
 	_ = controller.Flush()
+	var tidy *itemIDTidy
+	if tidyItemIDs {
+		tidy = &itemIDTidy{}
+	}
+	// send 写出一段字节并 flush；返回 false 表示客户端已不可写。
+	send := func(b []byte) bool {
+		if len(b) == 0 {
+			return true
+		}
+		if _, err := w.Write(b); err != nil {
+			return false
+		}
+		return controller.Flush() == nil
+	}
 	buffer := make([]byte, 32<<10)
 	for {
 		n, err := res.Body.Read(buffer)
 		if n > 0 {
-			if _, writeErr := w.Write(buffer[:n]); writeErr != nil {
-				return
+			chunk := buffer[:n]
+			if tidy != nil {
+				chunk = tidy.write(chunk)
 			}
-			if flushErr := controller.Flush(); flushErr != nil {
+			if !send(chunk) {
 				return
 			}
 		}
 		if err != nil {
+			if tidy != nil {
+				send(tidy.flush())
+			}
 			return
 		}
 	}
@@ -297,4 +317,33 @@ func isVisionType(literal []byte) bool {
 		return true
 	}
 	return false
+}
+
+// withoutLoneToolChoice 去掉没有 tools 时的 tool_choice：Copilot 的 /responses 会以 400 拒绝（如 Codex 压缩上下文的请求）。
+func withoutLoneToolChoice(body []byte) []byte {
+	if !bytes.Contains(body, []byte(`"tool_choice"`)) {
+		return body
+	}
+	var request map[string]json.RawMessage
+	if json.Unmarshal(body, &request) != nil || request == nil {
+		return body
+	}
+	if _, ok := request["tool_choice"]; !ok {
+		return body
+	}
+	// tools 缺失、为 null 或空数组才视为“没有工具”；其他类型交给上游自行判断。
+	if raw, ok := request["tools"]; ok && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		var tools []json.RawMessage
+		if json.Unmarshal(raw, &tools) != nil || len(tools) > 0 {
+			return body
+		}
+	}
+	delete(request, "tool_choice")
+	var out bytes.Buffer
+	encoder := json.NewEncoder(&out)
+	encoder.SetEscapeHTML(false)
+	if encoder.Encode(request) != nil {
+		return body
+	}
+	return bytes.TrimSuffix(out.Bytes(), []byte("\n"))
 }

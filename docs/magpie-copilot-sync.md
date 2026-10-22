@@ -3,7 +3,7 @@
 本项目是从 magpie 拆分的独立服务，不是 magpie 的子模块或自动镜像。同步时以
 [magpie GitHub 仓库](https://github.com/yetone/magpie) 中实际跟踪的源码、测试和提交历史为准。
 
-当前实现对照的上游基线：`19e9fc47f0c9cc8e30edf9881968e8cff82f072f`。
+当前实现对照的上游基线：`ea6be1592706ea4a0dd6cd526acec0b5d1fb967e`。
 完成后续同步并通过验证时，应将本文和 README 中记录的基线更新为实际核对的上游提交。
 
 ## 获取或更新上游
@@ -44,7 +44,7 @@ git -C .local/magpie log -1 --format='%H %cs %s'
 从上次同步记录的提交开始查看相关差异。首次核对可用本文开头的基线：
 
 ```sh
-BASE=19e9fc47f0c9cc8e30edf9881968e8cff82f072f
+BASE=ea6be1592706ea4a0dd6cd526acec0b5d1fb967e
 git -C .local/magpie diff --name-status "${BASE}..HEAD"
 git -C .local/magpie diff "${BASE}..HEAD" -- \
   internal/provider/account.go \
@@ -87,7 +87,7 @@ git -C .local/magpie log --oneline --all --regexp-ignore-case --grep='copilot'
 | `internal/copilot/login.go`、`credentials.go` | `internal/provider/copilot_signin.go`、`copilot_accounts.go`、`account.go` 中的 OAuth 登录和凭证行为 |
 | `internal/copilot/config.go`、`session.go` | `internal/provider/account.go`、`copilot_ghe.go` 中的主机、OAuth session 和身份头行为 |
 | `internal/copilot/models.go`、`auto.go` | `internal/provider/account.go`、`copilot_auto.go` 及相关模型数据和测试 |
-| `internal/copilot/service.go`、`request.go` | provider 请求签名与 `internal/gateway/` 的转发、协议和流式行为 |
+| `internal/copilot/service.go`、`request.go`、`itemids.go` | provider 请求签名与 `internal/gateway/` 的转发、协议和流式行为（含 `itemids.go` 的 Responses 项 id 统一） |
 
 只同步本服务已经支持的功能。magpie 的多账号管理、桌面 UI、agent 集成等不属于本项目的
 provider 代理范围；不要整文件复制，也不要为追求代码结构一致而引入这些依赖。

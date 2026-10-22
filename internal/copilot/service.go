@@ -307,6 +307,9 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 		}
 		return
 	}
+	if path == "/responses" {
+		body = withoutLoneToolChoice(body)
+	}
 	var request map[string]json.RawMessage
 	var model string
 	if json.Unmarshal(body, &request) != nil || request == nil ||
@@ -424,7 +427,7 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 		}
 		s.log(r.Context(), apiStatusLogLevel(res.StatusCode), "生成响应开始返回客户端",
 			"status", res.StatusCode, "model", model)
-		streamResponse(w, res)
+		streamResponse(w, res, path == "/responses")
 		return
 	}
 }
