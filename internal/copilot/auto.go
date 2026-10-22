@@ -15,6 +15,8 @@ type autoSession struct {
 	Token     string
 	Model     string
 	ExpiresAt int64
+	// Endpoints 是 /auto 在 selected_model 对象中声明的路径，只对 /models 中不可见的模型生效。
+	Endpoints []string
 }
 
 type autoWire struct {
@@ -24,16 +26,18 @@ type autoWire struct {
 	ExpiresAt int64           `json:"expires_at"`
 }
 
-func selectedModel(raw json.RawMessage) string {
+// selectedModel 解析 selected_model：字符串形式只有 id，对象形式可能带 supported_endpoints。
+func selectedModel(raw json.RawMessage) (string, []string) {
 	var id string
 	if json.Unmarshal(raw, &id) == nil {
-		return id
+		return id, nil
 	}
 	var selected struct {
-		ID string `json:"id"`
+		ID        string   `json:"id"`
+		Endpoints []string `json:"supported_endpoints"`
 	}
 	_ = json.Unmarshal(raw, &selected)
-	return selected.ID
+	return selected.ID, selected.Endpoints
 }
 
 func (s *Service) autoRequest(ctx context.Context, current session, path, version string, body []byte) (autoWire, error) {
@@ -64,14 +68,14 @@ func (s *Service) autoRequest(ctx context.Context, current session, path, versio
 	return wire, nil
 }
 
-func (s *Service) holdAuto(wire autoWire, model string) autoSession {
+func (s *Service) holdAuto(wire autoWire, model string, endpoints []string) autoSession {
 	expiry := time.Now().Add(time.Hour).Unix()
 	if wire.ExpiresAt > 0 && wire.ExpiresAt < expiry {
 		expiry = wire.ExpiresAt
 	}
 	s.autoState.Lock()
 	defer s.autoState.Unlock()
-	s.auto = autoSession{Token: wire.Token, Model: model, ExpiresAt: expiry}
+	s.auto = autoSession{Token: wire.Token, Model: model, ExpiresAt: expiry, Endpoints: endpoints}
 	return s.auto
 }
 
@@ -91,10 +95,10 @@ func (s *Service) resolveAuto(ctx context.Context, current session, prompt strin
 	body, _ := json.Marshal(map[string]string{"prompt": prompt, "tier": "balance"})
 	wire, err := s.autoRequest(ctx, current, "/auto", "2026-08-01", body)
 	if err == nil {
-		if model := selectedModel(wire.Selected); model != "" {
+		if model, endpoints := selectedModel(wire.Selected); model != "" {
 			if !s.isRefused(model) {
 				s.log(ctx, slog.LevelInfo, "Copilot Auto 选择模型", "model", model)
-				return s.holdAuto(wire, model), nil
+				return s.holdAuto(wire, model, endpoints), nil
 			}
 			// 新 Auto 已经明确选出被拒模型，不再用旧会话重复同一个选择。
 			return s.manualFallback(ctx, current)
@@ -107,7 +111,8 @@ func (s *Service) resolveAuto(ctx context.Context, current session, prompt strin
 		[]byte(`{"auto_mode":{"model_hints":["auto"]}}`))
 	if err == nil {
 		list, _ := s.getModels(ctx, current)
-		model := selectedModel(wire.Selected)
+		// 兼容接口返回的路径不可信，只采用 /auto 声明的路径。
+		model, _ := selectedModel(wire.Selected)
 		if s.isRefused(model) {
 			model = ""
 		}
@@ -129,7 +134,7 @@ func (s *Service) resolveAuto(ctx context.Context, current session, prompt strin
 		}
 		if model != "" {
 			s.log(ctx, slog.LevelInfo, "Copilot Auto 兼容接口选择模型", "model", model)
-			return s.holdAuto(wire, model), nil
+			return s.holdAuto(wire, model, nil), nil
 		}
 	} else {
 		var upstream *upstreamError
@@ -164,7 +169,8 @@ func (s *Service) manualFallback(ctx context.Context, current session) (autoSess
 func (s *Service) dropAuto(pick autoSession) {
 	s.autoState.Lock()
 	defer s.autoState.Unlock()
-	if s.auto == pick {
+	// Endpoints 是切片，不能用 == 比较整个结构。
+	if s.auto.Token == pick.Token && s.auto.Model == pick.Model && s.auto.ExpiresAt == pick.ExpiresAt {
 		s.auto = autoSession{}
 	}
 }

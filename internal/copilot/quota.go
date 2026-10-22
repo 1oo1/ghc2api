@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -114,6 +115,14 @@ func parseQuota(raw []byte) (Quota, error) {
 		hasQuota, hasKnown := selected.boolean("has_quota")
 		if used, ok := selected.number("credits_used"); ok && (!hasKnown || hasQuota) {
 			q.Summary = append(q.Summary, QuotaMetric{Key: "credits_used", Label: "Credits Used", Value: used, Format: "number"})
+		}
+		// 组织共享（pooled）Premium 额度用完时快照仍为 unlimited，但 has_quota=false，VS Code 会暂停该席位（magpie #1063）。
+		// 非组织套餐允许超额计费时不算用完。
+		copilotPlan := strings.ToLower(account.text("copilot_plan"))
+		overage, _ := selected.boolean("overage_permitted")
+		organization := copilotPlan == "business" || copilotPlan == "enterprise"
+		if plan != "Copilot Free" && hasKnown && !hasQuota && (!overage || organization) {
+			buckets = append(buckets, QuotaBucket{Window: window, Description: label, RemainingFraction: 0, ResetTime: reset})
 		}
 	case known:
 		if remaining, ok := selected.number("percent_remaining"); ok {

@@ -118,7 +118,8 @@ func TestParseQuotaCopilotFreeUsesChatSnapshot(t *testing.T) {
 	}
 }
 
-// TestParseQuotaUnlimitedSummarizesCreditsUsed unlimited 不产生额度桶；credits_used 按 has_quota 决定是否输出。
+// TestParseQuotaUnlimitedSummarizesCreditsUsed unlimited 且 has_quota 不为 false 时不产生额度桶并输出 credits_used；
+// has_quota=false 表示组织共享额度已用完，输出剩余 0 的 premium_requests 桶且不输出 credits_used。
 func TestParseQuotaUnlimitedSummarizesCreditsUsed(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -131,14 +132,17 @@ func TestParseQuotaUnlimitedSummarizesCreditsUsed(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			q := quotaTestParse(t, `{"quota_snapshots":{"premium_interactions":`+tc.premium+`}}`)
-			if len(q.Groups) != 0 {
-				t.Fatalf("unlimited 不应产生额度桶: %+v", q.Groups)
-			}
 			if !tc.want {
+				if bucket := quotaTestBucket(t, q, "premium_requests"); bucket.RemainingFraction != 0 {
+					t.Fatalf("has_quota=false 时 premium_requests 应剩余 0: %+v", bucket)
+				}
 				if len(q.Summary) != 0 {
 					t.Fatalf("has_quota=false 时不应输出 credits_used: %+v", q.Summary)
 				}
 				return
+			}
+			if len(q.Groups) != 0 {
+				t.Fatalf("unlimited 不应产生额度桶: %+v", q.Groups)
 			}
 			if len(q.Summary) != 1 || q.Summary[0].Key != "credits_used" || q.Summary[0].Value != 12.5 {
 				t.Fatalf("Summary = %+v, want 一个 credits_used=12.5", q.Summary)

@@ -15,7 +15,8 @@ parseQuota(raw []byte) (Quota, error)
 JSON 名为小驼峰（如 `remainingFraction`、`observedAt`），完整定义见 `quota.go`。解析规则：
 
 - 计划名由 `access_type_sku`/`copilot_plan` 映射。`token_based_billing=true` 时主额度为 `credits`/`Credits`，否则 `premium_requests`/`Premium requests`；Copilot Free 用 `chat` 快照（`Chat messages`，`token_based_billing=true` 时仍为 `credits`），无该快照时由 `monthly_quotas.chat` 与 `limited_user_quotas.chat` 计算。
-- `unlimited=true` 不产生 bucket；`credits_used`（`has_quota` 缺失或为 true）输出到 Summary（`Key=credits_used`、`Label=Credits Used`、`Format=number`）。
+- `unlimited=true` 不产生 bucket（例外见下条）；`credits_used`（`has_quota` 缺失或为 true）输出到 Summary（`Key=credits_used`、`Label=Credits Used`、`Format=number`）。
+- 组织共享 Premium 额度用完：非 Copilot Free 账号的 `premium_interactions` 为 `unlimited=true` 且 `has_quota` 明确为 `false` 时，视为组织共享额度已用完（VS Code 会暂停该席位，见 magpie #1063），输出剩余比例为 0 的主额度 bucket（窗口与名称同上，重置时间按下述规则），因此账号进入"无 Credits"档，重置时间可解析时按耗尽跳过（见 `pool.md`）。例外：该快照 `overage_permitted=true` 且 `copilot_plan` 不是 `business`/`enterprise`（不区分大小写）时仍不产生 bucket。
 - Additional Budget：`premium_interactions.overage_count`、`overage_entitlement` 均为合法非负数且 entitlement>0 时输出 `additional_budget` 桶，`RemainingFraction=max(0, 1-count/entitlement)`；非法或 entitlement 为 0 时不输出，不影响主额度。
 - 重置时间：`quota_reset_at`（Unix 秒）优先，其次 `quota_reset_date_utc`/`quota_reset_date`/`limited_user_reset_date`（RFC3339 转 UTC，或保留 `YYYY-MM-DD`；无法解析的跳过）。
 - 字段逐个容错；顶层不是 JSON 对象（含 `null`）返回错误。

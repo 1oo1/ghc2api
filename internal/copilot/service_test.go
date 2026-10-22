@@ -1278,9 +1278,10 @@ func TestGenerationRejectsModelsUnavailableForPath(t *testing.T) {
 			body: `{"model":"terms-model","input":"hello"}`,
 		},
 		{
-			name: "manual model is not in visible list",
-			path: "/v1/chat/completions",
-			body: `{"model":"hidden","messages":[{"role":"user","content":"hello"}]}`,
+			// 隐藏 chat 模型未声明路径时视为只支持 /chat/completions，因此在 /responses 上仍被拒绝。
+			name: "manual hidden model does not support path",
+			path: "/v1/responses",
+			body: `{"model":"hidden","input":"hello"}`,
 		},
 		{
 			name: "manual unknown model",

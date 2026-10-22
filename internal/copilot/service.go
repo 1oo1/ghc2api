@@ -362,7 +362,7 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 				return
 			}
 		}
-		if modelErr == nil && !list.supportsEndpoint(model, path) {
+		if modelErr == nil && !list.supportsEndpoint(model, path, pick) {
 			if isAuto {
 				s.dropAuto(pick)
 			}

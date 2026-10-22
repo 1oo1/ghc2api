@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"time"
 )
@@ -36,11 +37,13 @@ type model struct {
 }
 
 type modelList struct {
-	Data    []json.RawMessage `json:"data"`
-	Picks   []string          `json:"picks"`
-	Known   map[string]bool   `json:"known"`
-	Waiting map[string]bool   `json:"waiting"`
-	At      time.Time         `json:"at"`
+	Data  []json.RawMessage `json:"data"`
+	Picks []string          `json:"picks"`
+	Known map[string]bool   `json:"known"`
+	// Endpoints 记录每个 chat 模型（含隐藏模型）支持的路径；旧缓存没有该字段。
+	Endpoints map[string][]string `json:"endpoints"`
+	Waiting   map[string]bool     `json:"waiting"`
+	At        time.Time           `json:"at"`
 }
 
 func (s *Service) getModels(ctx context.Context, current session) (modelList, error) {
@@ -72,7 +75,7 @@ func (s *Service) getModels(ctx context.Context, current session) (modelList, er
 		s.log(ctx, slog.LevelWarn, "刷新 Copilot 模型列表失败", "error", s.redactString(err.Error()))
 		return modelList{}, err
 	}
-	list := modelList{Data: []json.RawMessage{}, Known: map[string]bool{}, Waiting: map[string]bool{}, At: time.Now()}
+	list := modelList{Data: []json.RawMessage{}, Known: map[string]bool{}, Endpoints: map[string][]string{}, Waiting: map[string]bool{}, At: time.Now()}
 	rank := map[string]int{}
 	for _, raw := range wire.Data {
 		var m model
@@ -80,6 +83,11 @@ func (s *Service) getModels(ctx context.Context, current session) (modelList, er
 			continue
 		}
 		list.Known[m.ID] = true
+		if len(m.Endpoints) == 0 {
+			list.Endpoints[m.ID] = []string{"/chat/completions"}
+		} else {
+			list.Endpoints[m.ID] = m.Endpoints
+		}
 		if internalModel.MatchString(m.ID) || m.Vendor == "Experimental" || (!m.Picker && m.Category == "") {
 			continue
 		}
@@ -126,19 +134,31 @@ func modelCacheFresh(at time.Time, ttl time.Duration) bool {
 	return !at.IsZero() && age >= 0 && age < ttl
 }
 
-func (list modelList) supportsEndpoint(id, path string) bool {
+// supportsEndpoint 判断模型是否支持 path；pick 为本次 Auto 选择，手选模型传零值。
+func (list modelList) supportsEndpoint(id, path string, pick autoSession) bool {
+	return slices.Contains(list.endpoints(id, pick), path)
+}
+
+// endpoints 依次取：可见模型的 /models 路径、/auto 声明的路径、隐藏 chat 模型的路径；
+// Auto 选中但 /models 不认识的模型视为只支持 /chat/completions，其余返回 nil。
+func (list modelList) endpoints(id string, pick autoSession) []string {
 	for _, raw := range list.Data {
 		var entry model
-		if json.Unmarshal(raw, &entry) != nil || entry.ID != id {
-			continue
-		}
-		for _, endpoint := range entry.Endpoints {
-			if endpoint == path {
-				return true
-			}
+		if json.Unmarshal(raw, &entry) == nil && entry.ID == id {
+			return entry.Endpoints
 		}
 	}
-	return false
+	isAuto := id != "" && pick.Model == id
+	if isAuto && len(pick.Endpoints) > 0 {
+		return pick.Endpoints
+	}
+	if endpoints, ok := list.Endpoints[id]; ok {
+		return endpoints
+	}
+	if isAuto {
+		return []string{"/chat/completions"}
+	}
+	return nil
 }
 
 func (s *Service) handleModels(w http.ResponseWriter, r *http.Request) {
