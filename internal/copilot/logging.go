@@ -100,10 +100,13 @@ func clientHeadersForLog(headers http.Header) map[string]any {
 	return fields
 }
 
+// statusResponseWriter 记录写给客户端的状态码，供账号统计与错误计数使用（见 poolAccount.record）。
 type statusResponseWriter struct {
 	http.ResponseWriter
 	status int
 	wrote  bool
+	// failure 是本次请求的失败性质，由 markFailure 设置；默认为 failureNone。
+	failure failureKind
 }
 
 func (w *statusResponseWriter) WriteHeader(status int) {

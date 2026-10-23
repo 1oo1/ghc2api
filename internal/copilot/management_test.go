@@ -254,6 +254,7 @@ func mgmtNewPool(t *testing.T, up *mgmtUpstream, ttl time.Duration, users ...str
 		t.Fatal(err)
 	}
 	quotaAwaitIdle(t, p)
+	t.Cleanup(p.WaitCooldownEffects) // 清理先于 TempDir 的删除完成
 	return p, dir
 }
 
@@ -485,7 +486,7 @@ func TestManagementAccountsListShowsQuotaAndRequestStats(t *testing.T) {
 	if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusInternalServerError {
 		t.Fatalf("bob 的生成请求 status=%d, want 500", w.Code)
 	}
-	// bob 也降为 -1 后 carol 最优：carol 的 session 失败并冷却，同一请求改由 alice 处理（alice 与 bob 同为 -1 且权重相同，
+	// bob 也降为 -1 后 carol 最优：carol 的 session 失败（连续第 1 次，尚未冷却），同一请求改由 alice 处理（alice 与 bob 同为 -1 且权重相同，
 	// 上一次由 bob 处理，因此轮到 alice）。
 	mgmtPatchPriority(t, p, "bob", -1)
 	if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK {
@@ -517,8 +518,8 @@ func TestManagementAccountsListShowsQuotaAndRequestStats(t *testing.T) {
 	if carol.Stats.Requests != 0 || carol.Stats.Errors != 0 {
 		t.Fatalf("carol 统计 = %+v, session 失败的请求不应计入 carol", carol.Stats)
 	}
-	if carol.CooldownUntil == nil {
-		t.Fatal("session 失败后 carol 应显示冷却截止时间")
+	if carol.CooldownUntil != nil {
+		t.Fatalf("session 失败一次后 carol 不应冷却（连续 3 次才冷却），实际冷却至 %s", carol.CooldownUntil)
 	}
 	for _, view := range []AccountView{alice, bob, carol} {
 		if view.Quota == nil || view.Quota.Subscription == nil || view.Quota.Subscription.Plan != "Copilot Pro" {

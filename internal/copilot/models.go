@@ -122,11 +122,23 @@ func (s *Service) getModels(ctx context.Context, current session) (modelList, er
 	}
 	sort.SliceStable(list.Picks, func(i, j int) bool { return rank[list.Picks[i]] < rank[list.Picks[j]] })
 	s.models = list
-	if err := s.writeCache("models", list); err != nil {
+	if err := s.writeCacheUnlessCooling("models", list); err != nil {
 		s.log(ctx, slog.LevelWarn, "写入磁盘模型缓存失败", "error", s.redactString(err.Error()))
 	}
 	s.log(ctx, slog.LevelInfo, "Copilot 模型列表刷新完成", "visible_count", len(list.Data), "selectable_count", len(list.Picks))
 	return list, nil
+}
+
+// forgetModels 清空账号的模型列表缓存（内存与磁盘），用于进入冷却时。等待正在进行的刷新结束后再检查 still()，
+// 仅在账号仍处于本次冷却时清空（见 settleCooldown）。
+func (s *Service) forgetModels(still func() bool) error {
+	_ = s.modelsMu.lock(context.Background()) // Background 不会被取消，lock 只会阻塞直到获取结束
+	defer s.modelsMu.unlock()
+	if !still() {
+		return nil
+	}
+	s.models = modelList{}
+	return s.removeCacheFile("models")
 }
 
 func modelCacheFresh(at time.Time, ttl time.Duration) bool {
@@ -199,7 +211,7 @@ func (s *Service) acceptTerms(ctx context.Context, current session, model string
 		[]byte(`{"state":"enabled"}`), nil) == nil {
 		delete(s.models.Waiting, model)
 		s.models.At = time.Time{}
-		if err := s.writeCache("models", s.models); err != nil {
+		if err := s.writeCacheUnlessCooling("models", s.models); err != nil {
 			s.log(ctx, slog.LevelWarn, "写入磁盘模型缓存失败", "error", s.redactString(err.Error()))
 			if path := s.cacheFile("models"); path != "" {
 				if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {

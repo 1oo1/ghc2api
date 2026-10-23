@@ -39,6 +39,21 @@ func (s *Service) removeCache() error {
 	return os.RemoveAll(s.cacheDir)
 }
 
+// removeCacheFile 删除账号缓存目录中的一个缓存文件；文件不存在视为成功。账号已删除或没有缓存目录时不做任何事。
+// 与 writeCache 共用读锁，因此不会与 removeCache 交错。
+func (s *Service) removeCacheFile(name string) error {
+	s.cacheMu.RLock()
+	defer s.cacheMu.RUnlock()
+	path := s.cacheFile(name)
+	if path == "" || s.cacheRemoved {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 func readCacheFile(path string, value any) error {
 	file, err := os.Open(path)
 	if err != nil {

@@ -77,11 +77,12 @@ func (s *Service) getSession(ctx context.Context) (session, error) {
 	}
 	defer res.Body.Close()
 	data, err := readLimited(res.Body, maxMetadataBody)
+	if res.StatusCode != http.StatusOK {
+		// 错误状态按上游状态码计数，即使正文读取失败（此时 data 可能不完整，但状态码可靠）。
+		return session{}, &upstreamError{res.StatusCode, data, res.Header}
+	}
 	if err != nil {
 		return session{}, err
-	}
-	if res.StatusCode != http.StatusOK {
-		return session{}, &upstreamError{res.StatusCode, data, res.Header}
 	}
 	var fresh session
 	if json.Unmarshal(data, &fresh) != nil {
@@ -97,11 +98,23 @@ func (s *Service) getSession(ctx context.Context) (session, error) {
 	s.session = fresh
 	s.addSecret(fresh.Token)
 	cache := cachedSession{Token: fresh.Token, ExpiresAt: fresh.ExpiresAt, API: fresh.API}
-	if err := s.writeCache("session", cache); err != nil {
+	if err := s.writeCacheUnlessCooling("session", cache); err != nil {
 		s.log(ctx, slog.LevelWarn, "写入磁盘 session 缓存失败", "error", s.redactString(err.Error()))
 	}
 	s.log(ctx, slog.LevelInfo, "Copilot session 获取成功", "expires_at", fresh.ExpiresAt, "api_host", fresh.API)
 	return fresh, nil
+}
+
+// forgetSession 清空账号的 session 缓存（内存与磁盘），用于进入冷却时。
+// 等待正在进行的 session 获取结束后再检查：仅当 still() 仍为真（账号仍处于本次冷却）时才清空，已解除则跳过（见 settleCooldown）。
+func (s *Service) forgetSession(still func() bool) error {
+	_ = s.sessionMu.lock(context.Background()) // Background 不会被取消，lock 只会阻塞直到获取结束
+	defer s.sessionMu.unlock()
+	if !still() {
+		return nil
+	}
+	s.session = session{}
+	return s.removeCacheFile("session")
 }
 
 func (s *Service) loadCachedSession(ctx context.Context) (session, bool) {

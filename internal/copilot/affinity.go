@@ -76,6 +76,17 @@ func (t *affinityTable) lookup(key string, now time.Time) (string, bool) {
 	return binding.accountID, true
 }
 
+// dropAccount 删除所有指向 accountID 的绑定（包括已过期的），用于账号进入冷却时：冷却期间这些绑定不可用，直接清除。
+func (t *affinityTable) dropAccount(accountID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for key, binding := range t.bindings {
+		if binding.accountID == accountID {
+			delete(t.bindings, key)
+		}
+	}
+}
+
 // count 返回当前条数，包括尚未清理的过期项。
 func (t *affinityTable) count() int {
 	t.mu.Lock()

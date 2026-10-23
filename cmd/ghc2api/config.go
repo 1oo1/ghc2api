@@ -60,6 +60,9 @@ type appConfig struct {
 	// SessionAffinityMaxPerAccountValue 保留原值以区分缺省值和非法输入（同 log_max_backups）。
 	SessionAffinityMaxPerAccountValue *string `yaml:"session_affinity_max_per_account"`
 	SessionAffinityMaxPerAccount      int     `yaml:"-"`
+	// AccountCooldownValue 保留原值以区分缺省值（2h）与非法输入；必须是大于 0 的 Go duration。
+	AccountCooldownValue *string       `yaml:"account_cooldown"`
+	AccountCooldown      time.Duration `yaml:"-"`
 	// MaxConcurrentRequestsValue 保留原值以区分缺省值（32）与显式 0（不限制）；非法输入（同 log_max_backups）。
 	MaxConcurrentRequestsValue *string `yaml:"max_concurrent_requests"`
 	MaxConcurrentRequests      int     `yaml:"-"`
@@ -171,6 +174,14 @@ func loadConfig(path string) (appConfig, error) {
 		}
 		config.SessionAffinityMaxPerAccount = limit
 	}
+	config.AccountCooldown = copilot.DefaultAccountCooldown
+	if value := config.AccountCooldownValue; value != nil {
+		cooldown, err := time.ParseDuration(strings.TrimSpace(*value))
+		if err != nil || cooldown <= 0 {
+			return appConfig{}, fmt.Errorf("无效的 account_cooldown %q，必须是大于 0 的 Go duration（例如 2h）", *value)
+		}
+		config.AccountCooldown = cooldown
+	}
 	config.MaxConcurrentRequests = defaultMaxConcurrentRequests
 	if value := config.MaxConcurrentRequestsValue; value != nil {
 		limit, err := strconv.Atoi(strings.TrimSpace(*value))
@@ -265,6 +276,7 @@ func (c appConfig) poolConfig(logger *slog.Logger) copilot.PoolConfig {
 		CredentialsDir: filepath.Join(c.DataPath, credentialsDirName), CacheDir: c.CacheDir,
 		Host: c.Host, ModelsCacheTTL: c.ModelsCacheTTL, QuotaRefreshInterval: c.QuotaRefreshInterval,
 		SessionAffinityTTL: affinityTTL, SessionAffinityMaxPerAccount: c.SessionAffinityMaxPerAccount,
+		AccountCooldown:       c.AccountCooldown,
 		MaxConcurrentRequests: c.MaxConcurrentRequests, Logger: logger,
 	}
 }

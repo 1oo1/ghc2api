@@ -1,6 +1,6 @@
 // 概览页：可用账号数、累计请求、错误数，以及各账号的请求统计表。
 import type { AccountView } from "../api";
-import { accountStatus, availableCount, formatTime, statusLabel, sumStats } from "../account";
+import { accountStatus, accountStatusText, availableCount, formatTime, sumStats } from "../account";
 import { Empty } from "../components/Empty";
 
 export function OverviewPage({ accounts }: { accounts: AccountView[] }) {
@@ -47,7 +47,7 @@ export function OverviewPage({ accounts }: { accounts: AccountView[] }) {
                     <td>{a.user}</td>
                     <td>
                       <span className={`badge ${status}`}>
-                        {statusLabel[status]}
+                        {accountStatusText(a, now)}
                       </span>
                     </td>
                     <td>{a.stats.requests.toLocaleString("zh-CN")}</td>

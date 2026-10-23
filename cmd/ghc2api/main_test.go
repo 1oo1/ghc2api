@@ -1374,6 +1374,53 @@ func TestSessionAffinityMaxPerAccountConfig(t *testing.T) {
 	}
 }
 
+// TestAccountCooldownConfig account_cooldown 缺省为 2h，合法的 Go duration 原样保存在 appConfig 并透传到
+// PoolConfig.AccountCooldown。无法解析、非正值与显式空串启动失败，错误信息包含字段名。
+func TestAccountCooldownConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		contents string
+		want     time.Duration
+		wantErr  bool
+	}{
+		{name: "default", contents: "", want: 2 * time.Hour},
+		{name: "custom", contents: "account_cooldown: 30m\n", want: 30 * time.Minute},
+		{name: "invalid", contents: "account_cooldown: soon\n", wantErr: true},
+		{name: "zero", contents: "account_cooldown: 0s\n", wantErr: true},
+		{name: "negative", contents: "account_cooldown: -1m\n", wantErr: true},
+		{name: "empty", contents: "account_cooldown: \"\"\n", wantErr: true},
+		// YAML null 与未写该键一样视为未设置，取缺省值 2h。
+		{name: "null-is-unset", contents: "account_cooldown:\n", want: 2 * time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			configPath := writeConfigWithAccount(t, "cooldown", accountJSON("cooldown-token"), apiKeySetting+tc.contents)
+			config, err := loadConfig(configPath)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("非法的 account_cooldown 未被拒绝")
+				}
+				// 字段尚未被识别时 YAML 解码就会失败；这里要求失败来自字段自身的校验。
+				if strings.Contains(err.Error(), "不是有效 YAML") {
+					t.Fatalf("account_cooldown 未被识别（YAML 解码失败）: %v", err)
+				}
+				if !strings.Contains(err.Error(), "account_cooldown") {
+					t.Fatalf("错误未指出字段 account_cooldown: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadConfig() error = %v", err)
+			}
+			if config.AccountCooldown != tc.want {
+				t.Fatalf("account_cooldown = %s, want %s", config.AccountCooldown, tc.want)
+			}
+			if got := config.poolConfig(nil).AccountCooldown; got != tc.want {
+				t.Fatalf("PoolConfig.AccountCooldown = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestAccountDisabledFlagIsLoaded 凭证文件中的 disabled 被读取到账号配置中，省略时账号为启用状态。
 func TestAccountDisabledFlagIsLoaded(t *testing.T) {
 	configDir := isolatedConfigDir(t)

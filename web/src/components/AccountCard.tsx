@@ -4,12 +4,14 @@ import type { AccountView } from "../api";
 import type { Actions } from "../actions";
 import {
   accountStatus,
+  accountStatusText,
+  isCooling,
+  coolingLabel,
   formatTime,
   hostLabel,
   MAX_PRIORITY,
   MIN_PRIORITY,
   parsePriority,
-  statusLabel,
 } from "../account";
 import { buckets, resetLabel, usedPercent, type Bucket, type Quota } from "../quota";
 
@@ -23,7 +25,10 @@ export function AccountCard({
   account: AccountView;
   actions: Actions;
 }) {
-  const status = accountStatus(account);
+  const now = Date.now();
+  const status = accountStatus(account, now);
+  // 冷却与禁用相互独立：禁用的账号仍可能处于冷却中，此时同样显示原因、截止时间与解除按钮。
+  const cooling = isCooling(account, now);
   const { busy, client, run } = actions;
   return (
     <article className="account-card">
@@ -33,16 +38,18 @@ export function AccountCard({
           <h2>{account.user}</h2>
           <small>{hostLabel(account.host)}</small>
         </div>
-        <span className={`badge ${status}`}>{statusLabel[status]}</span>
+        <span className={`badge ${status}`}>{accountStatusText(account, now)}</span>
       </header>
       <QuotaPanel quota={account.quota} quotaError={account.quota_error} />
       <p className="stats-line">
         请求 {account.stats.requests.toLocaleString("zh-CN")} · 错误{" "}
         {account.stats.errors.toLocaleString("zh-CN")} · 最近使用{" "}
         {formatTime(account.stats.last_used_at)}
-        {status === "cooling" &&
-          ` · 冷却至 ${formatTime(account.cooldown_until)}`}
+        {cooling && ` · 冷却至 ${formatTime(account.cooldown_until)}`}
       </p>
+      {cooling && status === "disabled" && (
+        <p className="hint">{coolingLabel(account.cooldown_reason)}</p>
+      )}
       {/* 以服务端的优先级为 key：优先级变化后重新挂载，输入框随之显示新值。 */}
       <PriorityEditor key={account.priority} account={account} actions={actions} />
       <footer>
@@ -59,6 +66,19 @@ export function AccountCard({
         >
           刷新额度
         </button>
+        {cooling && (
+          <button
+            disabled={busy}
+            onClick={() =>
+              void run(async () => {
+                await client.clearCooldown(account.id);
+                return `${account.user} 已解除冷却`;
+              })
+            }
+          >
+            解除冷却
+          </button>
+        )}
         <button
           disabled={busy}
           onClick={() =>

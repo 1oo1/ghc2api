@@ -47,10 +47,10 @@ JSON 名为小驼峰（如 `remainingFraction`、`observedAt`），完整定义�
 
 ### 错误触发刷新
 
-- 账号处理请求失败（响应状态 ≥400 且不是 429，或会话获取失败且不是上游 429）时，异步强制刷新该账号的额度（`poolAccount.refreshAfterError`，它以节流间隔调用 `refreshAsync`，`quota.go`）。触发点：`poolAccount.track`（客户端未取消）与 `Pool.forward` 中会话获取失败的分支。
-- 客户端断开造成的失败（`context.Canceled`）不触发；429 是限流，由冷却处理，也不触发。
+- 账号处理请求失败（响应状态 ≥400 且不是 429，或会话获取失败且不是上游 429）时，异步强制刷新该账号的额度（`poolAccount.refreshAfterError`，它以节流间隔调用 `refreshAsync`，`quota.go`）。触发点：`poolAccount.record`（经 `Pool.serve` 处理结束后，客户端未取消时）与 `Pool.pickSession` 中会话获取失败的分支。
+- 客户端断开造成的失败（`context.Canceled`）不触发；429 是限流，不触发刷新（429 本身按连续错误计数，见 `pool.md`）。
 - 节流：距上次尝试不足 `var quotaErrorRefreshInterval = time.Minute`（测试可临时修改，不得改为常量）不触发。同一账号已有异步刷新进行中（`quotaCache.refreshing`，错误触发与新增账号共用）时不再发起，因此单账号会话失败时两处触发只刷新一次。该标志不约束后台定时刷新与控制台列表刷新（非强制）：它们互相之间、以及与异步刷新之间没有在途保护，同一账号偶尔会并发请求一次上游（最长持续一次刷新的超时 10 秒，不会累积）。
-- 429 不触发刷新：Copilot 若以 429 表示额度耗尽，该账号只会冷却 1 分钟，耗尽状态要等下一次后台刷新（最长一个刷新间隔）才能被识别。
+- 429 不触发刷新：Copilot 若以 429 表示额度耗尽，该账号的 429 只计入连续错误（连续第 3 次才冷却，冷却时长为 `account_cooldown`，缺省 2 小时，见 `pool.md`），耗尽状态要等下一次后台刷新（最长一个刷新间隔）才能被识别。
 - 异步执行，不阻塞响应；使用独立于请求的 context（超时 `quotaRefreshTimeout`），客户端断开不影响刷新。结果照常在 `quotaCache.mu` 内更新 `checkedAt` 与额度并写入 `quota.json`，因此刷新得到的耗尽额度立即影响后续选择（见 `pool.md`）。
 
 ## 持久化

@@ -230,6 +230,8 @@ func testPool(t *testing.T, configs []Config) *Pool {
 		t.Fatal(err)
 	}
 	quotaAwaitIdle(t, pool)
+	// 测试中的请求可能触发进入冷却的异步副作用：清理先于 TempDir 的删除完成。
+	t.Cleanup(pool.WaitCooldownEffects)
 	return pool
 }
 
@@ -306,15 +308,16 @@ func TestNewPoolAcceptsDistinctAccountsInConfigOrder(t *testing.T) {
 }
 
 func TestServiceCooldownFollowsDeadline(t *testing.T) {
-	if AccountCooldown != time.Minute {
-		t.Fatalf("AccountCooldown = %s, want 1m", AccountCooldown)
+	// 原来的 1 分钟短冷却已取消，缺省冷却时长为 DefaultAccountCooldown（2 小时）。
+	if DefaultAccountCooldown != 2*time.Hour {
+		t.Fatalf("DefaultAccountCooldown = %s, want 2h", DefaultAccountCooldown)
 	}
 	s := testService(t, Config{APIKey: testAPIKey, Token: "oauth-a"})
 	now := time.Now()
 	if !s.available(now) {
 		t.Fatal("从未冷却的账号必须可用")
 	}
-	until := now.Add(AccountCooldown)
+	until := now.Add(DefaultAccountCooldown)
 	s.setCooldown(until)
 	if s.available(until.Add(-time.Nanosecond)) {
 		t.Fatal("冷却截止时间之前账号不可用")
@@ -380,6 +383,8 @@ func TestPoolWithSingleAccountMatchesService(t *testing.T) {
 	}
 }
 
+// TestPoolSessionFailureSwitchesAccountInSameRequestAndCoolsDown A 的 session 持续失败：每次失败都在同一请求内改用其他账号，
+// 请求仍然成功；连续第 3 次失败才冷却 A（不再是 1 分钟短冷却），冷却后 A 不再被尝试。
 func TestPoolSessionFailureSwitchesAccountInSameRequestAndCoolsDown(t *testing.T) {
 	// 必须在 NewPool 之前捕获日志，账号 Service 在创建时读取默认 logger。
 	logs := captureJSONSlog(t, slog.LevelWarn)
@@ -387,25 +392,31 @@ func TestPoolSessionFailureSwitchesAccountInSameRequestAndCoolsDown(t *testing.T
 	upstream.failSession("oauth-a", poolFailure{http.StatusInternalServerError, `{"message":"a down"}`})
 	p := testPool(t, poolUserConfigs(t, upstream.client(), "a", "b", "c"))
 
-	// 第一次请求先由 A 尝试（同档权重相同，按文件名），A 的 session 失败后同一请求改用其他账号，三次请求都必须成功。
-	// A 冷却后不再被尝试；B、C 之间的轮询顺序由 SWRR 决定，这里只断言 A 不再出现，不固定 B、C 的先后。
-	for i := range 3 {
-		w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody)
-		if w.Code != http.StatusOK {
-			t.Fatalf("请求 %d status=%d body=%s", i, w.Code, w.Body.String())
+	// A 尚未冷却时可能被尝试，每个请求都必须成功（A 失败后同一请求改用 B 或 C）；A 冷却后不再被尝试。
+	// B、C 之间的先后由 SWRR 决定，这里不固定。
+	for i := 0; p.findAccount("a").service.available(time.Now()); i++ {
+		if i == 10 {
+			t.Fatal("A 连续 session 失败后仍未冷却")
+		}
+		if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK {
+			t.Fatalf("请求 %d status=%d body=%s, want 200（同一请求内换号）", i, w.Code, w.Body.String())
 		}
 	}
-	got := upstream.generationOrder()
-	if len(got) != 3 {
-		t.Fatalf("三次请求的生成账号顺序 = %v, want 3 次", got)
+	if sessions := upstream.sessionCount("oauth-a"); sessions != 3 {
+		t.Errorf("A 的 session 交换 %d 次, want 3（连续第 3 次失败才冷却）", sessions)
 	}
-	for _, account := range got {
+	for range 3 {
+		if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK {
+			t.Fatalf("冷却后请求 status=%d body=%s, want 200", w.Code, w.Body.String())
+		}
+	}
+	for _, account := range upstream.generationOrder() {
 		if account == "oauth-a" {
-			t.Errorf("A 冷却后仍被用于生成请求: %v", got)
+			t.Errorf("A 冷却后仍被用于生成请求: %v", upstream.generationOrder())
 		}
 	}
-	if sessions := upstream.sessionCount("oauth-a"); sessions != 1 {
-		t.Errorf("冷却期内 A 的 session 交换 %d 次, want 1", sessions)
+	if sessions := upstream.sessionCount("oauth-a"); sessions != 3 {
+		t.Errorf("冷却期内 A 的 session 交换 %d 次, want 仍为 3", sessions)
 	}
 	warned := false
 	for _, entry := range jsonLogEntries(t, logs.Bytes()) {
@@ -466,6 +477,8 @@ func TestPoolReturnsBadGatewayWhenEveryAccountNetworkFails(t *testing.T) {
 	}
 }
 
+// TestPoolGeneration429PassesThroughAndCoolsAccount 生成接口的 429 原样透传且不在本请求内换账号；
+// 429 同样按连续错误计数，连续第 3 次 429 才让账号冷却（不再是第 1 次就冷却）。冷却后 A 不再被尝试。
 func TestPoolGeneration429PassesThroughAndCoolsAccount(t *testing.T) {
 	for _, path := range []string{"/v1/chat/completions", "/responses", "/v1/messages"} {
 		t.Run(path, func(t *testing.T) {
@@ -473,20 +486,36 @@ func TestPoolGeneration429PassesThroughAndCoolsAccount(t *testing.T) {
 			upstream.failGeneration("oauth-a", poolFailure{http.StatusTooManyRequests, `{"error":"quota exhausted"}`})
 			p := testPool(t, poolUserConfigs(t, upstream.client(), "a", "b"))
 
-			w := poolRequest(p, "POST", path, poolChatBody)
-			if w.Code != http.StatusTooManyRequests || w.Body.String() != `{"error":"quota exhausted"}` {
-				t.Fatalf("429 未原样透传: status=%d body=%s", w.Code, w.Body.String())
-			}
-			// 生成接口的 429 不在同一请求内换账号重试。
-			assertGenerationOrder(t, upstream, "oauth-a")
-
-			for i := range 3 {
-				if w := poolRequest(p, "POST", path, poolChatBody); w.Code != http.StatusOK {
-					t.Fatalf("冷却后第 %d 个请求 status=%d body=%s", i+1, w.Code, w.Body.String())
+			// A 与 B 轮流（权重相同，按文件名）。A 每次都返回 429 并原样透传；第 3 次 429 后 A 冷却。
+			var limited int
+			for i := 0; p.findAccount("a").service.available(time.Now()); i++ {
+				if i == 10 {
+					t.Fatal("A 连续 429 后仍未冷却")
+				}
+				w := poolRequest(p, "POST", path, poolChatBody)
+				switch w.Code {
+				case http.StatusTooManyRequests:
+					if w.Body.String() != `{"error":"quota exhausted"}` {
+						t.Fatalf("429 未原样透传: body=%s", w.Body.String())
+					}
+					limited++
+				case http.StatusOK:
+				default:
+					t.Fatalf("请求 %d status=%d body=%s, want 429 或 200", i, w.Code, w.Body.String())
 				}
 			}
-			// 第一次请求后 A 进入冷却，之后的请求全部落在 B。
-			assertGenerationOrder(t, upstream, "oauth-a", "oauth-b", "oauth-b", "oauth-b")
+			if limited != 3 {
+				t.Fatalf("A 返回 429 的次数 = %d, want 3（连续第 3 次才冷却）", limited)
+			}
+			before := countAccount(upstream.generationOrder(), "oauth-a")
+			for range 3 {
+				if w := poolRequest(p, "POST", path, poolChatBody); w.Code != http.StatusOK {
+					t.Fatalf("冷却后请求 status=%d body=%s, want 200", w.Code, w.Body.String())
+				}
+			}
+			if got := countAccount(upstream.generationOrder(), "oauth-a"); got != before {
+				t.Fatalf("冷却后 A 仍收到生成请求: %d -> %d", before, got)
+			}
 		})
 	}
 }
@@ -713,8 +742,8 @@ func TestPoolLogsClientRequestHeadersWithSensitiveRedacted(t *testing.T) {
 	assertClientRequestHeadersLogged(t, logs.Bytes())
 }
 
-// setupCooledAccountB 让账号 B 处于冷却中，A 与 C 未冷却。冷却直接设置而不经过 429 请求，
-// 使测试只关注 session 失败与冷却档的选择顺序。session 有效期设为 1 分钟，使每个请求都会重新交换 session，
+// setupCooledAccountB 让账号 B 处于冷却中（冷却中的账号完全不参与选择），A 与 C 未冷却。冷却直接设置而不经过错误请求，
+// 使测试只关注 session 失败与选择顺序。session 有效期设为 1 分钟，使每个请求都会重新交换 session，
 // 便于精确控制后续失败。
 func setupCooledAccountB(t *testing.T) (*poolUpstream, *Pool) {
 	t.Helper()
@@ -746,43 +775,44 @@ func assertSessionAttempts(t *testing.T, u *poolUpstream, before map[string]int,
 
 func TestPoolRequestNeverRetriesAccountWithinOneRequest(t *testing.T) {
 	accounts := []string{"oauth-a", "oauth-b", "oauth-c"}
-	t.Run("cooled-account-is-last-candidate-and-serves", func(t *testing.T) {
+	t.Run("cooled-account-is-not-a-candidate", func(t *testing.T) {
 		upstream, p := setupCooledAccountB(t)
 		upstream.failSession("oauth-a", poolFailure{http.StatusInternalServerError, `{"message":"a down"}`})
 		upstream.failSession("oauth-c", poolFailure{http.StatusInternalServerError, `{"message":"c down"}`})
-		before := sessionSnapshot(upstream, "oauth-a", "oauth-c")
-		if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK {
-			t.Fatalf("status=%d body=%s, want 200 由冷却中的 B 处理", w.Code, w.Body.String())
+		before := sessionSnapshot(upstream, accounts...)
+		// B 处于冷却中，不参与选择，也没有兜底：A、C 各尝试一次并失败后没有候选，
+		// 返回最后尝试的账号（C，SWRR 中 A 先于 C）的错误。
+		w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody)
+		if w.Code != http.StatusInternalServerError || w.Body.String() != `{"message":"c down"}` {
+			t.Fatalf("status=%d body=%s, want 500 且为 C 的错误（冷却的 B 不得兜底）", w.Code, w.Body.String())
 		}
-		// A、C 各只在本请求内尝试一次（失败即冷却，之后不会再被选中）；
-		// B 处于冷却档，只在 A、C 都被排除后才作为最后的候选被尝试，并成功处理。
-		// 本请求只有 B 的生成请求，因此生成请求的账号顺序只含一次 oauth-b。
-		assertSessionAttempts(t, upstream, before, map[string]int{"oauth-a": 1, "oauth-c": 1})
-		assertGenerationOrder(t, upstream, "oauth-b")
+		// A、C 各只在本请求内尝试一次；B 冷却中从未被尝试。
+		assertSessionAttempts(t, upstream, before, map[string]int{"oauth-a": 1, "oauth-b": 0, "oauth-c": 1})
+		assertGenerationOrder(t, upstream)
 	})
-	t.Run("every-account-attempted-exactly-once", func(t *testing.T) {
+	t.Run("every-available-account-attempted-exactly-once", func(t *testing.T) {
 		upstream, p := setupCooledAccountB(t)
 		for _, account := range accounts {
 			upstream.failSession(account, poolFailure{http.StatusInternalServerError, `{"message":"down"}`})
 		}
 		before := sessionSnapshot(upstream, accounts...)
 		if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code == http.StatusOK {
-			t.Fatalf("三个账号的 session 都失败时不应返回 200")
+			t.Fatalf("未冷却的账号 session 都失败时不应返回 200")
 		}
 		// 失败的 session 在预取阶段即返回、不进入请求处理函数，因此增量精确等于本请求内的尝试次数。
-		assertSessionAttempts(t, upstream, before, map[string]int{"oauth-a": 1, "oauth-b": 1, "oauth-c": 1})
+		// B 冷却中，不参与任何尝试。
+		assertSessionAttempts(t, upstream, before, map[string]int{"oauth-a": 1, "oauth-b": 0, "oauth-c": 1})
 	})
 }
 
 // TestPoolGenerationLargeRateLimitBodyPassesThroughAndCoolsAccount 上游 429 的正文超过 4 MiB 时，
-// 仍应原样透传正文和响应头（如 Retry-After），并让该账号进入冷却，而不是返回 502。
+// 仍应原样透传正文和响应头（如 Retry-After）。连续第 3 次这样的 429 才让该账号冷却，之前不冷却。
 func TestPoolGenerationLargeRateLimitBodyPassesThroughAndCoolsAccount(t *testing.T) {
 	body := strings.Repeat("q", 5<<20)
 	upstream := newPoolUpstream(t)
 	upstream.failGenerationWithHeader("oauth-a", poolFailure{http.StatusTooManyRequests, body},
 		http.Header{"Retry-After": {"120"}})
 	p := testPool(t, poolUserConfigs(t, upstream.client(), "a", "b"))
-
 	w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody)
 	if w.Code != http.StatusTooManyRequests {
 		t.Fatalf("大正文 429 status=%d, want 429（正文 %d 字节）", w.Code, w.Body.Len())
@@ -794,35 +824,60 @@ func TestPoolGenerationLargeRateLimitBodyPassesThroughAndCoolsAccount(t *testing
 		t.Fatalf("Retry-After = %q, want 120", got)
 	}
 	assertGenerationOrder(t, upstream, "oauth-a")
-	for i := range 2 {
-		if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK {
-			t.Fatalf("冷却后第 %d 个请求 status=%d", i+1, w.Code)
+	if !p.findAccount("a").service.available(time.Now()) {
+		t.Fatal("第 1 次大正文 429 不应冷却（连续第 3 次才冷却）")
+	}
+	// A 与 B 轮流：A 的第 2、3 次大正文 429 后冷却，之后的请求全部由 B 处理。
+	for i := 0; p.findAccount("a").service.available(time.Now()); i++ {
+		if i == 10 {
+			t.Fatal("A 连续大正文 429 后仍未冷却")
+		}
+		if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK && w.Code != http.StatusTooManyRequests {
+			t.Fatalf("请求 status=%d, want 429 或 200", w.Code)
 		}
 	}
-	// 账号 A 已冷却，之后的请求全部由 B 处理。
-	assertGenerationOrder(t, upstream, "oauth-a", "oauth-b", "oauth-b")
+	before := countAccount(upstream.generationOrder(), "oauth-a")
+	for range 2 {
+		if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK {
+			t.Fatalf("冷却后请求 status=%d, want 200", w.Code)
+		}
+	}
+	if got := countAccount(upstream.generationOrder(), "oauth-a"); got != before {
+		t.Fatalf("冷却后 A 仍收到生成请求: %d -> %d", before, got)
+	}
 }
 
+// TestPoolAutoRateLimitPassesThroughAndCoolsAccount Auto 路径的 429 兜底也是 429 时原样透传；
+// 按连续错误计数，第 3 次才冷却。冷却后不再访问 A 的 Auto 接口。
 func TestPoolAutoRateLimitPassesThroughAndCoolsAccount(t *testing.T) {
 	const autoBody = `{"model":"auto","messages":[{"role":"user","content":"hi"}]}`
 	upstream := newPoolUpstream(t)
 	upstream.failAuto("oauth-a", poolFailure{http.StatusTooManyRequests, `{"error":"auto limited"}`})
 	p := testPool(t, poolUserConfigs(t, upstream.client(), "a", "b"))
-
 	w := poolRequest(p, "POST", "/v1/chat/completions", autoBody)
-	if w.Code != http.StatusTooManyRequests {
+	if w.Code != http.StatusTooManyRequests || w.Body.String() != `{"error":"auto limited"}` {
 		t.Fatalf("Auto 路径 429 未透传: status=%d body=%s", w.Code, w.Body.String())
 	}
-	autoAfterFirst := upstream.autoCount("oauth-a")
+	if !p.findAccount("a").service.available(time.Now()) {
+		t.Fatal("第 1 次 Auto 限流不应冷却（连续第 3 次才冷却）")
+	}
+	for i := 0; p.findAccount("a").service.available(time.Now()); i++ {
+		if i == 10 {
+			t.Fatal("A 连续 Auto 限流后仍未冷却")
+		}
+		if w := poolRequest(p, "POST", "/v1/chat/completions", autoBody); w.Code != http.StatusTooManyRequests && w.Code != http.StatusOK {
+			t.Fatalf("请求 %d status=%d body=%s, want 429 或 200", i, w.Code, w.Body.String())
+		}
+	}
+	autoAfterCooled := upstream.autoCount("oauth-a")
 	for i := range 2 {
 		if w := poolRequest(p, "POST", "/v1/chat/completions", autoBody); w.Code != http.StatusOK {
 			t.Fatalf("冷却后请求 %d status=%d body=%s", i, w.Code, w.Body.String())
 		}
 	}
-	// A 在 Auto 限流后进入冷却，之后的请求全部由 B 处理，且不再访问 A 的 Auto 接口。
-	assertGenerationOrder(t, upstream, "oauth-b", "oauth-b")
-	if got := upstream.autoCount("oauth-a"); got != autoAfterFirst {
-		t.Errorf("冷却期内仍访问 A 的 Auto 接口: 次数 %d, want %d", got, autoAfterFirst)
+	// A 已冷却，之后的请求全部由 B 处理，且不再访问 A 的 Auto 接口。
+	if got := upstream.autoCount("oauth-a"); got != autoAfterCooled {
+		t.Errorf("冷却期内仍访问 A 的 Auto 接口: 次数 %d, want %d", got, autoAfterCooled)
 	}
 }
 

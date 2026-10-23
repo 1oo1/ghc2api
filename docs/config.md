@@ -40,6 +40,7 @@ management_key: ""            # 空则禁用控制台与管理接口；必须与
 session_affinity: true        # 默认 true
 session_affinity_ttl: "2h"    # Go duration，必须 > 0，默认 2h
 session_affinity_max_per_account: 5   # 整数，>= 0，默认 5；0 表示不限制
+account_cooldown: "2h"        # Go duration，必须 > 0，默认 2h：账号进入冷却后不参与选择的时长
 max_concurrent_requests: 32   # 整数，>= 0，默认 32；0 表示不限制
 quota_refresh_interval: "1h"  # Go duration，必须 >= 1m，默认 1h
 ```
@@ -48,10 +49,12 @@ quota_refresh_interval: "1h"  # Go duration，必须 >= 1m，默认 1h
 - 设置了 `management_key` 时，凭证目录不存在会自动创建（0700），允许 0 个账号启动。
 - `session_affinity: false` 时传给 Pool 的 `SessionAffinityTTL` 为 0；TTL 非法（含 `0s`、负值）启动失败。
 - `session_affinity_max_per_account` 是每个账号的有效会话绑定数上限（见 `session-affinity.md`），缺省为 `5`，`0` 表示不限制。负数、非整数（如 `abc`、`1.5`）与显式空值（`""`）启动失败，错误信息包含字段名 `session_affinity_max_per_account`。关闭 `session_affinity` 时该项不生效，但仍会校验。传给 Pool 的 `PoolConfig.SessionAffinityMaxPerAccount` 与之相同。
+- `account_cooldown` 是账号进入冷却后暂停参与选择的时长（规则见 `pool.md`「限流、错误计数与冷却」）。缺省为 `2h`；无法解析、非正（如 `0s`、`-1m`）或显式空值（`""`）启动失败，错误信息包含字段名 `account_cooldown`。写成 YAML null（`account_cooldown:` 或 `account_cooldown: ~`，即只写键名、不写值）视为未设置，取 `2h`，与其他可选键一致。`appConfig.AccountCooldown`（`yaml:"-"`）为解析后的值，`poolConfig` 把它填入 `PoolConfig.AccountCooldown`。
 - `max_concurrent_requests` 是同时处理的生成请求数上限（见 `pool.md` 的「生成请求并发上限」与 `http-api.md`）。缺省为 `32`，显式 `0` 表示不限制；负数与非整数启动失败，错误信息包含字段名 `max_concurrent_requests`。写成空值（`max_concurrent_requests:` 即 YAML null）时按未设置处理，取 `32`。传给 Pool 的 `PoolConfig.MaxConcurrentRequests` 与之相同。
 - `quota_refresh_interval` 是额度的节流窗口，也是后台定时刷新的判断依据（见 `quota-stats.md`）。无法解析、非正或小于 `1m` 的值启动失败，错误信息包含字段名 `quota_refresh_interval`；省略时为 `1h`。它与是否设置 `management_key` 无关。
 - `appConfig.poolConfig(logger)` 生成 `copilot.PoolConfig`（`CredentialsDir=DataPath/credentials`、`CacheDir=DataPath/cache`、`QuotaRefreshInterval` 等），`poolAccounts()` 把凭证转换为 `[]copilot.PoolAccount`（保持文件名顺序）；`loadConfig` 与 `serve` 都经 `NewManagedPool` 建池。
 - `serve` 在 HTTP 服务开始监听后启动 `pool.RunQuotaRefresh`，随退出信号（或 serve 返回）取消；它不参与 HTTP 关闭等待，也不影响会话亲和的保存顺序。
+- 关闭时保存会话亲和表前，`saveSessionAffinity` 最多等待 5 秒进入冷却的异步副作用（`Pool.WaitCooldownEffectsTimeout`，清缓存、删绑定、写 `cooldown.json`）。超时记 Warn「会话亲和：等待冷却副作用超时，继续保存」并照常保存，因此关闭耗时至多增加 5 秒。
 
 ## 日志
 

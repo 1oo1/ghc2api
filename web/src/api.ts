@@ -13,6 +13,8 @@ export type AccountView = {
   priority: number;
   /** 仅在冷却中时存在。 */
   cooldown_until?: string;
+  /** 仅在冷却中时存在：触发冷却的状态码（如 "403"），网络错误为 "network"。 */
+  cooldown_reason?: string;
   stats: {
     requests: number;
     errors: number;
@@ -102,6 +104,9 @@ export function createManagementClient(managementKey: string) {
       request<AccountView>("accounts", "PATCH", { id, disabled }),
     setPriority: (id: string, priority: number) =>
       request<AccountView>("accounts", "PATCH", { id, priority }),
+    /** 立即解除冷却，计数清零；返回服务端的账号视图。 */
+    clearCooldown: (id: string) =>
+      request<AccountView>("accounts", "PATCH", { id, clear_cooldown: true }),
     deleteAccount: (id: string) =>
       request<{ ok: boolean }>(
         `accounts?id=${encodeURIComponent(id)}`,

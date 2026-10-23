@@ -32,13 +32,14 @@ const consoleCSP = "default-src 'self'; script-src 'self' 'unsafe-inline'; style
 
 // AccountView 是管理接口返回的账号视图，不包含 OAuth token。
 type AccountView struct {
-	ID            string     `json:"id"`
-	User          string     `json:"user"`
-	Host          string     `json:"host"` // 空表示 github.com
-	Disabled      bool       `json:"disabled"`
-	Priority      int        `json:"priority"`                 // 优先级，取值 MinPriority 到 MaxPriority；数值越大越优先被选择
-	CooldownUntil *time.Time `json:"cooldown_until,omitempty"` // 仅在冷却中时输出
-	Stats         struct {
+	ID             string     `json:"id"`
+	User           string     `json:"user"`
+	Host           string     `json:"host"` // 空表示 github.com
+	Disabled       bool       `json:"disabled"`
+	Priority       int        `json:"priority"`                  // 优先级，取值 MinPriority 到 MaxPriority；数值越大越优先被选择
+	CooldownUntil  *time.Time `json:"cooldown_until,omitempty"`  // 仅在冷却中时输出
+	CooldownReason string     `json:"cooldown_reason,omitempty"` // 仅在冷却中时输出：触发冷却的状态码，网络错误为 "network"
+	Stats          struct {
 		Requests   uint64     `json:"requests"`
 		Errors     uint64     `json:"errors"`
 		LastUsedAt *time.Time `json:"last_used_at,omitempty"`
@@ -195,19 +196,23 @@ func (p *Pool) handleImportAccount(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, p.accountView(account))
 }
 
-// handlePatchAccount 更新账号的 disabled 与 priority，两者至少提供一个，未提供的字段保持不变。
-// 先重写凭证文件，成功后才更新内存状态；写入失败时返回 500 且状态不变。
+// handlePatchAccount 更新账号的 disabled、priority 与 clear_cooldown，三者至少提供一个，未提供的字段保持不变。
+// 顺序：disabled 或 priority 有变化时先重写凭证文件；写入失败返回 500，冷却、disabled、priority 全部不变。
+// 写入成功后同步内存中的 disabled 与 priority，再在 clear_cooldown 为 true 时解除冷却（见 poolAccount.liftCooldown）；
+// 解除失败返回 500，错误信息说明凭证已更新、账号仍冷却，此时 disabled 与 priority 已生效，冷却不变。
+// clear_cooldown 为 false 视为未提供。
 func (p *Pool) handlePatchAccount(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ID       string `json:"id"`
-		Disabled *bool  `json:"disabled"`
-		Priority *int   `json:"priority"`
+		ID            string `json:"id"`
+		Disabled      *bool  `json:"disabled"`
+		Priority      *int   `json:"priority"`
+		ClearCooldown bool   `json:"clear_cooldown"`
 	}
 	if !decodeManagementJSON(w, r, &req) {
 		return
 	}
-	if req.ID == "" || (req.Disabled == nil && req.Priority == nil) {
-		writeError(w, http.StatusBadRequest, "请求必须包含 id，且 disabled 与 priority 至少提供一个")
+	if req.ID == "" || (req.Disabled == nil && req.Priority == nil && !req.ClearCooldown) {
+		writeError(w, http.StatusBadRequest, "请求必须包含 id，且 disabled、priority 与 clear_cooldown 至少提供一个")
 		return
 	}
 	if req.Priority != nil {
@@ -227,19 +232,34 @@ func (p *Pool) handlePatchAccount(w http.ResponseWriter, r *http.Request) {
 	p.mu.Lock()
 	disabled, priority := account.disabled, account.priority
 	p.mu.Unlock()
-	if req.Disabled != nil {
-		disabled = *req.Disabled
+	credentialChanged := false
+	if req.Disabled != nil && *req.Disabled != disabled {
+		disabled, credentialChanged = *req.Disabled, true
 	}
-	if req.Priority != nil {
-		priority = *req.Priority
+	if req.Priority != nil && *req.Priority != priority {
+		priority, credentialChanged = *req.Priority, true
 	}
-	if err := setCredentialState(p.credentialPath(account), disabled, priority); err != nil {
-		writeError(w, http.StatusInternalServerError, "写入凭证失败: "+err.Error())
-		return
+	if credentialChanged {
+		if err := setCredentialState(p.credentialPath(account), disabled, priority); err != nil {
+			writeError(w, http.StatusInternalServerError, "写入凭证失败: "+err.Error())
+			return
+		}
 	}
 	p.mu.Lock()
 	account.disabled, account.priority = disabled, priority
 	p.mu.Unlock()
+	if req.ClearCooldown {
+		if err := account.liftCooldown(); err != nil {
+			p.log(r.Context(), slog.LevelWarn, "管理接口：解除冷却失败，账号仍处于冷却中", "id", account.id, "error", err.Error())
+			message := "删除冷却记录失败，账号仍处于冷却中: " + err.Error()
+			if credentialChanged {
+				message = "凭证已更新，账号仍冷却（删除冷却记录失败）: " + err.Error()
+			}
+			writeError(w, http.StatusInternalServerError, message)
+			return
+		}
+		p.log(r.Context(), slog.LevelInfo, "管理接口：账号已解除冷却", "id", account.id)
+	}
 	p.log(r.Context(), slog.LevelInfo, "管理接口：账号已更新", "id", account.id, "disabled", disabled, "priority", priority)
 	writeJSON(w, http.StatusOK, p.accountView(account))
 }
@@ -337,7 +357,7 @@ func (p *Pool) addVerifiedAccount(token, host, login string) (*poolAccount, erro
 	if err := SaveCredential(p.credentialPathFor(login), credential); err != nil {
 		return nil, err
 	}
-	account := newPoolAccount(service, id)
+	account := p.newAccount(service, id)
 	p.mu.Lock()
 	p.accounts = append(p.accounts, account)
 	p.mu.Unlock()
@@ -411,6 +431,7 @@ func (a *poolAccount) view(now time.Time) AccountView {
 	if until := a.service.cooldownUntil.Load(); until > now.UnixNano() {
 		cooldown := time.Unix(0, until).UTC()
 		view.CooldownUntil = &cooldown
+		view.CooldownReason = a.cooldownReason()
 	}
 	view.Stats.Requests = a.requests.Load()
 	view.Stats.Errors = a.failures.Load()

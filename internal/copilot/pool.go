@@ -17,9 +17,6 @@ import (
 	"time"
 )
 
-// AccountCooldown 是账号失败后暂停参与选择的时长。
-const AccountCooldown = time.Minute
-
 // PoolConfig 是账号池的服务级配置，账号无关的设置都放在这里。
 type PoolConfig struct {
 	APIKey               string        // 客户端访问密钥，必填：去除首尾空白后不能为空
@@ -31,9 +28,12 @@ type PoolConfig struct {
 	QuotaRefreshInterval time.Duration // 非正值使用默认的额度刷新间隔（DefaultQuotaRefreshInterval）
 	SessionAffinityTTL   time.Duration // <=0 表示关闭会话亲和（不创建绑定表）
 	// SessionAffinityMaxPerAccount 是每个账号的有效会话绑定数上限：新会话与故障切换时优先排除已达上限的账号，
-	// 排除后没有候选或会降为冷却档时忽略上限（见 Pool.choose）。
+	// 排除后没有候选时忽略上限（见 Pool.choose）。
 	// <=0 表示不限制；缺省值 DefaultSessionAffinityMaxPerAccount 由 cmd 层设置。
 	SessionAffinityMaxPerAccount int
+	// AccountCooldown 是账号进入冷却后暂停参与选择的时长；<=0 使用 DefaultAccountCooldown（2 小时）。
+	// NewPool（只接受账号配置）固定使用缺省值。冷却的触发规则见 cooldown.go。
+	AccountCooldown time.Duration
 	// MaxConcurrentRequests 是同时处理的生成请求数上限（命中生成接口的请求）；<=0 表示不限制。
 	// 名额已满时立即返回 503，不读取请求体、不选账号；名额在请求处理结束（含流式响应结束）后释放。
 	// 模型列表、健康检查与管理接口不占用名额。缺省值由 cmd 层设置（32）。
@@ -51,7 +51,7 @@ type PoolAccount struct {
 	Priority int // 优先级，取值 MinPriority 到 MaxPriority；数值越大越优先被选择
 }
 
-// poolAccount 是池内一个账号的运行时状态。id、service 与 routes 创建后不再变化；disabled、priority 与 swrrCurrent 由 Pool.mu 保护。
+// poolAccount 是池内一个账号的运行时状态。id、service、routes、cooldown 与 affinity 创建后不再变化；disabled、priority 与 swrrCurrent 由 Pool.mu 保护。
 type poolAccount struct {
 	id          string        // 账号 ID：GitHub 用户名的小写形式；无用户名时为初始下标
 	service     *Service      // 账号的 Copilot 服务
@@ -60,6 +60,11 @@ type poolAccount struct {
 	priority    int // 优先级，见 PoolAccount.Priority
 	swrrCurrent int // 平滑加权轮询的当前值，见 swrrPickLocked
 
+	cooldown time.Duration    // 冷却时长，见 PoolConfig.AccountCooldown
+	affinity *affinityTable   // 会话绑定表，冷却时删除指向本账号的绑定；未开启亲和时为 nil
+	effects  *cooldownEffects // 进入冷却的异步副作用计数，由池持有（见 Pool.WaitCooldownEffects）
+	errs     cooldownTracker  // 连续错误计数与冷却原因，见 cooldown.go
+
 	requests atomic.Uint64 // 分发到该账号的请求数（含模型列表与生成）
 	failures atomic.Uint64 // 其中响应状态 >= 400 的数量
 	lastUsed atomic.Int64  // 最近一次使用的 UnixNano，0 表示从未使用
@@ -67,11 +72,30 @@ type poolAccount struct {
 	quota quotaCache
 }
 
-// newPoolAccount 为 Service 创建账号运行时状态，并从缓存目录恢复额度（见 restoreQuota）。
+// newPoolAccount 为 Service 创建账号运行时状态，并从缓存目录恢复额度（见 restoreQuota）与未到期的冷却（见 restoreCooldown）。
+// 冷却时长与会话绑定表由池在 Pool.newAccount 中填入。
 func newPoolAccount(service *Service, id string) *poolAccount {
-	account := &poolAccount{id: id, service: service, routes: service.routes()}
+	account := &poolAccount{id: id, service: service, routes: service.routes(), cooldown: DefaultAccountCooldown, effects: new(cooldownEffects)}
 	account.restoreQuota()
+	account.restoreCooldown(time.Now())
 	return account
+}
+
+// newAccount 为池创建账号运行时状态，并填入池级的冷却时长与会话绑定表。
+func (p *Pool) newAccount(service *Service, id string) *poolAccount {
+	account := newPoolAccount(service, id)
+	account.cooldown = p.cooldownDuration()
+	account.affinity = p.affinity
+	account.effects = &p.effects
+	return account
+}
+
+// cooldownDuration 返回账号冷却时长：配置未设置或非正时为 DefaultAccountCooldown。
+func (p *Pool) cooldownDuration() time.Duration {
+	if p.config.AccountCooldown > 0 {
+		return p.config.AccountCooldown
+	}
+	return DefaultAccountCooldown
 }
 
 // Pool 在多个 GitHub 账号之间分发请求：按优先级与额度档位分出最优档，档内做平滑加权轮询选择可用账号，并负责会话亲和（含每账号绑定数上限）、账号的运行时增删、禁用与调整优先级。
@@ -88,6 +112,8 @@ type Pool struct {
 	generations chan struct{}
 
 	requestSeq atomic.Uint64
+
+	effects cooldownEffects // 进入冷却的异步副作用，见 Pool.WaitCooldownEffects
 
 	adminMu  sync.Mutex // 串行化账号的增删、禁用、优先级与凭证文件写入
 	mu       sync.Mutex // 保护 accounts 与各账号的 disabled、priority、swrrCurrent（选择会推进轮询状态，因此 choose 也持有它）
@@ -179,7 +205,7 @@ func (p *Pool) addConfigured(index int, config Config, disabled bool, priority i
 	if p.conflicts(service, id) {
 		return fmt.Errorf("第 %d 个 GitHub 账号与之前的账号重复", index)
 	}
-	account := newPoolAccount(service, id)
+	account := p.newAccount(service, id)
 	account.disabled = disabled
 	account.priority = priority
 	p.accounts = append(p.accounts, account)
@@ -330,9 +356,9 @@ func (p *Pool) forward(w http.ResponseWriter, r *http.Request, key string) {
 		writeNoAccount(w)
 		return
 	}
-	// 所有账号的 session 都失败：错误计入最后尝试的账号，之前失败的账号不计数。
+	// 所有可尝试账号的 session 都失败：每次失败已在 pickSession 中计入，这里只更新最后尝试账号的统计并写出错误，不再计数。
 	last := pick.last
-	last.track(r.Context(), w, func(w http.ResponseWriter) { last.service.handleError(pick.ctx, w, pick.err) })
+	last.record(r.Context(), w, func(w http.ResponseWriter) { last.service.handleError(pick.ctx, w, pick.err) }, false)
 }
 
 // sessionPick 是 pickSession 的结果。
@@ -348,7 +374,7 @@ type sessionPick struct {
 // 先到者完成绑定后，后到者按已有绑定选择同一账号，从而不会因竞争各选各的账号。
 // 门通过 defer 在返回前释放，因此只覆盖选择、取 session 与绑定，不会持有到响应结束。
 // 等待门时 ctx 被取消则返回错误，此时没有选择任何账号。
-// 账号 session 获取失败时冷却该账号，并在同一请求内改用其他尚未尝试的账号，每个账号最多尝试一次。
+// 账号 session 获取失败时按错误规则计入（见 countSessionFailure），并在同一请求内改用其他尚未尝试的账号，每个账号最多尝试一次。
 func (p *Pool) pickSession(r *http.Request, key string) (sessionPick, error) {
 	if p.affinity != nil && key != "" {
 		release, err := p.gate.acquire(r.Context(), key)
@@ -373,14 +399,18 @@ func (p *Pool) pickSession(r *http.Request, key string) (sessionPick, error) {
 			if pick.ctx.Err() != nil {
 				return pick, nil
 			}
-			account.service.setCooldown(time.Now().Add(AccountCooldown))
-			account.service.log(pick.ctx, slog.LevelWarn, "账号会话获取失败", "error", err, "cooldown", AccountCooldown.String())
+			account.service.log(pick.ctx, slog.LevelWarn, "账号会话获取失败", "error", err)
+			account.countSessionFailure(pick.ctx, err)
 			if !isUpstreamRateLimit(err) {
 				account.refreshAfterError()
 			}
 			continue
 		}
-		p.bind(pick.ctx, key, account)
+		// 取得 session 之后账号可能已因另一个请求的错误进入冷却：冷却账号不得被绑定。
+		// 本次请求仍由它处理（它在冷却前已被选中，属于在途请求），之后的请求不会再选中它。
+		if account.service.available(time.Now()) {
+			p.bind(pick.ctx, key, account)
+		}
 		pick.account = account
 		return pick, nil
 	}
@@ -388,19 +418,41 @@ func (p *Pool) pickSession(r *http.Request, key string) (sessionPick, error) {
 
 // serve 把请求交给已选定的账号处理，并记录该账号的统计。
 func (p *Pool) serve(w http.ResponseWriter, r *http.Request, account *poolAccount) {
-	account.track(r.Context(), w, func(w http.ResponseWriter) { account.routes.mux.ServeHTTP(w, r) })
+	account.record(r.Context(), w, func(w http.ResponseWriter) { account.routes.mux.ServeHTTP(w, r) }, true)
 }
 
-// track 记录账号处理了一次请求：请求数加 1，最近使用时间更新；响应状态 >= 400 时失败数加 1。
-// 客户端已取消（reqCtx 为 context.Canceled）时的失败并非账号的问题，不计入失败数；账号也不会因此冷却，且不触发额度刷新。
-// 非 429 的失败会异步刷新该账号额度（见 refreshAfterError）；429 是限流，由冷却处理，不刷新。
-func (a *poolAccount) track(reqCtx context.Context, w http.ResponseWriter, handle func(http.ResponseWriter)) {
+// record 记录账号处理了一次请求：请求数加 1，最近使用时间更新，然后按结果更新统计与连续错误计数：
+//   - 客户端已取消（reqCtx 为 context.Canceled）：不计数、不清零、不刷新额度，账号也不会因此冷却；
+//   - 上游的非错误状态（3xx，或标记为 failureIgnored）：既不计数也不清零；
+//   - 网络错误（写出的 502 或上游成功响应的正文中断，标记为 failureNetwork）：失败数 +1，原因为 network 计入连续错误，异步刷新额度；
+//   - 成功（< 300）：清零连续错误计数；
+//   - 其他 >= 400：失败数 +1，按状态码计入连续错误（见 ruleOf）；非 429 时异步刷新额度，429 是限流，不刷新。
+//
+// countErrors 为 false 时只更新统计：会话获取失败已在 pickSession 中计入，同一请求不得再计一次。
+func (a *poolAccount) record(reqCtx context.Context, w http.ResponseWriter, handle func(http.ResponseWriter), countErrors bool) {
 	a.requests.Add(1)
 	a.lastUsed.Store(time.Now().UnixNano())
 	writer := &statusResponseWriter{ResponseWriter: w, status: http.StatusOK}
 	handle(writer)
-	if writer.status >= http.StatusBadRequest && !errors.Is(reqCtx.Err(), context.Canceled) {
+	if errors.Is(reqCtx.Err(), context.Canceled) {
+		return
+	}
+	switch {
+	case writer.failure == failureIgnored, writer.status >= http.StatusMultipleChoices && writer.status < http.StatusBadRequest:
+		// 上游的重定向等非错误状态：既不计数也不清零。
+	case writer.failure == failureNetwork:
 		a.failures.Add(1)
+		if countErrors {
+			a.countFailure(reqCtx, ruleCounted, cooldownReasonNetwork)
+		}
+		a.refreshAfterError()
+	case writer.status < http.StatusMultipleChoices:
+		a.resetStreak()
+	default:
+		a.failures.Add(1)
+		if countErrors {
+			a.countFailure(reqCtx, ruleOf(writer.status), strconv.Itoa(writer.status))
+		}
 		if writer.status != http.StatusTooManyRequests {
 			a.refreshAfterError()
 		}
@@ -473,7 +525,7 @@ func (p *Pool) services() []*Service {
 
 // choose 选择处理本次请求的账号。键非空且开启亲和时：会话已绑定且该账号仍可用（未禁用、未冷却、未耗尽、本请求未尝试过）则直接使用它，且不推进轮询；
 // 否则为无可用绑定的会话（新会话或故障切换）选择：先取最优档，排除有效绑定数已达上限的账号后再在档内轮询，见下方说明。
-// 键为空或未开启亲和时按 pickLocked 选择。没有候选时返回 nil。
+// 键为空或未开启亲和时按 pickLocked 选择。没有候选（包括全部冷却）时返回 nil。
 func (p *Pool) choose(key string, tried map[*poolAccount]bool) *poolAccount {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -487,21 +539,20 @@ func (p *Pool) choose(key string, tried map[*poolAccount]bool) *poolAccount {
 			return account
 		}
 	}
-	// 排除已满账号后，若没有候选，或最优档的冷却状态与原最优档不同（即从未冷却降为冷却中），则忽略上限，仍按原最优档轮询，
-	// 避免把会话推向冷却中的账号。上限为 0 时 overCapLocked 返回 nil，不做排除。
+	// 排除已满账号后仍有候选时采用排除后的结果；没有候选（例如其余账号都已禁用、冷却或耗尽）时忽略上限，仍按原候选轮询，
+	// 因此上限不会让会话落到没有候选的情况，也不会把会话推向冷却中的账号（冷却账号不在候选内）。上限为 0 时 overCapLocked 返回 nil，不做排除。
 	group := p.topGroupLocked(now, tried)
-	if skip := p.overCapLocked(now, tried); skip != nil && len(group) > 0 {
-		if capped := p.topGroupLocked(now, skip); len(capped) > 0 && capped[0].key.cooling == group[0].key.cooling {
+	if skip := p.overCapLocked(now, tried); skip != nil {
+		if capped := p.topGroupLocked(now, skip); len(capped) > 0 {
 			group = capped
 		}
 	}
 	return swrrPickLocked(group)
 }
 
-// selectKey 是账号参与选择时的排序信息：cooling、priority 与 weight.hasCredits 决定档位（见 tierBefore）；
-// weight.fraction 决定档内 SWRR 的权重；file 是 SWRR 当前值并列时的先后。
+// selectKey 是账号参与选择时的排序信息：priority 与 weight.hasCredits 决定档位（见 tierBefore）；
+// weight.fraction 决定档内 SWRR 的权重；file 是 SWRR 当前值并列时的先后。冷却中的账号不参与选择，因此不需要冷却状态。
 type selectKey struct {
-	cooling  bool        // 已冷却的账号排在未冷却的账号之后
 	priority int         // 优先级，数值大者在前
 	weight   quotaWeight // 额度权重，见 weigh
 	file     string      // 凭证文件名（用户名 + ".json"，无用户名时用 ID），字节序升序
@@ -515,19 +566,15 @@ func keyOf(a *poolAccount, now time.Time) selectKey {
 	}
 	quota, _ := a.quota.snapshot()
 	return selectKey{
-		cooling:  !a.service.available(now),
 		priority: a.priority,
 		weight:   weigh(quota),
 		file:     name + ".json",
 	}
 }
 
-// tierBefore 报告 k 的档位是否严格优于 o：未冷却优先，其次优先级高者在前，再次有 Credits 者在前。
+// tierBefore 报告 k 的档位是否严格优于 o：优先级高者在前，再次有 Credits 者在前。
 // 档位相同时返回 false，档内的先后由 SWRR 决定。
 func (k selectKey) tierBefore(o selectKey) bool {
-	if k.cooling != o.cooling {
-		return !k.cooling
-	}
 	if k.priority != o.priority {
 		return k.priority > o.priority
 	}
@@ -540,12 +587,12 @@ type candidate struct {
 	key     selectKey
 }
 
-// topGroupLocked 返回最优档的全部候选，调用方须持有 p.mu。候选为未禁用、未被 skip 排除且未耗尽（见 poolAccount.exhausted）的账号；
+// topGroupLocked 返回最优档的全部候选，调用方须持有 p.mu。候选为未禁用、未冷却、未被 skip 排除且未耗尽（见 poolAccount.exhausted）的账号；
 // 按 tierBefore 找出最优档，返回与之同档的全部候选，顺序为账号在池中的顺序。没有候选时返回 nil。只读取状态，不推进轮询。
 func (p *Pool) topGroupLocked(now time.Time, skip map[*poolAccount]bool) []candidate {
 	var group []candidate
 	for _, a := range p.accounts {
-		if a.disabled || skip[a] || a.exhausted(now) {
+		if a.disabled || skip[a] || !a.service.available(now) || a.exhausted(now) {
 			continue
 		}
 		c := candidate{account: a, key: keyOf(a, now)}
@@ -584,7 +631,7 @@ func swrrPickLocked(group []candidate) *poolAccount {
 }
 
 // pickLocked 选出本次应使用的账号，调用方须持有 p.mu：先由 topGroupLocked 取最优档，再由 swrrPickLocked 在档内轮询。
-// 冷却中的账号排在未冷却账号之后，只有没有未冷却候选时才会被选中。没有候选（包括全部耗尽）时返回 nil。
+// 冷却中与已禁用、已耗尽的账号不参与选择。没有候选时返回 nil。
 func (p *Pool) pickLocked(now time.Time, tried map[*poolAccount]bool) *poolAccount {
 	return swrrPickLocked(p.topGroupLocked(now, tried))
 }
@@ -648,15 +695,4 @@ func (p *Pool) removeAccount(target *poolAccount) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.accounts = slices.DeleteFunc(p.accounts, func(a *poolAccount) bool { return a == target })
-}
-
-// setCooldown 让账号在 until 之前不参与选择。
-func (s *Service) setCooldown(until time.Time) {
-	s.cooldownUntil.Store(until.UnixNano())
-}
-
-// available 报告账号在 now 时是否可参与选择；冷却截止时刻本身即视为可用，从未冷却的账号始终可用。
-func (s *Service) available(now time.Time) bool {
-	until := s.cooldownUntil.Load()
-	return until == 0 || now.UnixNano() >= until
 }

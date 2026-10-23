@@ -1,7 +1,7 @@
 package copilot
 
 // 本文件覆盖账号优先级对选择顺序的影响。Pool.choose 按档位选出最优的一组账号：
-// 冷却档（未冷却优先）、优先级（高者在前）、是否有 Credits（有者在前）。同一档内的账号按 SWRR 平滑加权轮询，
+// 优先级（高者在前）、是否有 Credits（有者在前）；冷却中的账号完全不参与选择。同一档内的账号按 SWRR 平滑加权轮询，
 // 权重由额度决定（见 quotaWeight.swrrWeight）；权重相同时按凭证文件名（用户名 + ".json"）的字节序升序决定先后。
 // choose 每次调用都会推进轮询状态，因此逐次排除得到的顺序（见 rankedUsers）只对新建的池有意义。
 
@@ -27,6 +27,7 @@ func newPriorityPool(t *testing.T, client *http.Client, accounts ...PoolAccount)
 		t.Fatal(err)
 	}
 	quotaAwaitIdle(t, p)
+	t.Cleanup(p.WaitCooldownEffects) // 清理先于 TempDir 的删除完成
 	return p
 }
 
@@ -39,7 +40,7 @@ func userOf(account *poolAccount) string {
 }
 
 // rankedUsers 通过逐次排除已选中的账号，得到一次完整选择的顺序（不含禁用账号）。
-// 冷却档只在未冷却账号耗尽后才会出现，因此冷却账号排在未冷却账号之后。
+// 冷却中的账号不参与选择，因此不会出现在结果中。
 // 同档内的顺序来自 SWRR 的轮询状态，每次 choose 都会推进它，因此只对新建的池断言结果。
 func rankedUsers(p *Pool) []string {
 	tried := map[*poolAccount]bool{}
@@ -253,27 +254,30 @@ func TestChooseNeverPicksDisabledAccount(t *testing.T) {
 	}
 }
 
-// TestChooseCoolingAccountsAreLastResort 冷却中的账号只在未冷却账号耗尽后才会被选中，即使它的优先级更高。
-func TestChooseCoolingAccountsAreLastResort(t *testing.T) {
+// TestChooseCoolingAccountsAreExcluded 冷却中的账号完全不参与选择，即使它的优先级更高；其余账号的顺序不变。
+func TestChooseCoolingAccountsAreExcluded(t *testing.T) {
 	p := newPriorityPool(t, nil, priorityAccount("alice", 100), priorityAccount("bob", 0), priorityAccount("carol", -1))
 	coolDown(t, p, "alice")
-	assertRanking(t, p, "bob", "carol", "alice")
+	assertRanking(t, p, "bob", "carol")
 }
 
-// TestChooseAllCoolingUsesSameOrdering 全部冷却时进入冷却档，并按同样的优先级与文件名规则排序。
-func TestChooseAllCoolingUsesSameOrdering(t *testing.T) {
+// TestChooseAllCoolingReturnsNothing 全部账号冷却时没有候选，choose 返回 nil（不再从冷却账号兜底）。
+func TestChooseAllCoolingReturnsNothing(t *testing.T) {
 	p := newPriorityPool(t, nil, priorityAccount("alice", 0), priorityAccount("bob", 5), priorityAccount("carol", 5))
 	for _, user := range []string{"alice", "bob", "carol"} {
 		coolDown(t, p, user)
 	}
-	assertRanking(t, p, "bob", "carol", "alice")
+	if account := p.choose("", nil); account != nil {
+		t.Fatalf("全部冷却时 choose = %s, want nil", userOf(account))
+	}
 }
 
 // TestChooseCooldownExpiryRestoresAccount 冷却截止时间过去后，账号重新参与选择，按优先级回到原来的位置。
 func TestChooseCooldownExpiryRestoresAccount(t *testing.T) {
 	p := newPriorityPool(t, nil, priorityAccount("alice", 100), priorityAccount("bob", 0))
 	coolDown(t, p, "alice")
-	assertRanking(t, p, "bob", "alice")
+	// 冷却中的 alice 完全不参与选择，只剩 bob。
+	assertRanking(t, p, "bob")
 	// 不等待真实时间：把冷却截止时间设为已经过去。
 	p.findAccount("alice").service.setCooldown(time.Now().Add(-time.Second))
 	assertRanking(t, p, "alice", "bob")
@@ -327,19 +331,28 @@ func TestChooseConcurrentCallsSplitEvenly(t *testing.T) {
 }
 
 // TestPoolFailoverPicksNextBestAccountByPriority 最优账号的 session 失败后，同一请求改用下一个最优账号；
-// 之后最优账号处于冷却中，后续请求仍由下一个最优账号处理，且不再尝试最优账号。
+// 连续第 3 次失败后最优账号冷却，之后不再尝试它，请求仍由下一个最优账号处理，且不再尝试更低优先级的账号。
 func TestPoolFailoverPicksNextBestAccountByPriority(t *testing.T) {
 	upstream := newPoolUpstream(t)
 	upstream.failSession("oauth-alice", poolFailure{http.StatusInternalServerError, `{"message":"alice down"}`})
 	p := newPriorityPool(t, upstream.client(), priorityAccount("alice", 10), priorityAccount("bob", 5), priorityAccount("carol", 0))
-	for i := range 2 {
+	for i := range 3 {
 		if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK {
 			t.Fatalf("请求 %d status=%d body=%s", i, w.Code, w.Body.String())
 		}
 	}
-	assertGenerationOrder(t, upstream, "oauth-bob", "oauth-bob")
-	if got := upstream.sessionCount("oauth-alice"); got != 1 {
-		t.Errorf("alice 的 session 交换 %d 次, want 1（冷却后不再尝试）", got)
+	if p.findAccount("alice").service.available(time.Now()) {
+		t.Fatal("第 3 次 session 失败后 alice 应冷却")
+	}
+	if got := upstream.sessionCount("oauth-alice"); got != 3 {
+		t.Errorf("alice 的 session 交换 %d 次, want 3", got)
+	}
+	if w := poolRequest(p, "POST", "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK {
+		t.Fatalf("冷却后请求 status=%d body=%s", w.Code, w.Body.String())
+	}
+	assertGenerationOrder(t, upstream, "oauth-bob", "oauth-bob", "oauth-bob", "oauth-bob")
+	if got := upstream.sessionCount("oauth-alice"); got != 3 {
+		t.Errorf("冷却后 alice 的 session 交换 %d 次, want 仍为 3", got)
 	}
 	if got := upstream.sessionCount("oauth-carol"); got != 0 {
 		t.Errorf("carol 的 session 交换 %d 次, want 0（bob 优先级更高，不应被尝试）", got)

@@ -18,7 +18,7 @@
 | `GET /v0/management/version` | — | `{"version":"v0.0.1"}`，程序版本号（`copilot.Version`），控制台侧边栏显示 |
 | `GET /v0/management/accounts` | — | `[]AccountView`，顺带刷新过期额度（见 `quota-stats.md`） |
 | `POST /v0/management/accounts` | `{"credential":{"oauth_token":"...","host":"","user":""}}` | `200 AccountView` |
-| `PATCH /v0/management/accounts` | `{"id":"alice","disabled":true,"priority":50}` | `200 AccountView` |
+| `PATCH /v0/management/accounts` | `{"id":"alice","disabled":true,"priority":50}`；或 `{"id":"alice","clear_cooldown":true}` | `200 AccountView` |
 | `DELETE /v0/management/accounts?id=alice` | — | `200 {"ok":true}` |
 | `POST /v0/management/quota/refresh` | `{"id":"alice"}` | `200 AccountView`（强制刷新） |
 | `POST /v0/management/login` | — | `200 {"state","url","user_code","interval","expires_in"}` |
@@ -30,19 +30,24 @@ type AccountView struct {
     Disabled       bool
     Priority       int           // -1..100，始终输出
     CooldownUntil  *time.Time    // 仅冷却中输出
+    CooldownReason string        // 仅冷却中输出：触发冷却的状态码（如 "403"），网络错误为 "network"
     Stats          struct{ Requests, Errors uint64; LastUsedAt *time.Time }
     Quota          *Quota
     QuotaError     string
 }
 ```
 
-JSON 字段名为 `id`、`user`、`host`、`disabled`、`priority`、`cooldown_until`、`stats{requests,errors,last_used_at}`、`quota`、`quota_error`。不含 OAuth token。
+JSON 字段名为 `id`、`user`、`host`、`disabled`、`priority`、`cooldown_until`、`cooldown_reason`、`stats{requests,errors,last_used_at}`、`quota`、`quota_error`。`cooldown_until` 与 `cooldown_reason` 仅在冷却中输出。不含 OAuth token。
 
 ## 行为约定
 
 - 列表按账号池顺序（启动为凭证文件名顺序，新增追加末尾）。
-- 新增、删除、禁用、改优先级立即生效，无需重启；删除不影响进行中的请求。
-- 400：请求体非法 JSON；PATCH 缺 `id`、`disabled` 与 `priority` 都缺、`priority` 超出 [-1,100] 或非整数（均不写文件、不改状态）；DELETE/refresh 缺 `id`。404：`id` 不存在。写入失败 500。
+- 新增、删除、禁用、改优先级、解除冷却立即生效，无需重启；删除不影响进行中的请求。
+- PATCH 的 `disabled`、`priority`、`clear_cooldown` 可单独或组合提供，未提供的字段保持不变。顺序：`disabled` 或 `priority` 有变化时先重写凭证文件；写入失败返回 500，冷却、`disabled`、`priority` 全部不变。写入成功后同步内存中的 `disabled` 与 `priority`，再处理 `clear_cooldown`。
+- `clear_cooldown` 为 `true` 时立即解除冷却：先删除账号缓存目录中的 `cooldown.json`，删除成功后清空截止时间与原因、连续错误计数清零，解除后账号立即参与选择。`clear_cooldown` 为 `false` 视为未提供。禁用、启用与改优先级本身不影响冷却状态。
+- 解除失败（删除 `cooldown.json` 出错）时返回 500，错误信息以“凭证已更新，账号仍冷却”开头（若凭证未变化则不含该前缀）。此时 `disabled` 与 `priority` 已生效，冷却不变，修复文件问题后可再次解除。
+- 解除冷却与错误计数规则见 `pool.md`「限流、错误计数与冷却」。解除后，之前进入冷却时尚未完成的异步副作用不会把冷却记录写回磁盘。
+- 400：请求体非法 JSON；PATCH 缺 `id`，或 `disabled`、`priority`、`clear_cooldown`（为 `true`）都未提供，或 `priority` 超出 [-1,100] 或非整数（均不写文件、不改状态）；DELETE/refresh 缺 `id`。404：`id` 不存在。凭证写入失败 500（此时冷却、`disabled`、`priority` 全部不变）。解除冷却失败 500（见上文）。
 - 凭证写入、同名冲突与登录名规则见 `credentials.md`。
 
 ## 导入账号

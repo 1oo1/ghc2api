@@ -139,9 +139,16 @@ func shutdownServer(server *http.Server) error {
 	return err
 }
 
+// cooldownEffectsTimeout 是关闭时等待进入冷却的异步副作用的上限；超时后仍保存会话亲和表。
+const cooldownEffectsTimeout = 5 * time.Second
+
 // saveSessionAffinity 在服务关闭后保存会话亲和绑定；未开启会话亲和时不做任何事。
 // 成功输出 Info，失败只输出 Warn，不改变 serve 的返回值。
 func saveSessionAffinity(pool *copilot.Pool, enabled bool, logger *slog.Logger) {
+	// 进入冷却的异步副作用可能仍在进行（删除绑定、写入 cooldown.json）：先等它们结束，但有上界，超时后照常保存。
+	if !pool.WaitCooldownEffectsTimeout(cooldownEffectsTimeout) {
+		logger.Warn("会话亲和：等待冷却副作用超时，继续保存", "timeout", cooldownEffectsTimeout.String())
+	}
 	if !enabled {
 		return
 	}

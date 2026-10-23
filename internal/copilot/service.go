@@ -37,7 +37,7 @@ type Service struct {
 	cacheRemoved bool
 
 	requestSeq atomic.Uint64
-	// cooldownUntil 是账号冷却截止时间（UnixNano），0 表示从未冷却，见 pool.go。
+	// cooldownUntil 是账号冷却截止时间（UnixNano），0 表示从未冷却，见 cooldown.go。
 	cooldownUntil atomic.Int64
 	secretsMu     sync.RWMutex
 	secrets       map[string]struct{}
@@ -222,25 +222,43 @@ func isUpstreamRateLimit(err error) bool {
 	return errors.As(err, &upstream) && upstream.status == http.StatusTooManyRequests
 }
 
+// handleError 把错误写给客户端，并标记失败性质供账号计数（见 poolAccount.record）：
+//   - 上游返回错误状态（>= 400）：原样返回上游的状态码与正文，按上游状态码计数；
+//   - 上游返回非错误状态（如 3xx）：以 502 写出，但标记为忽略，既不计数也不清零；
+//   - 其他错误（网络错误等）：以 502 写出，标记为网络错误，冷却原因记为 network 而不是 502。
 func (s *Service) handleError(ctx context.Context, w http.ResponseWriter, err error) {
 	var upstream *upstreamError
-	if errors.As(err, &upstream) && upstream.status >= 400 {
+	if errors.As(err, &upstream) {
+		if upstream.status < http.StatusBadRequest {
+			s.log(ctx, slog.LevelWarn, "上游返回非错误状态，已按 502 写给客户端", "status", upstream.status)
+			markFailure(w, failureIgnored)
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
 		level := slog.LevelWarn
 		if upstream.status >= http.StatusInternalServerError {
 			level = slog.LevelError
 		}
-		if upstream.status == http.StatusTooManyRequests {
-			// 限流的账号暂停参与选择；429 原样透传，不在本请求内换账号。
-			s.setCooldown(time.Now().Add(AccountCooldown))
-		}
 		s.log(ctx, level, "Copilot API 返回错误状态", "status", upstream.status)
-		copyResponseHeaders(w.Header(), upstream.header)
-		w.WriteHeader(upstream.status)
-		_, _ = w.Write(upstream.body)
+		writeUpstreamError(w, upstream)
 		return
 	}
 	s.log(ctx, slog.LevelError, "请求处理失败", "error", s.redactString(err.Error()))
+	markFailure(w, failureNetwork)
 	writeError(w, http.StatusBadGateway, err.Error())
+}
+
+// writeUpstreamError 原样返回上游的错误状态与正文。正文为空（包括读取失败）时写 JSON 错误体，格式与 writeError 一致。
+// 不转发 Content-Length：正文可能读取不完整，声明的长度与实际写出的正文不一致会让客户端读取出错。
+func writeUpstreamError(w http.ResponseWriter, upstream *upstreamError) {
+	if len(upstream.body) == 0 {
+		writeError(w, upstream.status, fmt.Sprintf("上游返回 %d，但响应正文为空或读取失败", upstream.status))
+		return
+	}
+	copyResponseHeaders(w.Header(), upstream.header)
+	w.Header().Del("Content-Length")
+	w.WriteHeader(upstream.status)
+	_, _ = w.Write(upstream.body)
 }
 
 func readLimited(body io.Reader, limit int64) ([]byte, error) {
@@ -279,11 +297,12 @@ func (s *Service) fetchJSON(ctx context.Context, session session, method, path s
 	}
 	defer res.Body.Close()
 	data, err := readLimited(res.Body, maxMetadataBody)
+	if res.StatusCode/100 != 2 {
+		// 错误状态按上游状态码处理，即使正文读取失败。
+		return &upstreamError{res.StatusCode, data, res.Header}
+	}
 	if err != nil {
 		return err
-	}
-	if res.StatusCode/100 != 2 {
-		return &upstreamError{res.StatusCode, data, res.Header}
 	}
 	if value == nil {
 		return nil
@@ -320,7 +339,7 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 	}
 	// 写超时只针对响应写入，因此包装放在读取请求体之后（读取阶段不写响应）。请求结束时不清除截止时间，见 generationWriter。
 	// 注意：http.MaxBytesReader 超限时只有底层 w 实现 requestTooLarge 才会标记关闭连接（net/http 的 *response 实现了它）。
-	// 这里的 w 已被 withRequestLog（Pool 另有 track）包装为 statusResponseWriter，不实现该方法，
+	// 这里的 w 已被 withRequestLog（Pool 另有 record）包装为 statusResponseWriter，不实现该方法，
 	// 因此 Service 与 Pool 两条路径下超限都只返回 413，不会由 MaxBytesReader 关闭连接。
 	w = newGenerationWriter(w)
 	isAuto := model == "auto"
@@ -399,7 +418,9 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 			data, readErr := readLimited(res.Body, maxMetadataBody)
 			_ = res.Body.Close()
 			if readErr != nil {
-				s.handleError(r.Context(), w, readErr)
+				// 上游 400 的正文读不出来：无法判断是否为模型拒绝，按上游 400 原样返回；不是网络错误，也不计数（见 cooldown.go）。
+				s.log(r.Context(), slog.LevelWarn, "读取上游 400 响应正文失败", "error", s.redactString(readErr.Error()))
+				writeError(w, http.StatusBadRequest, "上游返回 400，且读取错误详情失败")
 				return
 			}
 			refusal := modelRefusal(data)
@@ -420,13 +441,9 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 			s.log(r.Context(), slog.LevelWarn, "生成请求返回客户端错误", "status", res.StatusCode, "model", model)
 			return
 		}
-		if res.StatusCode == http.StatusTooManyRequests {
-			// 限流的账号暂停参与选择；429 原样流式透传，不在本请求内换账号。
-			s.setCooldown(time.Now().Add(AccountCooldown))
-			s.log(r.Context(), slog.LevelWarn, "Copilot 生成请求被限流，账号进入冷却", "cooldown", AccountCooldown.String())
-		}
 		s.log(r.Context(), apiStatusLogLevel(res.StatusCode), "生成响应开始返回客户端",
 			"status", res.StatusCode, "model", model)
+		// 429 与其他错误的计数、冷却由 Pool 按写给客户端的状态码处理（见 cooldown.go）；这里原样流式透传。
 		streamResponse(w, res, path == "/responses")
 		return
 	}

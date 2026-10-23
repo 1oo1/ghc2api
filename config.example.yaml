@@ -10,7 +10,7 @@ data_path: "./data"
 #   文件名去掉 .json 后必须是合法的 GitHub 用户名（字母、数字，片段之间以单个 - 或 _ 分隔，不以分隔符开头或结尾，长度 1 到 100）。
 # - 忽略隐藏文件（以 . 开头）、非 .json 文件、子目录和指向目录的符号链接。
 # - 凭证中的 user 字段可省略；若填写，必须与文件名中的用户名一致（忽略大小写）。
-# - 账号按文件名排序加载；选择账号时先按是否冷却（未冷却优先）、priority（高者优先）与额度档位（有 Credits 者优先）分档，同档内按额度权重轮流使用，见 docs/pool.md。host 与 oauth_token 都相同的两个账号会导致启动失败。
+# - 账号按文件名排序加载；选择账号时冷却中的账号不参与选择，其余账号先按 priority（高者优先）与额度档位（有 Credits 者优先）分档，同档内按额度权重轮流使用，见 docs/pool.md。host 与 oauth_token 都相同的两个账号会导致启动失败。
 # 格式示例：{"oauth_token":"...","host":"acme.ghe.com","user":"alice"}
 # 可选的 disabled 字段：为 true 时账号启动后不参与选择；通常由管理接口写入，无需手动填写。
 # 可选的 priority 字段：-1 到 100 之间的整数，省略时为 0，数值越大越优先被选择；通常由管理接口写入。
@@ -42,6 +42,13 @@ session_affinity_ttl: "2h"
 # 新会话（以及绑定账号失败后的切换）优先选择未达上限的账号，以分散负载；已有可用绑定的会话不受此限制，
 # 所有账号都达到上限时照常分配。仅在 session_affinity 开启时生效。
 session_affinity_max_per_account: 5
+
+# 账号冷却时长，使用 Go duration 格式；必须大于 0，默认 2h。
+# 401、403 一次即冷却；429、5xx、网络错误与 session 获取失败连续第 3 次冷却（4xx 如 400、404 不计数）。
+# 冷却期间账号不参与选择，指向它的会话绑定失效；冷却原因显示在管理控制台。
+# 冷却状态保存在缓存目录（cache/）中，重启后仍然生效，直到截止时间或手动解除。
+# 写成空值（account_cooldown: 即 YAML null）时按未设置处理，取 2h。
+account_cooldown: "2h"
 
 # 同时处理的生成请求数上限（chat completions、responses、messages），必须是大于等于 0 的整数，默认 32；0 表示不限制。
 # 写成空值（max_concurrent_requests: 即 YAML null）时按未设置处理，取 32。

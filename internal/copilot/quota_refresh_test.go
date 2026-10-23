@@ -548,7 +548,7 @@ func TestErrorRefreshOnSessionFailure(t *testing.T) {
 			t.Fatalf("全部 session 失败 status=%d, want 500", w.Code)
 		}
 		quotaWaitAttempt(t, p.findAccount("alice"), time.Time{})
-		// 会话失败时 forward 与 track 都可能触发，但同一账号只应刷新一次。
+		// 会话失败时 forward 与 record 都可能触发，但同一账号只应刷新一次。
 		quotaStaysAt(t, up, "oauth-alice", 1)
 	})
 }

@@ -4,10 +4,26 @@ import type { AccountView } from "./api";
 export type AccountStatus = "disabled" | "cooling" | "enabled";
 
 export const statusLabel: Record<AccountStatus, string> = {
-  disabled: "已禁用",
+  disabled: "禁用中",
   cooling: "冷却中",
-  enabled: "已启用",
+  enabled: "启用中",
 };
+
+/**
+ * 冷却中的状态文字，带触发冷却的原因：状态码直接显示（如 "冷却中 · 403"），
+ * "network" 显示为网络错误；没有原因时只显示 "冷却中"。
+ */
+export function coolingLabel(reason?: string): string {
+  if (!reason) return statusLabel.cooling;
+  const text = reason === "network" ? "网络错误" : reason;
+  return `${statusLabel.cooling} · ${text}`;
+}
+
+/** 账号状态的展示文字：冷却中附带原因。 */
+export function accountStatusText(account: AccountView, now = Date.now()): string {
+  const status = accountStatus(account, now);
+  return status === "cooling" ? coolingLabel(account.cooldown_reason) : statusLabel[status];
+}
 
 /** 冷却截止时间晚于 now 时视为冷却中。 */
 export function isCooling(account: AccountView, now: number): boolean {

@@ -54,11 +54,12 @@ func (s *Service) autoRequest(ctx context.Context, current session, path, versio
 	}
 	defer res.Body.Close()
 	data, err := readLimited(res.Body, maxMetadataBody)
+	if res.StatusCode/100 != 2 {
+		// 错误状态按上游状态码处理，即使正文读取失败。
+		return autoWire{}, &upstreamError{res.StatusCode, data, res.Header}
+	}
 	if err != nil {
 		return autoWire{}, err
-	}
-	if res.StatusCode/100 != 2 {
-		return autoWire{}, &upstreamError{res.StatusCode, data, res.Header}
 	}
 	var wire autoWire
 	if json.Unmarshal(data, &wire) != nil || wire.Token == "" {
@@ -171,6 +172,15 @@ func (s *Service) dropAuto(pick autoSession) {
 	defer s.autoState.Unlock()
 	// Endpoints 是切片，不能用 == 比较整个结构。
 	if s.auto.Token == pick.Token && s.auto.Model == pick.Model && s.auto.ExpiresAt == pick.ExpiresAt {
+		s.auto = autoSession{}
+	}
+}
+
+// forgetAuto 清空内存中的 Auto 会话（只在内存中，没有磁盘文件），用于进入冷却时；仅在账号仍处于本次冷却时清空。
+func (s *Service) forgetAuto(still func() bool) {
+	s.autoState.Lock()
+	defer s.autoState.Unlock()
+	if still() {
 		s.auto = autoSession{}
 	}
 }

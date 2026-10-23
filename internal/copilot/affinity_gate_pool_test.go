@@ -183,7 +183,7 @@ func TestGateDifferentSessionsDoNotBlockEachOther(t *testing.T) {
 	gateExpectServed(t, gateWait(t, stuck), "oauth-alice")
 }
 
-// TestGateWaiterUsesFailoverAccountAfterFirstSessionFails 先到的请求的 alice session 失败，alice 被冷却，
+// TestGateWaiterUsesFailoverAccountAfterFirstSessionFails 先到的请求的 alice session 失败（连续第 1 次，alice 尚未冷却），
 // 请求在同一次处理中改用 bob；等待门的同键请求随后使用 bob，绑定一致：只有“新建绑定 bob”，没有“切换账号”。
 // 本用例验证故障切换与门的协作：故障切换之后门仍会放行等待者（否则等待者超时失败）。
 // 缺少门时同键请求不会排队，awaitGateWaiter 会失败，因此本用例也能发现门的缺失。
@@ -204,8 +204,8 @@ func TestGateWaiterUsesFailoverAccountAfterFirstSessionFails(t *testing.T) {
 
 	gateExpectServed(t, gateWait(t, first), "oauth-bob")
 	gateExpectServed(t, gateWait(t, second), "oauth-bob")
-	if p.findAccount("alice").service.available(time.Now()) {
-		t.Fatal("session 失败的 alice 应处于冷却中")
+	if !p.findAccount("alice").service.available(time.Now()) {
+		t.Fatal("session 只失败一次的 alice 不应冷却（连续 3 次才冷却）")
 	}
 	assertGenerationOrder(t, up.pool, "oauth-bob", "oauth-bob")
 	prefix := key[:12]

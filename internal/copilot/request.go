@@ -3,6 +3,7 @@ package copilot
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -85,18 +86,40 @@ func (w *generationWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
 
+// upstreamBody 包装上游回复的正文。仅当上游状态 < 400（成功响应）时，读取上游出错（非 EOF）才在响应写入器链上标记网络错误，
+// 因此流中途断开会计为网络错误。错误状态（>= 400）的正文读取失败不标记，按上游状态码计数。
+// 写给客户端失败不经过这里，不会被计为网络错误。
+type upstreamBody struct {
+	body    io.Reader
+	w       http.ResponseWriter
+	success bool // 上游状态 < 400
+}
+
+func (b upstreamBody) Read(p []byte) (int, error) {
+	n, err := b.body.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) && b.success {
+		markFailure(b.w, failureNetwork)
+	}
+	return n, err
+}
+
 // streamResponse 把上游回复透传给客户端，SSE 回复每读到一段就 flush。
 // tidyItemIDs 为 true 时（仅 /responses），SSE 流经 itemIDTidy 统一输出项 id；非 SSE 回复始终逐字节透传。
 func streamResponse(w http.ResponseWriter, res *http.Response, tidyItemIDs bool) {
 	defer res.Body.Close()
 	copyResponseHeaders(w.Header(), res.Header)
+	if res.StatusCode >= http.StatusBadRequest {
+		// 错误状态的正文可能读取不完整，不转发 Content-Length（同 writeUpstreamError）。
+		w.Header().Del("Content-Length")
+	}
 	stream := strings.HasPrefix(strings.ToLower(res.Header.Get("Content-Type")), "text/event-stream")
 	if stream {
 		w.Header().Set("X-Accel-Buffering", "no")
 	}
 	w.WriteHeader(res.StatusCode)
+	body := upstreamBody{body: res.Body, w: w, success: res.StatusCode < http.StatusBadRequest}
 	if !stream {
-		_, _ = io.Copy(w, res.Body)
+		_, _ = io.Copy(w, body)
 		return
 	}
 	controller := http.NewResponseController(w)
@@ -117,7 +140,7 @@ func streamResponse(w http.ResponseWriter, res *http.Response, tidyItemIDs bool)
 	}
 	buffer := make([]byte, 32<<10)
 	for {
-		n, err := res.Body.Read(buffer)
+		n, err := body.Read(buffer)
 		if n > 0 {
 			chunk := buffer[:n]
 			if tidy != nil {
