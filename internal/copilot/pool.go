@@ -106,6 +106,7 @@ type Pool struct {
 	client     *http.Client   // 新增账号与设备登录访问 GitHub 的客户端
 	idle       serviceRoutes  // 不访问上游的路由（健康检查、重定向、404/405），不依赖任何账号
 	affinity   *affinityTable // 会话绑定表；关闭时为 nil
+	risk       *riskTable     // 风控记录表（见 riskblock.go），随会话亲和开启；关闭时为 nil
 	gate       keyGate        // 同一会话键的选账号、取 session、绑定串行化（见 pickSession），零值可用
 	management http.Handler   // 管理接口；ManagementKey 为空时为 nil
 	// generations 是生成请求的并发名额（缓冲 channel 作信号量），容量为 MaxConcurrentRequests；不限制时为 nil。
@@ -212,7 +213,8 @@ func (p *Pool) addConfigured(index int, config Config, disabled bool, priority i
 	return nil
 }
 
-// newPool 按服务级配置创建空池，并按配置启用会话亲和、生成请求并发上限与管理接口。开启会话亲和且 CacheDir 非空时，启动即加载绑定文件（见 loadSessionAffinity）。
+// newPool 按服务级配置创建空池，并按配置启用会话亲和、生成请求并发上限与管理接口。
+// 开启会话亲和时同时启用风控记录；CacheDir 非空时启动即加载绑定文件与风控记录文件（见 loadSessionAffinity、loadRiskBlocks）。
 func newPool(config PoolConfig) *Pool {
 	logger := config.Logger
 	if logger == nil {
@@ -228,6 +230,8 @@ func newPool(config PoolConfig) *Pool {
 	if config.SessionAffinityTTL > 0 {
 		p.affinity = newAffinityTable(config.SessionAffinityTTL)
 		p.loadSessionAffinity()
+		p.risk = newRiskTable()
+		p.loadRiskBlocks()
 	}
 	if config.ManagementKey != "" {
 		p.logins = make(map[string]*deviceLogin)
@@ -342,14 +346,19 @@ func (p *Pool) affinityKey(r *http.Request, upstream string) string {
 // 取 session 期间客户端已取消时不冷却账号；等待会话门时客户端已取消则不写响应。
 // 请求体校验（生成接口）在预取 session 之后才执行，因此全部账号的 session 都失败时，
 // 无效请求体会收到 session 错误而不是 400，这是有意的取舍。
+//
+// 会话键命中风控记录（见 riskblock.go）时，在会话门与选账号之前直接返回记录的状态码，不访问上游。
 func (p *Pool) forward(w http.ResponseWriter, r *http.Request, key string) {
+	if p.riskBlocked(r.Context(), w, key) {
+		return
+	}
 	pick, err := p.pickSession(r, key)
 	if err != nil {
 		// 等待同会话门时客户端已取消：不选账号、不冷却、不计数，也不写响应。
 		return
 	}
 	if pick.account != nil {
-		p.serve(w, r.WithContext(pick.ctx), pick.account)
+		p.serve(w, r.WithContext(pick.ctx), pick.account, key)
 		return
 	}
 	if pick.last == nil {
@@ -400,7 +409,8 @@ func (p *Pool) pickSession(r *http.Request, key string) (sessionPick, error) {
 				return pick, nil
 			}
 			account.service.log(pick.ctx, slog.LevelWarn, "账号会话获取失败", "error", err)
-			account.countSessionFailure(pick.ctx, err)
+			status, cooled := account.countSessionFailure(pick.ctx, err)
+			p.recordRisk(pick.ctx, key, status, cooled)
 			if !isUpstreamRateLimit(err) {
 				account.refreshAfterError()
 			}
@@ -416,9 +426,10 @@ func (p *Pool) pickSession(r *http.Request, key string) (sessionPick, error) {
 	}
 }
 
-// serve 把请求交给已选定的账号处理，并记录该账号的统计。
-func (p *Pool) serve(w http.ResponseWriter, r *http.Request, account *poolAccount) {
-	account.record(r.Context(), w, func(w http.ResponseWriter) { account.routes.mux.ServeHTTP(w, r) }, true)
+// serve 把请求交给已选定的账号处理，并记录该账号的统计；响应的 401/403 使账号进入冷却时记录会话键 key 的风控。
+func (p *Pool) serve(w http.ResponseWriter, r *http.Request, account *poolAccount, key string) {
+	status, cooled := account.record(r.Context(), w, func(w http.ResponseWriter) { account.routes.mux.ServeHTTP(w, r) }, true)
+	p.recordRisk(r.Context(), key, status, cooled)
 }
 
 // record 记录账号处理了一次请求：请求数加 1，最近使用时间更新，然后按结果更新统计与连续错误计数：
@@ -429,13 +440,14 @@ func (p *Pool) serve(w http.ResponseWriter, r *http.Request, account *poolAccoun
 //   - 其他 >= 400：失败数 +1，按状态码计入连续错误（见 ruleOf）；非 429 时异步刷新额度，429 是限流，不刷新。
 //
 // countErrors 为 false 时只更新统计：会话获取失败已在 pickSession 中计入，同一请求不得再计一次。
-func (a *poolAccount) record(reqCtx context.Context, w http.ResponseWriter, handle func(http.ResponseWriter), countErrors bool) {
+// 返回写给客户端的状态码与本次是否使账号进入冷却。
+func (a *poolAccount) record(reqCtx context.Context, w http.ResponseWriter, handle func(http.ResponseWriter), countErrors bool) (status int, cooled bool) {
 	a.requests.Add(1)
 	a.lastUsed.Store(time.Now().UnixNano())
 	writer := &statusResponseWriter{ResponseWriter: w, status: http.StatusOK}
 	handle(writer)
 	if errors.Is(reqCtx.Err(), context.Canceled) {
-		return
+		return writer.status, false
 	}
 	switch {
 	case writer.failure == failureIgnored, writer.status >= http.StatusMultipleChoices && writer.status < http.StatusBadRequest:
@@ -443,7 +455,7 @@ func (a *poolAccount) record(reqCtx context.Context, w http.ResponseWriter, hand
 	case writer.failure == failureNetwork:
 		a.failures.Add(1)
 		if countErrors {
-			a.countFailure(reqCtx, ruleCounted, cooldownReasonNetwork)
+			cooled = a.countFailure(reqCtx, ruleCounted, cooldownReasonNetwork)
 		}
 		a.refreshAfterError()
 	case writer.status < http.StatusMultipleChoices:
@@ -451,12 +463,13 @@ func (a *poolAccount) record(reqCtx context.Context, w http.ResponseWriter, hand
 	default:
 		a.failures.Add(1)
 		if countErrors {
-			a.countFailure(reqCtx, ruleOf(writer.status), strconv.Itoa(writer.status))
+			cooled = a.countFailure(reqCtx, ruleOf(writer.status), strconv.Itoa(writer.status))
 		}
 		if writer.status != http.StatusTooManyRequests {
 			a.refreshAfterError()
 		}
 	}
+	return writer.status, cooled
 }
 
 // bind 把会话键绑定（或续期）到实际处理请求的账号。键为空或未开启亲和时不做任何事。

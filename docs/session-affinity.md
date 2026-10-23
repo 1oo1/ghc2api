@@ -63,6 +63,10 @@
 - `(*Pool).SaveSessionAffinity() error`：未开启亲和或 `CacheDir` 为空时无操作。开启亲和且有 `CacheDir` 时池启动即加载，失败只输出含「会话亲和」的 Warn，以空表启动。
 - cmd 层 `serve` 在 HTTP 服务 Shutdown 之后（defer）保存：先调用 `Pool.WaitCooldownEffectsTimeout(5 * time.Second)` 等待进入冷却的异步副作用结束（最多 5 秒，超时记 Warn「会话亲和：等待冷却副作用超时，继续保存」后照常保存），再保存；成功 Info「会话亲和：已保存」，失败 Warn，不改变 serve 返回值。进程被强杀会丢失最近绑定，属可接受的缓存语义。
 
+## 风控记录
+
+开启会话亲和时同时启用风控记录：401/403 使账号进入冷却时记录触发请求的会话键，之后同键请求直接返回记录的状态码，有效期 2 天，持久化到 `<CacheDir>/risk_blocks.json`。规则见 `pool.md`「风控记录」。
+
 ## 日志
 
 `Pool.bind` 仅在键非空且开启亲和时输出，属性 `session` 为键前 12 字符，不出现完整键、客户端密钥或正文：

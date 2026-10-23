@@ -69,22 +69,22 @@ type cooldownTracker struct {
 
 // countFailure 计入一次错误。rule 为 ruleIgnore 时不做任何事；reason 为触发冷却时记录的原因。
 // 账号已在冷却中时不计数、不延长冷却、不重复触发（冷却截止时间与原因保持不变）。
-// 触发时同步设置截止时间并清零计数，之后的副作用见 enterCooldown。
-func (a *poolAccount) countFailure(ctx context.Context, rule failureRule, reason string) {
+// 触发时同步设置截止时间并清零计数，之后的副作用见 enterCooldown。返回本次是否使账号进入冷却（风控记录据此判断，见 Pool.recordRisk）。
+func (a *poolAccount) countFailure(ctx context.Context, rule failureRule, reason string) bool {
 	if rule == ruleIgnore {
-		return
+		return false
 	}
 	now := time.Now()
 	a.errs.mu.Lock()
 	if !a.service.available(now) {
 		a.errs.mu.Unlock()
-		return
+		return false
 	}
 	if rule == ruleCounted {
 		a.errs.streak++
 		if a.errs.streak < cooldownStreakLimit {
 			a.errs.mu.Unlock()
-			return
+			return false
 		}
 	}
 	until := now.Add(a.cooldown)
@@ -93,16 +93,17 @@ func (a *poolAccount) countFailure(ctx context.Context, rule failureRule, reason
 	a.service.setCooldown(until)
 	a.errs.mu.Unlock()
 	a.enterCooldown(ctx, until, reason)
+	return true
 }
 
 // countSessionFailure 计入一次 session 获取失败：上游错误按其状态码计入；其他错误（网络等）按网络错误计入。
-func (a *poolAccount) countSessionFailure(ctx context.Context, err error) {
+// 返回上游状态码（非上游错误为 0）与本次是否使账号进入冷却。
+func (a *poolAccount) countSessionFailure(ctx context.Context, err error) (int, bool) {
 	var upstream *upstreamError
 	if errors.As(err, &upstream) {
-		a.countFailure(ctx, ruleOf(upstream.status), strconv.Itoa(upstream.status))
-		return
+		return upstream.status, a.countFailure(ctx, ruleOf(upstream.status), strconv.Itoa(upstream.status))
 	}
-	a.countFailure(ctx, ruleCounted, cooldownReasonNetwork)
+	return 0, a.countFailure(ctx, ruleCounted, cooldownReasonNetwork)
 }
 
 // resetStreak 在成功响应（状态 < 300）后清零连续错误计数。

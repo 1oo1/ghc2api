@@ -32,7 +32,9 @@ flowchart TD
     B2 -- "非生成接口，或占用成功" --> C["affinityKey：计算会话键<br/>仅生成请求且开启亲和；请求体 ≤16 MiB<br/>否则 key 为空"]
     C --> C1{"key 非空且开启亲和？"}
     C1 -- 否 --> D["tried = 空集"]
-    C1 -- 是 --> C2["取得会话门 keyGate(key)<br/>同键请求在此排队；等待受 ctx 约束"]
+    C1 -- 是 --> CR{"命中风控记录？<br/>（riskblock.go）"}
+    CR -- 是 --> CR1["直接返回记录的 401/403<br/>别再重试了，已经触发风控了<br/>不选账号、不访问上游"]
+    CR -- 否 --> C2["取得会话门 keyGate(key)<br/>同键请求在此排队；等待受 ctx 约束"]
     C2 -- "等待中客户端取消" --> C3["直接返回<br/>不选账号、不推进轮询、不计数、不写响应"]
     C2 -- 获得门 --> D
     D --> E["choose(key, tried)"]
@@ -176,6 +178,13 @@ flowchart TD
   禁用、启用与调整优先级本身不影响冷却状态。
 - 客户端取消不冷却也不计错误。
 
+## 风控记录（`riskblock.go`）
+
+- 记录：开启会话亲和时，生成请求（会话键非空）的 401/403 使账号**本次进入冷却**时，记录该会话键与状态码，有效期固定 2 天（`riskBlockTTL`，命中不续期）。两条路径都会记录：账号处理请求时写给客户端的 401/403（`serve` → `record`），以及 `pickSession` 中 session 交换返回 401/403（之后本请求照常切换到其他账号）。账号已在冷却中（未触发新冷却）、429/5xx/网络错误累计触发的冷却、键为空或关闭亲和时都不记录。
+- 拦截：`forward` 在会话门与选账号之前检查记录；命中时直接写出记录的状态码与 `{"error":{"message":"别再重试了，已经触发风控了","type":"copilot_proxy_error"}}`，不选账号、不访问上游、不计入任何账号的统计，并输出 Warn「风控：会话已被拦截」（只含键前 12 字符）。不同会话键互不影响；无会话键的请求（模型列表等）不受影响。
+- 持久化：`<CacheDir>/risk_blocks.json`，`{"version":1,"blocks":[{"key","status","expires"}]}`，权限 `0600`。新增记录时在请求返回前同步写入（只写未过期项，并清理内存中的过期项）；写入失败只记 Warn。池创建时加载：丢弃已过期、key 为空、状态码不是 401/403 的项，截止时刻封顶 `now+2天`；文件损坏或版本不符时 Warn「风控：记录文件无法加载，已以空表启动」。`CacheDir` 为空时只在内存中。
+- 手动解除账号冷却（`clear_cooldown`）不清除风控记录；记录只能等待过期，或停止服务后删除 `risk_blocks.json`。
+
 ## 测试依赖的内部名字
 
-`(*Pool).gate`、`keyGate`（字段 `mu`、`m`）、`gateEntry.waiters`、`Pool.accounts`、`pickLocked(now, tried map[*poolAccount]bool)`、`(*Pool).choose(key string, tried map[*poolAccount]bool)`、`(quotaWeight).swrrWeight() int`、`DefaultSessionAffinityMaxPerAccount`、`PoolConfig.SessionAffinityMaxPerAccount`、`(*affinityTable).activeCounts(time.Time) map[string]int`、`MinPriority`/`MaxPriority`、`quotaWeight`/`weigh(*Quota)`、`exhaustedUntil(*Quota)`、`(*poolAccount).exhausted(time.Time) bool`、`DefaultAccountCooldown`、`PoolConfig.AccountCooldown`、`(*Service).setCooldown(time.Time)`/`available(time.Time) bool`（`cooldown.go`）、`(*poolAccount).record`、`(*Pool).findAccount(id)`（忽略大小写）、`(*Service).cacheDir`、`(*Pool).Handler()`、`generationWriteTimeout`；额度刷新相关的 `DefaultQuotaRefreshInterval`、`(*Service).quotaRefreshInterval`、`quotaRefreshTick`、`quotaErrorRefreshInterval`、`quotaRefreshTimeout`、`(*Pool).RunQuotaRefresh(ctx)`、`(*poolAccount).refreshAfterError()`、`quotaCache.refreshing`；测试辅助 `testClient`、`testJSON`、`testService`、`testDevice`（login_test.go）、`poolUpstream`（pool_test.go）、`quotaTimeoutMessage`（management_review_test.go）。其余名字见 `session-affinity.md`、`quota-stats.md`、`management.md`。
+`riskTable`（`newRiskTable`、`add`、`lookup`、`save`、`load`）、`riskBlockTTL`、`riskBlockMessage`、`riskBlockFileName`、`Pool.risk`、`(*Pool).gate`、`keyGate`（字段 `mu`、`m`）、`gateEntry.waiters`、`Pool.accounts`、`pickLocked(now, tried map[*poolAccount]bool)`、`(*Pool).choose(key string, tried map[*poolAccount]bool)`、`(quotaWeight).swrrWeight() int`、`DefaultSessionAffinityMaxPerAccount`、`PoolConfig.SessionAffinityMaxPerAccount`、`(*affinityTable).activeCounts(time.Time) map[string]int`、`MinPriority`/`MaxPriority`、`quotaWeight`/`weigh(*Quota)`、`exhaustedUntil(*Quota)`、`(*poolAccount).exhausted(time.Time) bool`、`DefaultAccountCooldown`、`PoolConfig.AccountCooldown`、`(*Service).setCooldown(time.Time)`/`available(time.Time) bool`（`cooldown.go`）、`(*poolAccount).record`、`(*Pool).findAccount(id)`（忽略大小写）、`(*Service).cacheDir`、`(*Pool).Handler()`、`generationWriteTimeout`；额度刷新相关的 `DefaultQuotaRefreshInterval`、`(*Service).quotaRefreshInterval`、`quotaRefreshTick`、`quotaErrorRefreshInterval`、`quotaRefreshTimeout`、`(*Pool).RunQuotaRefresh(ctx)`、`(*poolAccount).refreshAfterError()`、`quotaCache.refreshing`；测试辅助 `testClient`、`testJSON`、`testService`、`testDevice`（login_test.go）、`poolUpstream`（pool_test.go）、`quotaTimeoutMessage`（management_review_test.go）。其余名字见 `session-affinity.md`、`quota-stats.md`、`management.md`。
