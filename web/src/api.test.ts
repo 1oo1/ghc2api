@@ -1,7 +1,10 @@
-// 管理接口客户端的解除冷却请求。新增的方法：
+// 管理接口客户端的补充测试。覆盖的方法：
 //   - ManagementClient.clearCooldown(id: string)：发送 PATCH /v0/management/accounts，请求体为 {"id": id, "clear_cooldown": true}，
 //     返回服务端的账号视图。
+//   - ManagementClient.createSession()：发送 POST /v0/management/session，携带管理凭证或控制台令牌，
+//     返回 { token, expires_at }（ConsoleSession）。
 import { afterEach, expect, test, vi } from "vitest";
+import type { ConsoleSession } from "./api";
 import { ApiError, createManagementClient } from "./api";
 
 afterEach(() => {
@@ -46,4 +49,53 @@ test("clearCooldown 的错误保留服务端消息与状态码", async () => {
   expect(error).toBeInstanceOf(ApiError);
   expect((error as ApiError).status).toBe(404);
   expect((error as ApiError).message).toBe("账号不存在");
+});
+
+test("createSession 发送 POST /v0/management/session，携带凭证且无请求体", async () => {
+  const session: ConsoleSession = { token: "token-123", expires_at: "2026-11-06T12:00:00Z" };
+  const fetchMock = stubFetch(200, session);
+
+  await createManagementClient("mgmt-key").createSession();
+
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+  expect(url).toBe("/v0/management/session");
+  expect(init.method).toBe("POST");
+  expect((init.headers as Record<string, string>).Authorization).toBe("Bearer mgmt-key");
+  expect(init.body).toBeUndefined();
+});
+
+test("createSession 也接受控制台令牌作为凭证", async () => {
+  const session: ConsoleSession = { token: "token-123", expires_at: "2026-11-06T12:00:00Z" };
+  const fetchMock = stubFetch(200, session);
+
+  await createManagementClient("token-123").createSession();
+
+  const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+  expect((init.headers as Record<string, string>).Authorization).toBe(
+    "Bearer token-123",
+  );
+});
+
+test("createSession 返回服务端的令牌与过期时间", async () => {
+  stubFetch(200, {
+    token: "token-123",
+    expires_at: "2026-11-06T12:00:00Z",
+  });
+  await expect(
+    createManagementClient("mgmt-key").createSession(),
+  ).resolves.toEqual({
+    token: "token-123",
+    expires_at: "2026-11-06T12:00:00Z",
+  });
+});
+
+test("createSession 的错误保留服务端消息与状态码", async () => {
+  stubFetch(401, { error: { message: "管理密钥无效或缺失" } });
+  const error = await createManagementClient("bad")
+    .createSession()
+    .catch((e: unknown) => e);
+  expect(error).toBeInstanceOf(ApiError);
+  expect((error as ApiError).status).toBe(401);
+  expect((error as ApiError).message).toBe("管理密钥无效或缺失");
 });

@@ -10,8 +10,12 @@
 - 冷却与禁用相互独立：账号既禁用又冷却中时，徽标仍为「禁用中」，但卡片同样显示冷却原因（一行提示）与冷却截止时间，并显示「解除冷却」按钮。是否显示冷却信息与「解除冷却」按钮由 `isCooling(account, now)` 判断，即冷却截止时间晚于当前时间，与是否禁用无关。
 - 冷却中（无论是否禁用）的账号卡片显示「解除冷却」按钮，调用 `PATCH /v0/management/accounts` 的 `clear_cooldown`（`ManagementClient.clearCooldown(id)`，`web/src/api.ts`），成功后提示并刷新列表。
 - 版本：侧边栏品牌区显示服务端版本号（`GET /v0/management/version`）；加载失败时不显示。
-- 登录态：管理密钥存于当前标签页 `sessionStorage`（`web/src/session.ts`，键 `ghc2api.managementKey`），刷新保持登录；关闭标签页、退出或密钥失效时清除；存储不可用时静默忽略，退化为只存 React state。
-- 安全：同源脚本可读取该密钥，风险已接受；控制台不得引入第三方脚本。
+- 登录态：登录时用管理密钥调用 `POST /v0/management/session` 换取控制台令牌（见 `management.md`「控制台令牌」），之后所有请求只用令牌，管理密钥不保存。令牌与过期时间以 `{"token","expiresAt"}` 存于 `localStorage`（`web/src/session.ts`，键 `ghc2api.consoleSession`），跨标签页、重启浏览器后仍保持登录。
+  - 打开页面时若本地令牌未过期，立即用它调用 `POST session` 续期（有效期重新计为 14 天）并替换保存的令牌；续期返回 401 则回到登录页，网络错误则继续用现有令牌。
+  - 本地记录已过期、内容损坏时直接删除并显示登录页；退出登录或任一请求返回 401 时清除。
+  - 读取时顺带删除旧版存于 `sessionStorage` 的明文密钥（键 `ghc2api.managementKey`）。
+  - 存储不可用时静默忽略，退化为只存 React state。
+- 安全：同源脚本可读取该令牌，风险已接受；控制台不得引入第三方脚本，也不应与其他应用共用同一源（协议+域名+端口）。退出登录只清除本地记录，不能吊销已泄露的令牌；需立即吊销时更换 `management_key`。
 - 不包含 API Keys、运行日志、设置、模型列表、刷新凭据等功能。
 
 ## 构建

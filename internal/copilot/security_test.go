@@ -161,7 +161,8 @@ func TestServiceRequestLogsFollowAuthorization(t *testing.T) {
 }
 
 // TestPoolRequestLogsFollowAuthorization 托管池：业务请求与管理接口鉴权失败时都不输出请求日志；
-// 控制台页面是免鉴权路径，仍保留请求日志。
+// 控制台页面是免鉴权路径，仍保留请求日志。管理接口只接受控制台令牌（POST /v0/management/session 除外），
+// 携带管理密钥访问非 session 管理接口（含需路径清理的路径）属于鉴权失败。
 func TestPoolRequestLogsFollowAuthorization(t *testing.T) {
 	runSecurityLogCases(t, newSecurityPool(securityAPIKey), []securityLogCase{
 		{name: "missing-key-warns-without-request-logs", method: "GET", path: "/v1/models",
@@ -180,13 +181,18 @@ func TestPoolRequestLogsFollowAuthorization(t *testing.T) {
 			wantStatus: http.StatusUnauthorized, wantAuthWarning: msgMgmtAuthFail},
 		{name: "management-with-api-key-warns-without-request-logs", method: "GET", path: "/v0/management/accounts",
 			auth: "Bearer " + securityAPIKey, wantStatus: http.StatusUnauthorized, wantAuthWarning: msgMgmtAuthFail},
+		{name: "management-with-mgmt-key-warns-without-request-logs", method: "GET", path: "/v0/management/accounts",
+			auth: "Bearer " + securityMgmtKey, wantStatus: http.StatusUnauthorized, wantAuthWarning: msgMgmtAuthFail},
+		{name: "management-mgmt-key-on-cleaned-path-warns-without-request-logs", method: "GET", path: "/v0/management//accounts",
+			auth: "Bearer " + securityMgmtKey, wantStatus: http.StatusUnauthorized, wantAuthWarning: msgMgmtAuthFail},
 		{name: "management-authorized-keeps-request-logs", method: "GET", path: "/v0/management/accounts",
-			auth: "Bearer " + securityMgmtKey, wantStatus: http.StatusOK, wantRequestLogs: true},
+			auth: "Bearer " + consoleTokenFor(securityMgmtKey), wantStatus: http.StatusOK, wantRequestLogs: true},
 	})
 }
 
 // TestManagementMuxResponsesKeepRequestLogs 管理路径上由 ServeMux 直接产生的响应不经过鉴权（没有进入管理密钥校验），
 // 因此不是鉴权失败，必须输出请求日志，且不输出鉴权告警。覆盖方法不匹配（405，ServeMux 也可能给 404）与路径清理重定向。
+// 路径清理重定向要求先通过鉴权，因此用控制台令牌（管理密钥在非 session 路径上是鉴权失败，见上一测试）。
 func TestManagementMuxResponsesKeepRequestLogs(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
@@ -197,8 +203,8 @@ func TestManagementMuxResponsesKeepRequestLogs(t *testing.T) {
 	}{
 		{name: "post-console-without-key", method: "POST", path: "/management",
 			wantStatuses: []int{http.StatusMethodNotAllowed, http.StatusNotFound}},
-		{name: "cleaned-path-redirect-with-management-key", method: "GET", path: "/v0/management//accounts",
-			auth: "Bearer " + securityMgmtKey, wantStatuses: []int{http.StatusMovedPermanently, http.StatusTemporaryRedirect, http.StatusPermanentRedirect}},
+		{name: "cleaned-path-redirect-with-console-token", method: "GET", path: "/v0/management//accounts",
+			auth: "Bearer " + consoleTokenFor(securityMgmtKey), wantStatuses: []int{http.StatusMovedPermanently, http.StatusTemporaryRedirect, http.StatusPermanentRedirect}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var logs bytes.Buffer

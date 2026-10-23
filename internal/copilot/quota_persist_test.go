@@ -493,7 +493,7 @@ func TestCancelledQuotaRefreshDoesNotWriteFile(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		r := httptest.NewRequest("GET", "/v0/management/accounts", nil).WithContext(ctx)
-		r.Header.Set("Authorization", "Bearer "+mgmtKey)
+		r.Header.Set("Authorization", "Bearer "+consoleTokenFor(mgmtKey))
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
@@ -522,7 +522,7 @@ func TestCancelledQuotaRefreshDoesNotWriteFile(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		r := httptest.NewRequest("POST", "/v0/management/quota/refresh", strings.NewReader(`{"id":"alice"}`)).WithContext(ctx)
-		r.Header.Set("Authorization", "Bearer "+mgmtKey)
+		r.Header.Set("Authorization", "Bearer "+consoleTokenFor(mgmtKey))
 		done := make(chan struct{})
 		go func() {
 			defer close(done)

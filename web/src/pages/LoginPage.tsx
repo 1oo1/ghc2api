@@ -1,10 +1,11 @@
-// 登录页：输入管理密钥，通过 GET /v0/management/accounts 校验后进入控制台。
+// 登录页：输入管理密钥，通过 POST /v0/management/session 换取控制台令牌后进入控制台。
 import { useState, type FormEvent } from "react";
 import {
   ApiError,
   createManagementClient,
   errorMessage,
   isUnauthorized,
+  type ConsoleSession,
 } from "../api";
 
 export function LoginPage({
@@ -13,7 +14,7 @@ export function LoginPage({
 }: {
   /** 从控制台被踢回时的提示，例如密钥已失效。 */
   notice: string;
-  onLogin: (managementKey: string) => void;
+  onLogin: (session: ConsoleSession) => void;
 }) {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -25,8 +26,7 @@ export function LoginPage({
     setBusy(true);
     setError("");
     try {
-      await createManagementClient(key).listAccounts();
-      onLogin(key);
+      onLogin(await createManagementClient(key).createSession());
     } catch (err) {
       setError(loginErrorMessage(err));
       setBusy(false);
@@ -57,8 +57,8 @@ export function LoginPage({
       {notice && <div className="banner error">{notice}</div>}
       {error && <p role="alert" className="hint error">{error}</p>}
       <small>
-        管理密钥即 config.yaml 中的 management_key。密钥保存在当前标签页的 sessionStorage 中，
-        刷新页面后仍保持登录，关闭标签页或退出登录后清除。
+        管理密钥即 config.yaml 中的 management_key。密钥只用于换取 14 天有效的登录令牌，不会保存在浏览器中；
+        14 天内打开控制台会自动续期，超过 14 天未打开或退出登录后需重新输入。
       </small>
     </main>
   );

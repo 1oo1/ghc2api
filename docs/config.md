@@ -63,7 +63,7 @@ quota_refresh_interval: "1h"  # Go duration，必须 >= 1m，默认 1h
 - 单文件上限默认 10 MiB，保留 5 个备份；用 `log_max_size_mb`、`log_max_backups` 调整（备份数 `0` 表示不保留）。
 - 同一 `logs_path` 只应由一个进程使用。
 - `debug` 记录脱敏后的完整上游请求/响应正文，可能含提示词等业务数据；排障后应恢复 `info`。认证头、凭证字段、已知 token 会脱敏。
-- 只有鉴权失败（业务 `api_key` 或管理 `management_key`，返回 401）的请求不输出"收到客户端请求"与"客户端请求处理完成"，只输出一条 WARN 告警，字段为 `method`、`path`（各自最多 256 字节，按 UTF-8 字符边界截断）与 `remote_addr`。其他请求（包括 `/healthz`、`/favicon.ico`、控制台页面，以及 ServeMux 自身产生的 405、404 与路径清理重定向）都输出这两条日志。
+- 只有鉴权失败（业务 `api_key`，或管理接口的控制台令牌/session 接口的 `management_key`，返回 401）的请求不输出"收到客户端请求"与"客户端请求处理完成"，只输出一条 WARN 告警，字段为 `method`、`path`（各自最多 256 字节，按 UTF-8 字符边界截断）与 `remote_addr`。其他请求（包括 `/healthz`、`/favicon.ico`、控制台页面，以及 ServeMux 自身产生的 405、404 与路径清理重定向）都输出这两条日志。
 - 日志中 `account` 为账号在当前列表中的下标，`user` 为用户名。
 
 ## 文件权限

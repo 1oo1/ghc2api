@@ -43,6 +43,13 @@ export type LoginStatus = {
   error?: string;
 };
 
+/** 控制台令牌：由管理密钥换取，或用未过期的令牌续期。 */
+export type ConsoleSession = {
+  token: string;
+  /** RFC3339 过期时间。 */
+  expires_at: string;
+};
+
 /** 服务端返回的非 2xx 错误，保留 HTTP 状态码便于区分处理。 */
 export class ApiError extends Error {
   readonly status: number;
@@ -67,10 +74,10 @@ export function errorMessage(error: unknown, fallback = "操作失败"): string 
 export type ManagementClient = ReturnType<typeof createManagementClient>;
 
 /**
- * 使用给定的管理密钥创建客户端。
- * 密钥只放在请求头中发送，本模块不做任何持久化。
+ * 使用给定的凭据（管理密钥或控制台令牌）创建客户端。
+ * 凭据只放在请求头中发送，本模块不做任何持久化。
  */
-export function createManagementClient(managementKey: string) {
+export function createManagementClient(credential: string) {
   async function request<T>(
     path: string,
     method = "GET",
@@ -79,7 +86,7 @@ export function createManagementClient(managementKey: string) {
     const response = await fetch(`/v0/management/${path}`, {
       method,
       headers: {
-        Authorization: `Bearer ${managementKey}`,
+        Authorization: `Bearer ${credential}`,
         ...(body === undefined ? {} : { "Content-Type": "application/json" }),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -95,6 +102,8 @@ export function createManagementClient(managementKey: string) {
   }
 
   return {
+    /** 签发新的控制台令牌：凭据为管理密钥时即登录，为令牌时即续期。 */
+    createSession: () => request<ConsoleSession>("session", "POST"),
     /** 服务端程序版本，例如 v0.0.1。 */
     getVersion: () => request<{ version: string }>("version"),
     listAccounts: () => request<AccountView[]>("accounts"),

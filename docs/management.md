@@ -5,7 +5,8 @@
 ## 启用与鉴权
 
 - 仅 `management_key` 非空（去除首尾空白后至少 32 字节，且不同于 `api_key`）时注册。留空则 `/management` 与 `/v0/management/*` 不存在：与其他未注册路径一样先校验服务密钥，无有效 `api_key` 返回 401，有则 404。
-- 鉴权 `Authorization: Bearer <management_key>`（常量时间比较），失败 401 并输出一条鉴权失败告警（字段 `method`、`path` 各最多 256 字节，按 UTF-8 字符边界截断，以及 `remote_addr`），不输出请求日志。`api_key` 与 `X-Api-Key` 均不能访问管理接口；`/management` 页面本身无需鉴权。管理密钥校验只作用于 `/v0/management/` 前缀，且位于请求日志之外。路径清理重定向（如 `/v0/management//accounts`）同样发生在该前缀下，因此必须先通过管理密钥校验才会被重定向；`/management` 上由 ServeMux 直接产生的 405、404 不需要管理密钥，照常输出请求日志。
+- 鉴权 `Authorization: Bearer <控制台令牌>`（见下文「控制台令牌」）。管理密钥只能用于 `POST /v0/management/session`（路径须完全一致，常量时间比较）换取令牌，访问其他管理接口一律 401；脚本调用管理接口也需先换取令牌。
+- 鉴权失败返回 401：`POST /v0/management/session` 的消息为 `管理密钥无效或缺失`，其他路径为 `控制台令牌无效或缺失`。同时输出一条鉴权失败告警（字段 `method`、`path` 各最多 256 字节，按 UTF-8 字符边界截断，以及 `remote_addr`），不输出请求日志。`api_key` 与 `X-Api-Key` 均不能访问管理接口；`/management` 页面本身无需鉴权。鉴权只作用于 `/v0/management/` 前缀，且位于请求日志之外。路径清理重定向（如 `/v0/management//accounts`）同样发生在该前缀下，因此必须先携带有效令牌才会被重定向（清理前的路径不是 session 路径，不接受管理密钥）；`/management` 上由 ServeMux 直接产生的 405、404 不需要管理密钥，照常输出请求日志。
 - 响应均为 JSON，错误格式同 `writeError`；请求体上限 1 MiB。
 - 密钥通过 HTTP 头发送，监听非本机地址时应置于 TLS 反向代理之后。
 - 控制台响应带 `X-Frame-Options: DENY` 与 `Content-Security-Policy`（含 `default-src 'self'`、`frame-ancestors 'none'`；单文件构建内联 script/style，故 script-src、style-src 允许 `'unsafe-inline'`）。
@@ -15,6 +16,7 @@
 | 方法与路径 | 请求 | 响应 |
 | --- | --- | --- |
 | `GET /management` | — | 控制台 HTML（`web.Index()`） |
+| `POST /v0/management/session` | — | `{"token":"v1.…","expires_at":"RFC3339"}`，签发新的控制台令牌（用管理密钥即登录，用令牌即续期） |
 | `GET /v0/management/version` | — | `{"version":"v0.0.1"}`，程序版本号（`copilot.Version`），控制台侧边栏显示 |
 | `GET /v0/management/accounts` | — | `[]AccountView`，顺带刷新过期额度（见 `quota-stats.md`） |
 | `POST /v0/management/accounts` | `{"credential":{"oauth_token":"...","host":"","user":""}}` | `200 AccountView` |
@@ -38,6 +40,16 @@ type AccountView struct {
 ```
 
 JSON 字段名为 `id`、`user`、`host`、`disabled`、`priority`、`cooldown_until`、`cooldown_reason`、`stats{requests,errors,last_used_at}`、`quota`、`quota_error`。`cooldown_until` 与 `cooldown_reason` 仅在冷却中输出。不含 OAuth token。
+
+## 控制台令牌
+
+代码：`internal/copilot/console_token.go`。
+
+- 格式 `v1.<过期时间 Unix 秒>.<签名>`，签名为 HMAC-SHA256（密钥为 `management_key`，消息为 `ghc2api-console-token:v1.<exp>`）的 base64 RawURL 编码。令牌不含管理密钥，服务端不保存任何状态。
+- 有效期 14 天（`consoleTokenTTL`），过期时间为签发时刻截断到秒后加 14 天。校验拒绝：格式不符、签名不符、已到期（当前时间不早于 exp）、exp 晚于当前时间 + 14 天。
+- 令牌可访问全部 `/v0/management/*`，不能当作 `api_key` 使用。
+- 无单独吊销：退出登录只清除浏览器记录。更换 `management_key` 后所有令牌立即失效。
+- 持有有效令牌即可无限续期（滑动过期），没有绝对有效期上限。
 
 ## 行为约定
 

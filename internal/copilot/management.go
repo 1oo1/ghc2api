@@ -51,11 +51,16 @@ type AccountView struct {
 // managementAPIPrefix 是需要管理密钥的接口路径前缀；控制台页面 /management 不需要鉴权。
 const managementAPIPrefix = "/v0/management/"
 
-// newManagementHandler 注册管理路由。控制台页面无需鉴权，managementAPIPrefix 下的接口要求 Authorization: Bearer <管理密钥>。
+// managementSessionPath 是用管理密钥换取控制台令牌的接口，也是唯一接受管理密钥的接口。
+const managementSessionPath = managementAPIPrefix + "session"
+
+// newManagementHandler 注册管理路由。控制台页面无需鉴权，managementAPIPrefix 下的接口要求 Authorization: Bearer <控制台令牌>，
+// 只有 POST managementSessionPath 同时接受管理密钥。
 // 鉴权位于请求日志之外：未通过鉴权的请求只输出鉴权告警；其余请求（包括 ServeMux 自身产生的 405、404 与路径清理重定向）都输出请求日志。
 func (p *Pool) newManagementHandler() http.Handler {
 	api := http.NewServeMux()
 	api.HandleFunc("GET /v0/management/version", handleVersion)
+	api.HandleFunc("POST "+managementSessionPath, handleCreateSession(p.config.ManagementKey))
 	api.HandleFunc("GET /v0/management/accounts", p.handleListAccounts)
 	api.HandleFunc("POST /v0/management/accounts", p.handleImportAccount)
 	api.HandleFunc("PATCH /v0/management/accounts", p.handlePatchAccount)
@@ -75,9 +80,10 @@ func isManagementPath(path string) bool {
 	return path == "/management" || strings.HasPrefix(path, managementAPIPrefix)
 }
 
-// requireManagementKey 校验管理接口的管理密钥，只作用于 managementAPIPrefix 下的路径，其他路径直接交给 next。
+// requireManagementKey 校验管理接口的凭据，只作用于 managementAPIPrefix 下的路径，其他路径直接交给 next。
+// 管理密钥只能用于 POST /v0/management/session 换取控制台令牌（见 console_token.go），其余接口只接受有效令牌。
 // 只接受 Authorization: Bearer，不接受 X-Api-Key，因此服务访问密钥无法用来访问管理接口。
-// 校验在 next（含请求日志）之外，因此路径清理等 ServeMux 行为不会绕过它。
+// 校验在 next（含请求日志）之外，因此路径清理等 ServeMux 行为不会绕过它；清理前的路径不等于 session 路径，不接受管理密钥。
 // key 为空时拒绝所有管理接口请求（空密钥与 "Bearer " 后的空值哈希相同，不能交给 secretMatches）。
 func requireManagementKey(key string, logf logFunc, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -85,17 +91,24 @@ func requireManagementKey(key string, logf logFunc, next http.Handler) http.Hand
 			next.ServeHTTP(w, r)
 			return
 		}
+		session := r.Method == http.MethodPost && r.URL.Path == managementSessionPath
 		value, found := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if key == "" || !found || !secretMatches(key, value) {
+		ok := key != "" && found &&
+			(verifyConsoleToken(key, value, time.Now()) || session && secretMatches(key, value))
+		if !ok {
 			logAuthFailure(logf, r, "管理接口鉴权失败")
-			writeError(w, http.StatusUnauthorized, "管理密钥无效或缺失")
+			message := "控制台令牌无效或缺失"
+			if session {
+				message = "管理密钥无效或缺失"
+			}
+			writeError(w, http.StatusUnauthorized, message)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-// serveConsole 返回内嵌的管理控制台页面。页面本身不含密钥，密钥由用户输入后随请求发送。
+// serveConsole 返回内嵌的管理控制台页面。页面本身不含密钥，用户输入的密钥只用于换取控制台令牌。
 // 同时设置 CSP 与 X-Frame-Options，防止控制台被其他站点嵌入（点击劫持）。
 func serveConsole(w http.ResponseWriter, _ *http.Request) {
 	page, err := web.Index()

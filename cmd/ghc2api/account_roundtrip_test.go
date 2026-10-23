@@ -127,6 +127,20 @@ func assertRoundTripAccountLoads(t *testing.T, configPath, credentials, token st
 	}
 }
 
+// roundTripAuth 用管理密钥经 POST /v0/management/session 换取控制台令牌，返回 "Bearer <令牌>"。
+// 除该入口外管理接口只接受控制台令牌，不接受管理密钥，因此其他管理请求都用它鉴权。
+func roundTripAuth(t *testing.T, pool *copilot.Pool) string {
+	t.Helper()
+	token := fetchConsoleToken(t, func(auth string) (int, []byte) {
+		r := httptest.NewRequest(http.MethodPost, "/v0/management/session", nil)
+		r.Header.Set("Authorization", auth)
+		w := httptest.NewRecorder()
+		pool.Handler().ServeHTTP(w, r)
+		return w.Code, w.Body.Bytes()
+	}, roundTripManagementKey)
+	return "Bearer " + token
+}
+
 // TestManagementWrittenAccountsLoadAtStartup 管理接口导入或设备登录写出的凭证（登录名含 "-" 与 "_"）
 // 能被启动时的 loadConfig 正常读取，并加入账号列表。
 func TestManagementWrittenAccountsLoadAtStartup(t *testing.T) {
@@ -136,7 +150,7 @@ func TestManagementWrittenAccountsLoadAtStartup(t *testing.T) {
 		configPath, pool, credentials := roundTripSetup(t, token)
 		r := httptest.NewRequest(http.MethodPost, "/v0/management/accounts",
 			strings.NewReader(`{"credential":{"oauth_token":"`+token+`"}}`))
-		r.Header.Set("Authorization", "Bearer "+roundTripManagementKey)
+		r.Header.Set("Authorization", roundTripAuth(t, pool))
 		w := httptest.NewRecorder()
 		pool.Handler().ServeHTTP(w, r)
 		if w.Code != http.StatusOK {
@@ -147,9 +161,10 @@ func TestManagementWrittenAccountsLoadAtStartup(t *testing.T) {
 
 	t.Run("device-login", func(t *testing.T) {
 		configPath, pool, credentials := roundTripSetup(t, token)
+		auth := roundTripAuth(t, pool)
 		start := httptest.NewRecorder()
 		login := httptest.NewRequest(http.MethodPost, "/v0/management/login", nil)
-		login.Header.Set("Authorization", "Bearer "+roundTripManagementKey)
+		login.Header.Set("Authorization", auth)
 		pool.Handler().ServeHTTP(start, login)
 		var begun struct {
 			State string `json:"state"`
@@ -161,7 +176,7 @@ func TestManagementWrittenAccountsLoadAtStartup(t *testing.T) {
 		for {
 			status := httptest.NewRecorder()
 			poll := httptest.NewRequest(http.MethodGet, "/v0/management/login/status?state="+begun.State, nil)
-			poll.Header.Set("Authorization", "Bearer "+roundTripManagementKey)
+			poll.Header.Set("Authorization", auth)
 			pool.Handler().ServeHTTP(status, poll)
 			var result struct {
 				Status string `json:"status"`

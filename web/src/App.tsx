@@ -1,10 +1,11 @@
 // 应用入口组件：未登录时显示登录页；登录后显示控制台（概览 / 账号与额度）。
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   createManagementClient,
   errorMessage,
   isUnauthorized,
   type AccountView,
+  type ConsoleSession,
   type LoginStart,
 } from "./api";
 import type { Actions } from "./actions";
@@ -12,11 +13,11 @@ import { DeviceLoginPanel } from "./components/DeviceLoginPanel";
 import { AccountsPage } from "./pages/AccountsPage";
 import { LoginPage } from "./pages/LoginPage";
 import { OverviewPage } from "./pages/OverviewPage";
-import { clearSessionKey, loadSessionKey, saveSessionKey } from "./session";
+import { clearSession, loadSession, saveSession } from "./session";
 
 /** 账号列表自动刷新间隔（毫秒）。 */
 const REFRESH_INTERVAL_MS = 15_000;
-const EXPIRED_MESSAGE = "管理密钥已失效，请重新输入";
+const EXPIRED_MESSAGE = "登录已失效，请重新输入管理密钥";
 
 type Page = "overview" | "accounts";
 const pages: { id: Page; label: string; icon: string }[] = [
@@ -25,31 +26,59 @@ const pages: { id: Page; label: string; icon: string }[] = [
 ];
 
 export function App() {
-  // 管理密钥保存在 React state 中，并同步到当前标签页的 sessionStorage（见 session.ts），
-  // 因此刷新页面后仍保持登录；关闭标签页或退出登录、密钥失效时清除。不写入 localStorage、cookie 或 URL。
-  const [managementKey, setManagementKey] = useState(loadSessionKey);
+  // 控制台令牌（由管理密钥换取，见 session.ts）保存在 React state 与 localStorage 中；
+  // 管理密钥本身只在登录时发送一次，不做任何保存。退出登录或令牌失效时清除。
+  const [token, setToken] = useState(loadSession);
   const [loginNotice, setLoginNotice] = useState("");
+  // 当前令牌的同步副本，供异步续期回调判断结果是否已过时（期间已退出或重新登录）。
+  const tokenRef = useRef(token);
+  const updateToken = useCallback((next: string) => {
+    tokenRef.current = next;
+    setToken(next);
+  }, []);
 
-  const onLogin = useCallback((key: string) => {
-    setLoginNotice("");
-    saveSessionKey(key);
-    setManagementKey(key);
-  }, []);
-  const onExpire = useCallback((message: string) => {
-    setLoginNotice(message);
-    clearSessionKey();
-    setManagementKey("");
-  }, []);
+  const onLogin = useCallback(
+    (session: ConsoleSession) => {
+      setLoginNotice("");
+      saveSession(session.token, session.expires_at);
+      updateToken(session.token);
+    },
+    [updateToken],
+  );
+  const onExpire = useCallback(
+    (message: string) => {
+      setLoginNotice(message);
+      clearSession();
+      updateToken("");
+    },
+    [updateToken],
+  );
   const onLogout = useCallback(() => {
-    clearSessionKey();
-    setManagementKey("");
-  }, []);
+    clearSession();
+    updateToken("");
+  }, [updateToken]);
 
-  if (!managementKey)
-    return <LoginPage notice={loginNotice} onLogin={onLogin} />;
+  // 打开页面时若已登录，用现有令牌换新令牌，有效期重新计为 14 天；
+  // 令牌被拒（如管理密钥已更换）则回到登录页，网络错误时继续使用现有令牌。
+  // 响应返回前令牌已变化（退出、重新登录或 StrictMode 下的另一次续期已生效）时忽略该响应。
+  useEffect(() => {
+    const saved = tokenRef.current;
+    if (!saved) return;
+    createManagementClient(saved)
+      .createSession()
+      .then((session) => {
+        if (tokenRef.current === saved) onLogin(session);
+      })
+      .catch((e) => {
+        if (tokenRef.current === saved && isUnauthorized(e))
+          onExpire(EXPIRED_MESSAGE);
+      });
+  }, [onLogin, onExpire]);
+
+  if (!token) return <LoginPage notice={loginNotice} onLogin={onLogin} />;
   return (
     <Console
-      managementKey={managementKey}
+      credential={token}
       onLogout={onLogout}
       onExpire={onExpire}
     />
@@ -61,18 +90,19 @@ export function App() {
  * 各页面只负责展示。组件卸载即丢弃全部状态（退出登录时）。
  */
 function Console({
-  managementKey,
+  credential,
   onLogout,
   onExpire,
 }: {
-  managementKey: string;
+  /** 控制台令牌。 */
+  credential: string;
   onLogout: () => void;
-  /** 密钥失效时调用，回到登录页并给出提示。 */
+  /** 令牌失效时调用，回到登录页并给出提示。 */
   onExpire: (message: string) => void;
 }) {
   const client = useMemo(
-    () => createManagementClient(managementKey),
-    [managementKey],
+    () => createManagementClient(credential),
+    [credential],
   );
   const [page, setPage] = useState<Page>("overview");
   const [accounts, setAccounts] = useState<AccountView[]>([]);

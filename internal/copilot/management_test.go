@@ -258,8 +258,10 @@ func mgmtNewPool(t *testing.T, up *mgmtUpstream, ttl time.Duration, users ...str
 	return p, dir
 }
 
-// mgmtCall 通过 Pool 的 HTTP 入口调用接口；key 为空时不带 Authorization 头（不经 withTestAPIKey，不会补服务密钥）。
-func mgmtCall(p *Pool, method, path, body, key string) *httptest.ResponseRecorder {
+// mgmtCallRaw 通过 Pool 的 HTTP 入口调用接口，key 原样放入 Authorization: Bearer，不做任何替换；
+// key 为空时不带 Authorization 头（不经 withTestAPIKey，不会补服务密钥）。
+// 专门验证鉴权行为（区分管理密钥与控制台令牌）的测试用它，不要依赖 mgmtCall 的密钥替换。
+func mgmtCallRaw(p *Pool, method, path, body, key string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, path, strings.NewReader(body))
 	r.Header.Set("Content-Type", "application/json")
 	if key != "" {
@@ -268,6 +270,20 @@ func mgmtCall(p *Pool, method, path, body, key string) *httptest.ResponseRecorde
 	w := httptest.NewRecorder()
 	p.Handler().ServeHTTP(w, r)
 	return w
+}
+
+// mgmtCall 通过 Pool 的 HTTP 入口调用接口，替换范围如下：
+//   - session 路径（managementSessionPath）不替换、原样发送：它是“用管理密钥登录、用令牌续期”的唯一入口，
+//     替换会掩盖管理密钥登录的语义；
+//   - 其余路径把管理密钥常量（mgmtKey、securityMgmtKey）替换成用它签发的控制台令牌再发送，因为除 session 外
+//     管理接口只接受控制台令牌、不接受管理密钥，这样业务性测试不必逐个换令牌。
+//
+// 需要显式区分管理密钥与令牌的鉴权测试请改用 mgmtCallRaw。
+func mgmtCall(p *Pool, method, path, body, key string) *httptest.ResponseRecorder {
+	if path != managementSessionPath && (key == mgmtKey || key == securityMgmtKey) {
+		key = consoleTokenFor(key)
+	}
+	return mgmtCallRaw(p, method, path, body, key)
 }
 
 // mgmtAccounts 调用 GET /v0/management/accounts 并解析结果。
@@ -388,36 +404,48 @@ func TestNewManagedPoolRejectsInvalidAccounts(t *testing.T) {
 	}
 }
 
-func TestManagementRoutesRequireManagementKey(t *testing.T) {
+// TestManagementRoutesRequireConsoleToken 管理接口的鉴权：除 POST /v0/management/session 外只接受有效控制台令牌，
+// 携带管理密钥返回 401；管理密钥只在 POST /v0/management/session 换取令牌时被接受（该请求也接受有效令牌续期）。
+// 错误或缺失的凭据、服务 api_key 都返回 401；鉴权只接受 Authorization: Bearer，不接受 X-Api-Key。
+// 本测试要显式区分管理密钥与令牌，因此用 mgmtCallRaw 发送原始凭据，不经过 mgmtCall 的密钥替换。
+func TestManagementRoutesRequireConsoleToken(t *testing.T) {
 	p, err := NewManagedPool(PoolConfig{
 		ManagementKey: mgmtKey, APIKey: mgmtAPIKey, CredentialsDir: t.TempDir(), CacheDir: t.TempDir(),
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	token := mgmtSessionToken(t, p, mgmtKey)
 	for _, tc := range []struct {
 		name string
 		key  string
 		want int
 	}{
-		{name: "management-key", key: mgmtKey, want: http.StatusOK},
+		{name: "management-key-is-not-console-token", key: mgmtKey, want: http.StatusUnauthorized},
+		{name: "console-token", key: token, want: http.StatusOK},
 		{name: "wrong-key", key: "wrong", want: http.StatusUnauthorized},
 		{name: "missing-key", key: "", want: http.StatusUnauthorized},
-		{name: "api-key-is-not-management-key", key: mgmtAPIKey, want: http.StatusUnauthorized},
+		{name: "api-key-is-not-console-token", key: mgmtAPIKey, want: http.StatusUnauthorized},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if w := mgmtCall(p, "GET", "/v0/management/accounts", "", tc.key); w.Code != tc.want {
+			if w := mgmtCallRaw(p, "GET", "/v0/management/accounts", "", tc.key); w.Code != tc.want {
 				t.Fatalf("status = %d, want %d; body=%s", w.Code, tc.want, w.Body.String())
 			}
 		})
 	}
-	// 管理密钥只接受 Authorization: Bearer，不能通过 X-Api-Key 传递。
-	r := httptest.NewRequest("GET", "/v0/management/accounts", nil)
-	r.Header.Set("X-Api-Key", mgmtKey)
-	w := httptest.NewRecorder()
-	p.Handler().ServeHTTP(w, r)
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("X-Api-Key 携带管理密钥 status = %d, want 401", w.Code)
+	// 管理密钥只在 POST /v0/management/session 换取令牌时被接受。
+	if code, _ := mgmtCreateSession(t, p, mgmtKey); code != http.StatusOK {
+		t.Fatalf("管理密钥 POST session status = %d, want 200", code)
+	}
+	// 凭据只接受 Authorization: Bearer，不能通过 X-Api-Key 传递（管理密钥与令牌都不行）。
+	for _, value := range []string{mgmtKey, token} {
+		r := httptest.NewRequest("GET", "/v0/management/accounts", nil)
+		r.Header.Set("X-Api-Key", value)
+		w := httptest.NewRecorder()
+		p.Handler().ServeHTTP(w, r)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("X-Api-Key 携带 %q status = %d, want 401", value, w.Code)
+		}
 	}
 }
 
@@ -433,7 +461,7 @@ func TestManagementRoutesAbsentWithoutManagementKey(t *testing.T) {
 	} {
 		// 未启用管理接口时，这些路径与其他未注册路径一样先校验服务访问密钥：
 		// 携带管理密钥（不是服务密钥）得到 401，携带有效服务密钥只能得到普通 404。
-		if w := mgmtCall(p, tc.method, tc.path, "", mgmtKey); w.Code != http.StatusUnauthorized {
+		if w := mgmtCallRaw(p, tc.method, tc.path, "", mgmtKey); w.Code != http.StatusUnauthorized {
 			t.Errorf("%s %s 携带管理密钥 status = %d, want 401", tc.method, tc.path, w.Code)
 		}
 		if w := mgmtCall(p, tc.method, tc.path, "", testAPIKey); w.Code != http.StatusNotFound {
@@ -443,7 +471,7 @@ func TestManagementRoutesAbsentWithoutManagementKey(t *testing.T) {
 }
 
 // TestManagementConsolePageIsPublicAndMatchesEmbeddedHTML 控制台页面无需鉴权，且返回内嵌的 HTML；
-// 管理接口不受 api_key 影响，携带管理密钥即可访问。
+// 管理接口不受 api_key 影响，携带控制台令牌即可访问。
 func TestManagementConsolePageIsPublicAndMatchesEmbeddedHTML(t *testing.T) {
 	p, err := NewManagedPool(PoolConfig{
 		ManagementKey: mgmtKey, APIKey: mgmtAPIKey, CredentialsDir: t.TempDir(), CacheDir: t.TempDir(),
@@ -459,8 +487,9 @@ func TestManagementConsolePageIsPublicAndMatchesEmbeddedHTML(t *testing.T) {
 	if w.Code != http.StatusOK || w.Header().Get("Content-Type") != "text/html; charset=utf-8" || !bytes.Equal(w.Body.Bytes(), want) {
 		t.Fatalf("GET /management status=%d content-type=%q，正文与内嵌 HTML 不一致", w.Code, w.Header().Get("Content-Type"))
 	}
-	if w := mgmtCall(p, "GET", "/v0/management/accounts", "", mgmtKey); w.Code != http.StatusOK {
-		t.Fatalf("携带管理密钥访问管理接口 status = %d, want 200", w.Code)
+	token := mgmtSessionToken(t, p, mgmtKey)
+	if w := mgmtCallRaw(p, "GET", "/v0/management/accounts", "", token); w.Code != http.StatusOK {
+		t.Fatalf("携带控制台令牌访问管理接口 status = %d, want 200", w.Code)
 	}
 }
 

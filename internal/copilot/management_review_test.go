@@ -345,7 +345,7 @@ func TestManagementRefreshCancelledByClientKeepsCacheAndRetriesNextList(t *testi
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	r := httptest.NewRequest("POST", "/v0/management/quota/refresh", strings.NewReader(`{"id":"alice"}`)).WithContext(ctx)
-	r.Header.Set("Authorization", "Bearer "+mgmtKey)
+	r.Header.Set("Authorization", "Bearer "+consoleTokenFor(mgmtKey))
 	w := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {

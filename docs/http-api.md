@@ -5,8 +5,8 @@
 ## 鉴权
 
 - `api_key` 必填（见 `config.md`），与监听地址无关；不存在匿名模式。除健康检查和管理接口外的请求需 `Authorization: Bearer <api_key>`，也支持 Anthropic 客户端的 `x-api-key`。库层同样不接受空密钥：构造函数拒绝空 `APIKey`，鉴权中间件收到空密钥时拒绝所有需鉴权的请求（失败即拒绝），见 `pool.md`。
-- `/v0/management/*` 改用管理密钥，`api_key` 不能访问；详见 `management.md`。
-- 只有鉴权失败（业务 `api_key` 或管理 `management_key`，返回 401）的请求才不输出"收到客户端请求"与"客户端请求处理完成"，只输出一条 WARN 告警，字段为 `method`、`path`（各自最多 256 字节，按 UTF-8 字符边界截断）与 `remote_addr`（客户端地址）。其他请求都输出这两条日志：鉴权通过的请求、`/healthz`、`/favicon.ico`、控制台页面 `/management`，以及 ServeMux 自身产生的响应（如 `POST /management` 的 405；携带管理密钥的 `/v0/management//accounts` 的路径清理重定向）。鉴权位于请求日志之外（见 `logging.go` 的 `withRequestID`、`withRequestLog` 与 `pool.go`、`management.go` 中的鉴权中间件）。
+- `/v0/management/*` 改用控制台令牌（管理密钥只能用于换取令牌），`api_key` 不能访问；详见 `management.md`。
+- 只有鉴权失败（业务 `api_key`，或管理接口的控制台令牌/session 接口的 `management_key`，返回 401）的请求才不输出"收到客户端请求"与"客户端请求处理完成"，只输出一条 WARN 告警，字段为 `method`、`path`（各自最多 256 字节，按 UTF-8 字符边界截断）与 `remote_addr`（客户端地址）。其他请求都输出这两条日志：鉴权通过的请求、`/healthz`、`/favicon.ico`、控制台页面 `/management`，以及 ServeMux 自身产生的响应（如 `POST /management` 的 405；携带控制台令牌的 `/v0/management//accounts` 的路径清理重定向）。鉴权位于请求日志之外（见 `logging.go` 的 `withRequestID`、`withRequestLog` 与 `pool.go`、`management.go` 中的鉴权中间件）。
 - 请求头上限 `MaxHeaderBytes` 为 64 KiB（Go 实际另有约 4 KiB 余量），超出时由 HTTP 服务拒绝。
 - 生成响应的写超时：生成接口（流式与非流式）向客户端写响应时，每次写入（含刷新）前把写截止时间续期为现在起 60 秒（`generationWriteTimeout`，包级变量）。客户端长时间不读取、写入超时后请求结束，并释放并发名额，上游请求随之取消。请求结束时不清除截止时间：net/http（HTTP/1.1）在每个请求结束后会自行清除连接的写截止时间，因此 handler 返回后的最后一次 flush 仍受超时保护，之后复用该连接的请求不受影响。服务器没有全局 `WriteTimeout`，不会截断长时间的生成。
 

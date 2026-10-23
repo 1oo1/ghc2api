@@ -118,6 +118,24 @@ func writeConfigAt(t *testing.T, dir, name, contents string) string {
 	return path
 }
 
+// fetchConsoleToken 用管理密钥经 POST /v0/management/session 换取控制台令牌。
+// 除该入口外，管理接口只接受控制台令牌、不接受管理密钥，因此其他管理请求都要先换令牌。
+// send 执行一次请求并返回状态码与响应体；Authorization 头由本函数以 "Bearer <值>" 传入。
+func fetchConsoleToken(t *testing.T, send func(auth string) (int, []byte), managementKey string) string {
+	t.Helper()
+	status, body := send("Bearer " + managementKey)
+	if status != http.StatusOK {
+		t.Fatalf("POST /v0/management/session status=%d body=%s", status, body)
+	}
+	var res struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(body, &res); err != nil || res.Token == "" {
+		t.Fatalf("session 响应缺少 token: %s", body)
+	}
+	return res.Token
+}
+
 // appConfigYAML 生成服务级配置。apiKey 原样写入（为空时写入 api_key: ""，加载会因 api_key 必填而失败）；
 // 需要成功启动的夹具应传入 validAPIKey。
 func appConfigYAML(listen, host, apiKey, logLevel string) string {
@@ -1592,11 +1610,30 @@ func TestRunServesWithoutCredentialsWhenManagementKeySet(t *testing.T) {
 		t.Fatalf("GET /management status=%d content-type=%q", page.StatusCode, page.Header.Get("Content-Type"))
 	}
 
+	// 除 POST /v0/management/session 外管理接口只接受控制台令牌：先用管理密钥换令牌再查列表。
+	token := fetchConsoleToken(t, func(auth string) (int, []byte) {
+		req, err := http.NewRequest(http.MethodPost, baseURL+"/v0/management/session", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", auth)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		body, err := io.ReadAll(res.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res.StatusCode, body
+	}, key)
+
 	req, err := http.NewRequest(http.MethodGet, baseURL+"/v0/management/accounts", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Authorization", "Bearer "+token)
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)

@@ -52,21 +52,26 @@ func TestManagementVersionReturnsVersionVariable(t *testing.T) {
 	}
 }
 
-// TestManagementVersionRequiresManagementKey 版本接口与其他管理接口一样需要管理密钥：
-// 无密钥、错误密钥或服务 api_key 均返回 401。
-func TestManagementVersionRequiresManagementKey(t *testing.T) {
+// TestManagementVersionRequiresConsoleToken 版本接口与其他非 session 管理接口一样只接受有效控制台令牌：
+// 管理密钥不被接受（401），无凭据、错误凭据或服务 api_key 同样返回 401。
+// 本测试要显式区分管理密钥与令牌，因此用 mgmtCallRaw 发送原始凭据，不经过 mgmtCall 的密钥替换。
+func TestManagementVersionRequiresConsoleToken(t *testing.T) {
 	p := versionPool(t)
+	token := mgmtSessionToken(t, p, mgmtKey)
 	for _, tc := range []struct {
 		name string
 		key  string
+		want int
 	}{
-		{name: "missing-key", key: ""},
-		{name: "wrong-key", key: "wrong"},
-		{name: "api-key-is-not-management-key", key: mgmtAPIKey},
+		{name: "management-key-is-not-console-token", key: mgmtKey, want: http.StatusUnauthorized},
+		{name: "missing-key", key: "", want: http.StatusUnauthorized},
+		{name: "wrong-key", key: "wrong", want: http.StatusUnauthorized},
+		{name: "api-key-is-not-console-token", key: mgmtAPIKey, want: http.StatusUnauthorized},
+		{name: "console-token", key: token, want: http.StatusOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if w := mgmtCall(p, "GET", "/v0/management/version", "", tc.key); w.Code != http.StatusUnauthorized {
-				t.Fatalf("status = %d, want 401; body=%s", w.Code, w.Body.String())
+			if w := mgmtCallRaw(p, "GET", "/v0/management/version", "", tc.key); w.Code != tc.want {
+				t.Fatalf("status = %d, want %d; body=%s", w.Code, tc.want, w.Body.String())
 			}
 		})
 	}
@@ -76,7 +81,7 @@ func TestManagementVersionRequiresManagementKey(t *testing.T) {
 // 携带管理密钥得到 401，携带有效服务密钥只能得到普通 404。
 func TestManagementVersionAbsentWithoutManagementKey(t *testing.T) {
 	p := testPool(t, poolConfigs(t, nil, "oauth-a"))
-	if w := mgmtCall(p, "GET", "/v0/management/version", "", mgmtKey); w.Code != http.StatusUnauthorized {
+	if w := mgmtCallRaw(p, "GET", "/v0/management/version", "", mgmtKey); w.Code != http.StatusUnauthorized {
 		t.Errorf("携带管理密钥 status = %d, want 401", w.Code)
 	}
 	if w := mgmtCall(p, "GET", "/v0/management/version", "", testAPIKey); w.Code != http.StatusNotFound {
