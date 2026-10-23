@@ -186,8 +186,8 @@ func TestAffinityLogSwitchAccountWhenBindingUnavailable(t *testing.T) {
 	}
 }
 
-// TestAffinityLogAbsentWithoutSessionSignal 没有会话信号（只有 model，或没有 user 消息）的请求不使用亲和，
-// 也不输出任何亲和日志。
+// TestAffinityLogAbsentWithoutSessionSignal 没有会话信号（只有 model，或没有 user 消息）的请求在开启亲和时
+// 直接返回 500（无法计算模型缓存 key），不选账号，也不输出任何亲和日志。
 func TestAffinityLogAbsentWithoutSessionSignal(t *testing.T) {
 	for _, tc := range []struct{ name, body string }{
 		{name: "model-only", body: `{"model":"gpt-4.1","messages":[]}`},
@@ -196,8 +196,14 @@ func TestAffinityLogAbsentWithoutSessionSignal(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			up := newMgmtUpstream(t)
 			p, logs := affinityLogPool(t, up, slog.LevelDebug, DefaultSessionAffinityTTL)
-			affinityLogChat(t, p, tc.body)
-			affinityLogChat(t, p, tc.body)
+			r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(tc.body))
+			r.Header.Set("Content-Type", "application/json")
+			r.Header.Set("Authorization", "Bearer "+affinityLogClientKey)
+			w := httptest.NewRecorder()
+			withTestAPIKey(p.Handler()).ServeHTTP(w, r)
+			if w.Code != http.StatusInternalServerError {
+				t.Fatalf("无会话信号请求 status=%d body=%s, want 500", w.Code, w.Body.String())
+			}
 
 			if !strings.Contains(logs.String(), "收到客户端请求") {
 				t.Fatal("没有捕获到请求日志，无法验证没有亲和日志")

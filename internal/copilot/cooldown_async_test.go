@@ -33,7 +33,7 @@ func cooldownSessionLockedDuring401(t *testing.T, f *cooldownFixture, p *Pool) (
 	firstDone := make(chan struct{})
 	go func() {
 		defer close(firstDone)
-		first <- cooldownChat(p)
+		first <- poolRequest(p, "POST", "/v1/chat/completions", affinityChatBody(t, "session lock request"))
 	}()
 	reviewAwait(t, gen.started, "生成请求未到达上游")
 
@@ -41,7 +41,7 @@ func cooldownSessionLockedDuring401(t *testing.T, f *cooldownFixture, p *Pool) (
 	secondDone := make(chan struct{})
 	go func() {
 		defer close(secondDone)
-		_ = cooldownChat(p)
+		_ = poolRequest(p, "POST", "/v1/chat/completions", affinityChatBody(t, "session lock request"))
 	}()
 	reviewAwait(t, sess.started, "会话交换未到达上游")
 
@@ -395,12 +395,12 @@ func TestCooldownPickSessionDoesNotBindCooledAccount(t *testing.T) {
 	body := affinityChatBody(t, "pickSession binds nothing to a cooled account")
 	key := affinityPoolKey(t, body)
 
-	// 1. 不带会话键的生成请求阻塞在上游；释放后以 401 冷却账号 a。
+	// 1. 带其他会话键的生成请求阻塞在上游；释放后以 401 冷却账号 a（不得绑定被测的会话键）。
 	gen.arm()
 	first := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		defer close(firstDone)
-		first <- cooldownChat(p)
+		first <- poolRequest(p, "POST", "/v1/chat/completions", affinityChatBody(t, "cooldown trigger"))
 	}()
 	reviewAwait(t, gen.started, "生成请求未到达上游")
 

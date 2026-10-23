@@ -6,6 +6,8 @@ package copilot
 // 全部通过 sessionKey 黑盒验证，不依赖实现内部的函数名。
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"testing"
 )
@@ -106,6 +108,8 @@ func TestSessionKeyHeaderSources(t *testing.T) {
 		{"conversation", map[string]string{"X-Conversation-Id": "id-1"}},
 		{"thread", map[string]string{"X-Thread-Id": "id-1"}},
 		{"client-request", map[string]string{"X-Client-Request-Id": "id-1"}},
+		{"agent-task", map[string]string{"X-Agent-Task-Id": "id-1"}},
+		{"request-id", map[string]string{"X-Request-Id": "id-1"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			key := affinityKeyOf(t, "/chat/completions", tc.headers, nil)
@@ -278,6 +282,8 @@ func TestSessionKeyDistinctPrefixes(t *testing.T) {
 		{"conv", affinityKeyReq{headers: map[string]string{"X-Conversation-Id": id}}},
 		{"thread", affinityKeyReq{headers: map[string]string{"X-Thread-Id": id}}},
 		{"clientreq", affinityKeyReq{headers: map[string]string{"X-Client-Request-Id": id}}},
+		{"agenttask", affinityKeyReq{headers: map[string]string{"X-Agent-Task-Id": id}}},
+		{"req", affinityKeyReq{headers: map[string]string{"X-Request-Id": id}}},
 		{"session", affinityKeyReq{fields: map[string]any{"session_id": id}}},
 		{"pck", affinityKeyReq{fields: map[string]any{"prompt_cache_key": id}}},
 		{"user", affinityKeyReq{fields: map[string]any{"metadata": map[string]any{"user_id": id}}}},
@@ -342,8 +348,16 @@ func TestSessionKeySignalPriority(t *testing.T) {
 			affinityKeyReq{headers: map[string]string{"X-Thread-Id": "hi"}},
 			affinityKeyReq{headers: map[string]string{"X-Client-Request-Id": "lo-a"}},
 			affinityKeyReq{headers: map[string]string{"X-Client-Request-Id": "lo-b"}}},
-		{"clientreq-优于-body-thread",
+		{"clientreq-优于-agenttask",
 			affinityKeyReq{headers: map[string]string{"X-Client-Request-Id": "hi"}},
+			affinityKeyReq{headers: map[string]string{"X-Agent-Task-Id": "lo-a"}},
+			affinityKeyReq{headers: map[string]string{"X-Agent-Task-Id": "lo-b"}}},
+		{"agenttask-优于-req",
+			affinityKeyReq{headers: map[string]string{"X-Agent-Task-Id": "hi"}},
+			affinityKeyReq{headers: map[string]string{"X-Request-Id": "lo-a"}},
+			affinityKeyReq{headers: map[string]string{"X-Request-Id": "lo-b"}}},
+		{"req-优于-body-thread",
+			affinityKeyReq{headers: map[string]string{"X-Request-Id": "hi"}},
 			affinityKeyReq{fields: map[string]any{"thread_id": "lo-a"}},
 			affinityKeyReq{fields: map[string]any{"threadId": "lo-b"}}},
 		{"body-thread-优于-body-session",
@@ -455,14 +469,56 @@ func TestSessionKeyIDNormalization(t *testing.T) {
 // TestSessionKeyHeaderNameCaseInsensitive 请求头名字大小写不敏感（依赖 Go 的 Header 规范化）。
 func TestSessionKeyHeaderNameCaseInsensitive(t *testing.T) {
 	const path = "/chat/completions"
-	want := affinityKeyOf(t, path, map[string]string{"X-Session-ID": "s1"}, nil)
-	affinityAssertKeyShape(t, want)
-	if want == affinityFallbackKey(t, path) {
-		t.Fatal("请求头来源没有产生显式信号（与内容兜底同键）")
+	for _, tc := range []struct {
+		canonical string
+		variants  []string
+	}{
+		{"X-Session-ID", []string{"x-session-id", "X-SESSION-ID", "X-Session-Id"}},
+		{"X-Agent-Task-Id", []string{"x-agent-task-id", "X-AGENT-TASK-ID", "X-Agent-Task-ID"}},
+		{"X-Request-Id", []string{"x-request-id", "X-REQUEST-ID", "X-Request-ID"}},
+	} {
+		t.Run(tc.canonical, func(t *testing.T) {
+			want := affinityKeyOf(t, path, map[string]string{tc.canonical: "s1"}, nil)
+			affinityAssertKeyShape(t, want)
+			if want == affinityFallbackKey(t, path) {
+				t.Fatal("请求头来源没有产生显式信号（与内容兜底同键）")
+			}
+			for _, name := range tc.variants {
+				if got := affinityKeyOf(t, path, map[string]string{name: "s1"}, nil); got != want {
+					t.Fatalf("请求头 %s 的会话键与 %s 不同: %s != %s", name, tc.canonical, got, want)
+				}
+			}
+		})
 	}
-	for _, name := range []string{"x-session-id", "X-SESSION-ID", "X-Session-Id"} {
-		if got := affinityKeyOf(t, path, map[string]string{name: "s1"}, nil); got != want {
-			t.Fatalf("请求头 %s 的会话键与 X-Session-ID 不同: %s != %s", name, got, want)
+}
+
+// TestSessionKeyInvalidHeaderValueFallsThroughToNextSource 请求头值无效（含控制字符或过长）时视为不存在，
+// 落到优先级更低的下一来源：clientreq 无效落到 agenttask，agenttask 无效落到 req，req 无效落到请求体来源。
+func TestSessionKeyInvalidHeaderValueFallsThroughToNextSource(t *testing.T) {
+	const path = "/chat/completions"
+	agenttask := affinityKeyOf(t, path, map[string]string{"X-Agent-Task-Id": "id-agent"}, nil)
+	req := affinityKeyOf(t, path, map[string]string{"X-Request-Id": "id-req"}, nil)
+	body := affinityKeyOf(t, path, nil, map[string]any{"session_id": "id-body"})
+	for name, key := range map[string]string{"agenttask": agenttask, "req": req, "body": body} {
+		affinityAssertKeyShape(t, key)
+		if key == affinityFallbackKey(t, path) {
+			t.Fatalf("%s 来源没有产生显式信号（与内容兜底同键）", name)
+		}
+	}
+	for _, invalid := range []string{"bad\x01id", strings.Repeat("a", 257)} {
+		if got := affinityKeyOf(t, path, map[string]string{
+			"X-Client-Request-Id": invalid, "X-Agent-Task-Id": "id-agent",
+		}, nil); got != agenttask {
+			t.Fatalf("clientreq 值 %q 无效时应落到 agenttask: %s != %s", invalid, got, agenttask)
+		}
+		if got := affinityKeyOf(t, path, map[string]string{
+			"X-Agent-Task-Id": invalid, "X-Request-Id": "id-req",
+		}, nil); got != req {
+			t.Fatalf("agenttask 值 %q 无效时应落到 req: %s != %s", invalid, got, req)
+		}
+		if got := affinityKeyOf(t, path, map[string]string{"X-Request-Id": invalid},
+			map[string]any{"session_id": "id-body"}); got != body {
+			t.Fatalf("req 值 %q 无效时应落到请求体 session_id: %s != %s", invalid, got, body)
 		}
 	}
 }
@@ -642,7 +698,7 @@ func TestSessionKeyHeaderSignalWithInvalidJSON(t *testing.T) {
 	headers := map[string]string{"X-Session-ID": "s1"}
 	key := affinityKeyRaw(t, path, headers, "not json")
 	affinityAssertKeyShape(t, key)
-	// 信号只取决于客户端密钥与信号本身：非法 JSON 与合法 JSON 在同一请求头下同键。
+	// 会话键只取决于信号本身：非法 JSON 与合法 JSON 在同一请求头下同键。
 	if got := affinityKeyOf(t, path, headers, nil); got != key {
 		t.Fatalf("非法 JSON 不应影响请求头信号: %s != %s", got, key)
 	}
@@ -705,6 +761,8 @@ func TestSessionKeyExactSignalStrings(t *testing.T) {
 		{"conv-header", map[string]string{"X-Conversation-Id": "id-1"}, nil, "conv:id-1"},
 		{"thread-header", map[string]string{"X-Thread-Id": "id-1"}, nil, "thread:id-1"},
 		{"clientreq", map[string]string{"X-Client-Request-Id": "id-1"}, nil, "clientreq:id-1"},
+		{"agenttask", map[string]string{"X-Agent-Task-Id": "id-1"}, nil, "agenttask:id-1"},
+		{"req", map[string]string{"X-Request-Id": "id-1"}, nil, "req:id-1"},
 		{"body-thread", nil, map[string]any{"thread_id": "id-1"}, "thread:id-1"},
 		{"body-session", nil, map[string]any{"session_id": "id-1"}, "session:id-1"},
 		{"body-task", nil, map[string]any{"task_id": "id-1"}, "task:id-1"},
@@ -724,13 +782,22 @@ func TestSessionKeyExactSignalStrings(t *testing.T) {
 		})
 	}
 
-	// 内容兜底以 content\x00 开头，与任何 前缀:ID 的显式信号不会混淆。
+	// 内容兜底为 "content\x00" + hex(sha256(首条 user 文本))，不含 model，与任何 前缀:ID 的显式信号不会混淆。
 	fallbackBody := affinityBody(t, map[string]any{
 		"model":    "gpt-4.1",
 		"messages": []any{map[string]string{"role": "user", "content": "first question"}},
 	})
 	fallback := sessionSignal(affinityRequest(path, "", "").Header, fallbackBody, path)
-	if !strings.HasPrefix(fallback, "content\x00") {
-		t.Fatalf("内容兜底信号 = %q, want 以 content\\x00 开头", fallback)
+	digest := sha256.Sum256([]byte("first question"))
+	wantFallback := "content\x00" + hex.EncodeToString(digest[:])
+	if fallback != wantFallback {
+		t.Fatalf("内容兜底信号 = %q, want %q", fallback, wantFallback)
+	}
+
+	// 会话键是信号串的 SHA-256 十六进制，不含客户端密钥。
+	key := sessionKey(affinityRequest(path, "client-a", ""), fallbackBody, path)
+	keyDigest := sha256.Sum256([]byte(wantFallback))
+	if want := hex.EncodeToString(keyDigest[:]); key != want {
+		t.Fatalf("sessionKey() = %q, want hex(sha256(signal)) = %q", key, want)
 	}
 }

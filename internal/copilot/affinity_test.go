@@ -137,8 +137,8 @@ func TestSessionKeyClaudeSessionFromMetadata(t *testing.T) {
 	}
 }
 
-// TestSessionKeyFallbackUsesFirstUserMessageAndModel 没有会话 ID 时，兜底信号为 model 与首条 user 消息的文本。
-func TestSessionKeyFallbackUsesFirstUserMessageAndModel(t *testing.T) {
+// TestSessionKeyFallbackUsesFirstUserMessage 没有会话 ID 时，兜底信号为第一条 user 消息的文本（不含 model）。
+func TestSessionKeyFallbackUsesFirstUserMessage(t *testing.T) {
 	chatKey := func(model string, messages []any) string {
 		body := affinityBody(t, map[string]any{"model": model, "messages": messages})
 		return sessionKey(affinityRequest("/v1/chat/completions", "client-a", ""), body, "/chat/completions")
@@ -162,8 +162,8 @@ func TestSessionKeyFallbackUsesFirstUserMessageAndModel(t *testing.T) {
 	if got := chatKey("gpt-4.1", []any{map[string]any{"role": "user", "content": parts}}); got != first {
 		t.Fatal("content 数组应拼接文本片段，并忽略非文本片段")
 	}
-	if chatKey("gpt-4.1-mini", []any{user("first question")}) == first {
-		t.Fatal("不同 model 得到了相同的兜底键")
+	if got := chatKey("gpt-4.1-mini", []any{user("first question")}); got != first {
+		t.Fatal("兜底信号不含 model：不同 model 的同一首条 user 文本应得到相同的会话键")
 	}
 	if chatKey("gpt-4.1", []any{user("another question")}) == first {
 		t.Fatal("不同首条 user 消息得到了相同的兜底键")
@@ -238,27 +238,26 @@ func TestSessionKeySignalsApplyToAllPaths(t *testing.T) {
 	}
 }
 
-// TestSessionKeyClientKeyIsolation 会话键包含客户端密钥：Bearer 优先于 X-Api-Key，不同密钥互不共享，
-// 未配置密钥时仍然稳定地产生键；键中不包含密钥或正文原文。
-func TestSessionKeyClientKeyIsolation(t *testing.T) {
+// TestSessionKeyIgnoresClientCredentials 会话键不含客户端密钥：同一会话信号下，不同的 Authorization /
+// X-Api-Key（或都没有）得到相同的键；键中不包含密钥或正文原文。
+func TestSessionKeyIgnoresClientCredentials(t *testing.T) {
 	body := []byte(affinityChatBody(t, "first question"))
 	key := func(bearer, xAPIKey string) string {
 		return sessionKey(affinityRequest("/v1/chat/completions", bearer, xAPIKey), body, "/chat/completions")
 	}
 	keyA := key("key-a", "")
 	affinityAssertKeyShape(t, keyA)
-	if key("key-b", "") == keyA {
-		t.Fatal("不同客户端密钥共享了同一个会话键")
+	if key("key-b", "") != keyA {
+		t.Fatal("不同客户端密钥不应改变会话键")
 	}
 	if key("key-a", "key-b") != keyA {
-		t.Fatal("Authorization: Bearer 应优先于 X-Api-Key")
+		t.Fatal("Authorization 与 X-Api-Key 同时存在时不应改变会话键")
 	}
 	if key("", "key-a") != keyA {
-		t.Fatal("只带 X-Api-Key 且密钥相同时应得到相同的会话键")
+		t.Fatal("只带 X-Api-Key 不应改变会话键")
 	}
-	anonymous := key("", "")
-	if anonymous == "" || anonymous != key("", "") || anonymous == keyA {
-		t.Fatalf("未配置客户端密钥时应得到稳定且独立的会话键，实际 = %q", anonymous)
+	if key("", "") != keyA {
+		t.Fatal("没有客户端密钥不应改变会话键")
 	}
 	for _, secret := range []string{"key-a", "first question"} {
 		if strings.Contains(keyA, secret) {
@@ -439,6 +438,60 @@ func TestSessionAffinityRebindsWhenBoundAccountUnavailable(t *testing.T) {
 				t.Fatalf("alice 被服务 %d 次, want 只有准备请求的 1 次", aliceServed)
 			}
 		})
+	}
+}
+
+// TestSessionAffinityNoSignalReturns500 开启亲和时，生成请求无法得到会话键（没有显式会话 ID 也没有 user 消息，
+// 含请求体不是合法 JSON 对象的情况）返回 500，消息为“无法计算模型缓存 key”，不选账号、不访问上游。
+func TestSessionAffinityNoSignalReturns500(t *testing.T) {
+	up := newMgmtUpstream(t)
+	p, _ := mgmtNewPool(t, up, DefaultSessionAffinityTTL, "alice", "bob")
+	for _, tc := range []struct{ name, body string }{
+		{"no-user-message", `{"model":"gpt-4.1","messages":[]}`},
+		{"model-only", `{"model":"gpt-4.1"}`},
+		{"invalid-json", `not json`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := poolRequest(p, "POST", "/v1/chat/completions", tc.body)
+			if w.Code != http.StatusInternalServerError {
+				t.Fatalf("无会话信号请求 status=%d body=%s, want 500", w.Code, w.Body.String())
+			}
+			if msg := mgmtErrorMessage(t, w); msg != "无法计算模型缓存 key" {
+				t.Fatalf("错误消息 = %q, want 无法计算模型缓存 key", msg)
+			}
+			if !strings.Contains(w.Body.String(), `"type":"copilot_proxy_error"`) {
+				t.Fatalf("500 应沿用 writeError 的 JSON 格式: body=%s", w.Body.String())
+			}
+		})
+	}
+	if got := up.pool.generationOrder(); len(got) != 0 {
+		t.Fatalf("无会话信号的请求到达了上游生成接口: %v", got)
+	}
+	if got := up.pool.sessionCount("oauth-alice") + up.pool.sessionCount("oauth-bob"); got != 0 {
+		t.Fatalf("无会话信号的请求交换了 session %d 次, want 0（不选账号）", got)
+	}
+}
+
+// TestSessionAffinityDisabledNoSignalIsServed 关闭亲和（TTL 为 0）时，无会话信号的生成请求照常处理，不返回 500。
+func TestSessionAffinityDisabledNoSignalIsServed(t *testing.T) {
+	up := newMgmtUpstream(t)
+	p, _ := mgmtNewPool(t, up, 0, "alice", "bob")
+	if w := poolRequest(p, "POST", "/v1/chat/completions", `{"model":"gpt-4.1","messages":[]}`); w.Code != http.StatusOK {
+		t.Fatalf("关闭亲和时无会话信号请求 status=%d body=%s, want 200", w.Code, w.Body.String())
+	}
+	assertGenerationOrder(t, up.pool, mgmtOrder("alice")...)
+}
+
+// TestSessionAffinityNoSignal500ReleasesConcurrencySlot 无会话信号返回 500 的路径也必须释放并发名额：
+// 名额为 1 的池在 500 之后仍能处理带会话信号的生成请求（若名额未释放，第二次请求会得到 503）。
+func TestSessionAffinityNoSignal500ReleasesConcurrencySlot(t *testing.T) {
+	up := newPoolUpstream(t)
+	p := newLimitedPoolUsers(t, up.client(), 1, "a")
+	if w := poolRequest(p, "POST", "/v1/chat/completions", `{"model":"gpt-4.1","messages":[]}`); w.Code != http.StatusInternalServerError {
+		t.Fatalf("无会话信号请求 status=%d body=%s, want 500", w.Code, w.Body.String())
+	}
+	if w := poolRequest(p, "POST", "/v1/chat/completions", affinityChatBody(t, "after the 500")); w.Code != http.StatusOK {
+		t.Fatalf("500 之后的带信号请求 status=%d body=%s, want 200（并发名额应已释放）", w.Code, w.Body.String())
 	}
 }
 

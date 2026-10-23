@@ -45,6 +45,7 @@ OpenAI 客户端 base URL：`http://127.0.0.1:8080/v1`；Anthropic 客户端 bas
 - 无工具时去掉 `tool_choice`：Copilot 的 `/responses` 对设置了 `tool_choice` 却没有声明工具的请求直接返回 400（如 Codex 压缩上下文的请求会去掉 `tools` 但保留 `tool_choice`）。因此转发到上游 `/responses` 的请求（含 Auto），顶层 `tools` 缺失、为 `null` 或空数组时去掉顶层 `tool_choice`；改写时重新编码 JSON（键顺序可能变化，数字与 `<`、`>`、`&` 保持原文）。`tools` 为非空数组或其他类型、请求体不是合法 JSON 对象时原样转发；Chat Completions 与 `/v1/messages` 不做此处理。代码见 `request.go` 的 `withoutLoneToolChoice`。
 - 不转发客户端认证信息、Cookie 和逐跳头；拒绝重定向及不在 GitHub/Copilot 白名单内的 session API 地址。
 - 生成请求体校验在 session 获取之后，故所有账号 session 都失败时，无效请求体收到 session 错误而非 400。
+- 开启会话亲和时，生成请求无法得到会话键（没有显式会话 ID，也没有 user 消息，含请求体不是合法 JSON 对象的情况）返回 500，响应体为 `{"error":{"message":"无法计算模型缓存 key","type":"copilot_proxy_error"}}`，不选账号、不访问上游。规则见 `session-affinity.md`。
 
 ## 上游请求头与消息解析
 

@@ -37,6 +37,8 @@ var headerSessionSources = []sessionSource{
 	{"conv:", []string{"X-Conversation-Id"}},
 	{"thread:", []string{"X-Thread-Id"}},
 	{"clientreq:", []string{"X-Client-Request-Id"}},
+	{"agenttask:", []string{"X-Agent-Task-Id"}},
+	{"req:", []string{"X-Request-Id"}},
 }
 
 // bodySessionSources 是请求体中的来源，排在所有请求头来源之后，按优先级排列。
@@ -63,24 +65,15 @@ var bodySessionSources = []sessionSource{
 	}},
 }
 
-// sessionKey 计算请求的会话键，用于把同一会话固定到同一账号。键由客户端密钥与会话信号的哈希组成，
-// 不保留原始密钥或正文。没有任何会话信号时返回空字符串，表示不使用亲和。
+// sessionKey 计算请求的会话键，用于把同一会话固定到同一账号。键为会话信号的哈希，不含客户端密钥，
+// 也不保留正文。没有任何会话信号时返回空字符串，由调用方决定如何处理。
 func sessionKey(r *http.Request, body []byte, upstreamPath string) string {
 	signal := sessionSignal(r.Header, body, upstreamPath)
 	if signal == "" {
 		return ""
 	}
-	raw, _ := json.Marshal([2]string{clientKey(r), signal})
-	sum := sha256.Sum256(raw)
+	sum := sha256.Sum256([]byte(signal))
 	return hex.EncodeToString(sum[:])
-}
-
-// clientKey 返回客户端密钥：Authorization: Bearer 优先，否则使用 X-Api-Key；两者都没有时为空字符串。
-func clientKey(r *http.Request) string {
-	if key, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok && key != "" {
-		return key
-	}
-	return r.Header.Get("X-Api-Key")
 }
 
 // sessionSignal 按优先级返回会话信号，与上游路径无关的显式会话 ID 优先：
@@ -221,18 +214,15 @@ func (f *requestFields) str(path string) string {
 	return value
 }
 
-// contentSignal 以第一条 user 消息的文本作为兜底信号，并带上 model 以区分模型；没有 user 消息时返回空字符串。
-// 文本先取摘要再参与编码，避免把整段正文保留在内存中。
+// contentSignal 以第一条 user 消息的文本作为兜底信号，不区分模型；没有 user 消息时返回空字符串。
+// 文本先取摘要，避免把整段正文保留在内存中。
 func contentSignal(fields map[string]json.RawMessage, upstreamPath string) string {
 	text, ok := firstUserText(fields, upstreamPath)
 	if !ok {
 		return ""
 	}
-	var model string
-	_ = json.Unmarshal(fields["model"], &model)
 	digest := sha256.Sum256([]byte(text))
-	raw, _ := json.Marshal([2]string{model, hex.EncodeToString(digest[:])})
-	return "content\x00" + string(raw)
+	return "content\x00" + hex.EncodeToString(digest[:])
 }
 
 // firstUserText 返回第一条 user 消息的文本。Responses 的 input 可以是字符串（即一条 user 消息），

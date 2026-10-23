@@ -2,7 +2,8 @@ package copilot
 
 // 本文件覆盖会话亲和的门（Pool.gate，见 affinity_gate.go）在 Pool 层的并发行为：
 // 同一会话键的请求在选账号前排队，先到的请求完成 bind 后门即释放（不持有到响应结束），后到的请求才轮到；
-// 不同会话键、亲和关闭或键为空时不加门，请求互不阻塞；等待门时客户端取消不影响账号状态。
+// 不同会话键或亲和关闭时不加门，请求互不阻塞；等待门时客户端取消不影响账号状态。
+// 开启亲和但没有会话信号的生成请求在选账号前直接返回 500，不再进入会话门（见 TestSessionAffinityNoSignalReturns500）。
 // 同步只用 channel 与 awaitGateWaiter 轮询门的内部状态（有超时保护）；不使用固定时长的 sleep。
 
 import (
@@ -261,28 +262,19 @@ func TestGateClientCancelWhileWaitingLeavesAccountsAlone(t *testing.T) {
 	)
 }
 
-// TestGateSkippedWhenAffinityDisabledOrKeyEmpty 亲和关闭或键为空时不加门：先到的请求卡住时，同一请求体的第二个请求
-// 不等待，直接由其他账号（SWRR 轮到的 bob）完成。
-func TestGateSkippedWhenAffinityDisabledOrKeyEmpty(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		ttl  time.Duration
-		body string
-	}{
-		{name: "affinity-disabled", ttl: 0, body: gateClaudeBody(t, affinitySession, "first question")},
-		{name: "empty-key", ttl: DefaultSessionAffinityTTL, body: `{"model":"gpt-4.1","messages":[]}`},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			up := newMgmtUpstream(t)
-			hold := up.holdSessions("oauth-alice")
-			p, _ := affinityLogPool(t, up, slog.LevelInfo, tc.ttl)
+// TestGateSkippedWhenAffinityDisabled 亲和关闭时不加门：先到的请求卡住时，同一请求体的第二个请求
+// 不等待，直接由其他账号（SWRR 轮到的 bob）完成。开启亲和但键为空的请求在选账号前直接返回 500
+// （见 TestSessionAffinityNoSignalReturns500），不会再进入会话门。
+func TestGateSkippedWhenAffinityDisabled(t *testing.T) {
+	up := newMgmtUpstream(t)
+	hold := up.holdSessions("oauth-alice")
+	p, _ := affinityLogPool(t, up, slog.LevelInfo, 0)
+	body := gateClaudeBody(t, affinitySession, "first question")
 
-			stuck := gateSend(context.Background(), p, tc.body)
-			gateAwaitHeld(t, hold)
-			gateExpectServed(t, gateWait(t, gateSend(context.Background(), p, tc.body)), "oauth-bob")
+	stuck := gateSend(context.Background(), p, body)
+	gateAwaitHeld(t, hold)
+	gateExpectServed(t, gateWait(t, gateSend(context.Background(), p, body)), "oauth-bob")
 
-			hold.free()
-			gateExpectServed(t, gateWait(t, stuck), "oauth-alice")
-		})
-	}
+	hold.free()
+	gateExpectServed(t, gateWait(t, stuck), "oauth-alice")
 }

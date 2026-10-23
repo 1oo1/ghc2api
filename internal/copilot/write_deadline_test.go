@@ -140,10 +140,12 @@ func (f *writeDeadlineFront) connCount() int {
 // /healthz 的响应写不出去，连接被关闭。若将来 net/http 不再清除截止时间，本测试应失败。
 func TestWriteDeadlineKeepAliveSequence(t *testing.T) {
 	shortenWriteTimeout(t)
+	// pool 入口开启会话亲和，生成请求须带会话信号，否则直接返回 500（无法计算模型缓存 key）。
+	body := affinityChatBody(t, "write deadline keep-alive")
 	for _, tc := range writeDeadlineCases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newWriteDeadlineFront(t, tc.entry, tc.contentType)
-			if status, _ := f.do(t, http.MethodPost, "/v1/chat/completions", poolChatBody); status != http.StatusOK {
+			if status, _ := f.do(t, http.MethodPost, "/v1/chat/completions", body); status != http.StatusOK {
 				t.Fatalf("第一个生成请求 status = %d, want 200", status)
 			}
 			time.Sleep(2 * generationWriteTimeout)
@@ -151,7 +153,7 @@ func TestWriteDeadlineKeepAliveSequence(t *testing.T) {
 			if status, reused := f.do(t, http.MethodGet, "/healthz", ""); status != http.StatusOK || !reused {
 				t.Fatalf("/healthz status = %d, 复用连接 = %v, want 200 且复用连接", status, reused)
 			}
-			if status, reused := f.do(t, http.MethodPost, "/v1/chat/completions", poolChatBody); status != http.StatusOK || !reused {
+			if status, reused := f.do(t, http.MethodPost, "/v1/chat/completions", body); status != http.StatusOK || !reused {
 				t.Fatalf("生成请求 status = %d, 复用连接 = %v, want 200 且复用连接", status, reused)
 			}
 			if n := f.connCount(); n != 1 {

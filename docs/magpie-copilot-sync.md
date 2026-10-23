@@ -149,11 +149,12 @@ git -C .local/cpa grep -n -i -E \
 | cpa 行为 | 本项目 |
 | --- | --- |
 | 显式会话 ID 的来源、顺序与前缀（`claude:`、`codex:`、`header:`、`affinity:`、`slot:`、`pck:` 等） | 同步，前缀与 cpa 一致 |
+| （cpa 无此来源） | 本项目扩展：通用请求头末尾追加 `X-Agent-Task-Id` → `agenttask:`、`X-Request-Id` → `req:`，同步 cpa 时保留 |
 | `NormalizeExplicitID`：拒绝控制字符，裁剪空白，限 256 字节 | 同步 |
 | 父会话、子代理、fork 识别与绑定继承 | 不同步。本项目绑定表是扁平的；Codex 取 `Session-Id` 优先于 `Thread-Id`，Claude Code 子代理与主会话共用会话 ID，因此子代理自然落到主会话账号 |
 | Gemini `cachedContent`、请求体外层 `request` 包装 | 不同步，本项目不接收 Gemini 协议 |
-| `execution_session_id`、LCP 前缀匹配、`derived` 会话指纹 | 不同步，保留本项目的「model + 首条 user 消息」兜底 |
-| 绑定键含 provider 与 model | 不同步，键含客户端密钥，不含 model |
+| `execution_session_id`、LCP 前缀匹配、`derived` 会话指纹 | 不同步，保留本项目的「首条 user 消息」兜底 |
+| 绑定键含 provider 与 model | 不同步，键只由会话信号决定，不含客户端密钥与 model |
 | gjson 宽松解析：数字等非字符串字段转成字符串；未闭合或带尾随内容的 `metadata.user_id` JSON 仍可取出 `session_id`；重复键取第一个 | `encoding/json` 严格解析：只接受 JSON 字符串；畸形 `user_id` JSON 不识别为 Claude 会话（落到 `user:` 或兜底）；重复键取最后一个 |
 
 cpa 新增或调整会话来源（请求头、请求体字段、优先级、规范化）时，先在 `affinity_key_test.go`

@@ -16,6 +16,9 @@ import (
 	"time"
 )
 
+// concurrencyChatBody 是带 user 消息的生成请求体：池开启会话亲和，带信号的请求才不会因缺少会话键被拒（500）。
+const concurrencyChatBody = `{"model":"gpt-4.1","messages":[{"role":"user","content":"concurrency"}]}`
+
 // heldUpstream 模拟长时间占用名额的生成请求：生成请求到达后先写出一个 SSE 数据块并刷新，然后阻塞直到 releaseAll 被调用，
 // 最后写出 [DONE] 结束流。其余路径交给 poolUpstream 处理。
 type heldUpstream struct {
@@ -128,12 +131,12 @@ func TestPoolRejectsGenerationWhenConcurrencyIsFull(t *testing.T) {
 	p := newLimitedPool(t, up.client, 1)
 
 	first := make(chan *httptest.ResponseRecorder, 1)
-	go func() { first <- poolRequest(p, http.MethodPost, "/v1/chat/completions", poolChatBody) }()
+	go func() { first <- poolRequest(p, http.MethodPost, "/v1/chat/completions", concurrencyChatBody) }()
 	up.awaitArrival(t)
 	requestsBefore := p.accounts[0].requests.Load()
 	upstreamBefore := up.generationCount()
 
-	spy := &readSpy{body: strings.NewReader(poolChatBody)}
+	spy := &readSpy{body: strings.NewReader(concurrencyChatBody)}
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", spy)
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -175,7 +178,7 @@ func TestPoolRejectsGenerationWhenConcurrencyIsFull(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("第一个流式请求在释放后仍未结束")
 	}
-	if w := poolRequest(p, http.MethodPost, "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK {
+	if w := poolRequest(p, http.MethodPost, "/v1/chat/completions", concurrencyChatBody); w.Code != http.StatusOK {
 		t.Fatalf("名额释放后的生成请求 status = %d, want 200; body=%s", w.Code, w.Body.String())
 	}
 }
@@ -188,7 +191,7 @@ func TestPoolZeroConcurrencyLimitIsUnlimited(t *testing.T) {
 	const concurrent = 3
 	results := make(chan *httptest.ResponseRecorder, concurrent)
 	for range concurrent {
-		go func() { results <- poolRequest(p, http.MethodPost, "/v1/chat/completions", poolChatBody) }()
+		go func() { results <- poolRequest(p, http.MethodPost, "/v1/chat/completions", concurrencyChatBody) }()
 	}
 	for range concurrent {
 		up.awaitArrival(t)
@@ -215,7 +218,7 @@ func TestPoolReleasesConcurrencySlotWhenAllSessionsFail(t *testing.T) {
 	}
 	p := newLimitedPoolUsers(t, up.client(), 1, "a", "b")
 	for i := range 2 {
-		w := poolRequest(p, http.MethodPost, "/v1/chat/completions", poolChatBody)
+		w := poolRequest(p, http.MethodPost, "/v1/chat/completions", concurrencyChatBody)
 		if w.Code == http.StatusOK {
 			t.Fatalf("第 %d 次请求在 session 全部失败时返回 200", i+1)
 		}
@@ -236,7 +239,7 @@ func TestPoolReleasesConcurrencySlotWhenClientDisconnects(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(poolChatBody)).WithContext(ctx)
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(concurrencyChatBody)).WithContext(ctx)
 	r.Header.Set("Content-Type", "application/json")
 	done := make(chan struct{})
 	go func() {
@@ -251,7 +254,7 @@ func TestPoolReleasesConcurrencySlotWhenClientDisconnects(t *testing.T) {
 		t.Fatal("客户端断开后请求仍未结束")
 	}
 	up.releaseAll()
-	if w := poolRequest(p, http.MethodPost, "/v1/chat/completions", poolChatBody); w.Code != http.StatusOK {
+	if w := poolRequest(p, http.MethodPost, "/v1/chat/completions", concurrencyChatBody); w.Code != http.StatusOK {
 		t.Fatalf("客户端断开后的生成请求 status = %d, want 200; body=%s", w.Code, w.Body.String())
 	}
 }
@@ -285,7 +288,7 @@ func (e *endlessUpstream) serve(w http.ResponseWriter, r *http.Request) {
 // postChatHeadersOnly 通过真实 TCP 连接发送一个生成请求，只读取响应头，不读取响应体；调用方负责关闭响应体。
 func postChatHeadersOnly(t *testing.T, baseURL string) *http.Response {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/chat/completions", strings.NewReader(poolChatBody))
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/chat/completions", strings.NewReader(concurrencyChatBody))
 	if err != nil {
 		t.Fatal(err)
 	}

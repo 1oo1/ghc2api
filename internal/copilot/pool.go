@@ -291,7 +291,13 @@ func (p *Pool) dispatch(w http.ResponseWriter, r *http.Request) {
 			}
 			defer p.releaseGeneration()
 		}
-		p.forward(w, r, p.affinityKey(r, entry.upstream))
+		key, ok := p.affinityKey(r, entry.upstream)
+		if !ok {
+			p.log(r.Context(), slog.LevelWarn, "无法计算会话键")
+			writeError(w, http.StatusInternalServerError, "无法计算模型缓存 key")
+			return
+		}
+		p.forward(w, r, key)
 	}
 }
 
@@ -326,19 +332,21 @@ func (p *Pool) routeOf(r *http.Request) routeEntry {
 	return entry
 }
 
-// affinityKey 计算生成请求的会话键。未开启亲和或非生成接口时不读取请求体。
+// affinityKey 计算生成请求的会话键。未开启亲和或非生成接口时不读取请求体，返回空键。
 // 请求体最多读取 maxRequestBody 字节，读出的部分与剩余内容拼接后原样放回 r.Body，下游仍能读到完整请求体；
-// 超过上限时不计算会话键，下游会照常返回 413。
-func (p *Pool) affinityKey(r *http.Request, upstream string) string {
+// 读取失败或超过上限时不计算会话键，返回空键，下游会照常返回错误（如 413）。
+// 请求体读取成功但没有任何会话信号时 ok 为 false，调用方应拒绝该请求。
+func (p *Pool) affinityKey(r *http.Request, upstream string) (key string, ok bool) {
 	if upstream == "" || p.affinity == nil || r.Body == nil {
-		return ""
+		return "", true
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody+1))
 	r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), r.Body))
 	if err != nil || len(body) > maxRequestBody {
-		return ""
+		return "", true
 	}
-	return sessionKey(r, body, upstream)
+	key = sessionKey(r, body, upstream)
+	return key, key != ""
 }
 
 // forward 处理需要 session 的请求。先由 pickSession 选出账号、取得 session 并绑定会话键，再把请求交给该账号处理。

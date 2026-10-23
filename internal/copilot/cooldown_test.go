@@ -112,7 +112,8 @@ func cooldownSetGeneration(u *mgmtUpstream, account string, status int) {
 	u.pool.failGeneration(account, poolFailure{status, cooldownBody(status)})
 }
 
-// cooldownChat 通过 HTTP 入口发送一次 chat 请求（不带会话信号，不参与会话亲和）。
+// cooldownChat 通过 HTTP 入口发送一次不带任何会话信号的 chat 请求。开启会话亲和的池会拒绝这类请求
+// （返回 500「无法计算模型缓存 key」），因此本助手只用于关闭亲和的池。
 func cooldownChat(p *Pool) *httptest.ResponseRecorder {
 	return poolRequest(p, "POST", "/v1/chat/completions", poolChatBody)
 }
