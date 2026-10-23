@@ -2,12 +2,14 @@ package copilot
 
 // 本文件覆盖每账号会话绑定上限（PoolConfig.SessionAffinityMaxPerAccount）：affinityTable.activeCounts 统计仍有效的绑定数，
 // Pool.choose 在新会话或故障切换时排除已满的账号。规则：命中可用绑定时不受上限限制；冷却账号不参与选择，上限也不改变这一点；
-// 所有账号都已满时忽略上限照常选择并绑定；键为空或关闭亲和时上限无效；上限 0 表示不限制。
+// 上限只在最优档内生效（优先级最高、其次有 Credits 的一档）：最优档内全部已满时忽略上限，在整个最优档内选择，绝不降到低档；
+// 所有账号都已满时同样忽略上限照常选择并绑定；键为空或关闭亲和时上限无效；上限 0 表示不限制。
 // 期望序列按 pool_swrr_test.go 中的 SWRR 手算：本文件的账号权重都为 1，因此轮询顺序即文件名顺序的循环。
 // 测试只通过 choose、activeCounts、HTTP 入口与 affinity.lookup 观察结果。账号都没有额度数据（权重均为 1），
 // HTTP 测试只发送成功的请求，因此不会触发异步额度刷新。
 
 import (
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -117,12 +119,37 @@ func TestCapIgnoresExpiredBindings(t *testing.T) {
 	}
 }
 
-// TestCapDivertsNewSessionToLowerPriority 高优先级账号已满时，新会话分流到低优先级账号，而不是回退到已满的高优先级账号。
-func TestCapDivertsNewSessionToLowerPriority(t *testing.T) {
+// TestCapStaysInTopPriorityTier 上限只在最优档内生效，绝不把新会话降到低档：高优先级的 alice 已满、低优先级的 bob 空闲，
+// 最优档内全部已满时忽略上限，新会话仍选 alice。
+func TestCapStaysInTopPriorityTier(t *testing.T) {
 	p := newCapPool(t, 1, priorityAccount("alice", 10), priorityAccount("bob", 0))
 	p.affinity.bind("old", "alice", time.Now())
-	if got := userOf(p.choose("new", nil)); got != "bob" {
-		t.Fatalf("新会话 choose = %s, want bob（高优先级的 alice 已满）", got)
+	if got := userOf(p.choose("new", nil)); got != "alice" {
+		t.Fatalf("新会话 choose = %s, want alice（最优档内全部已满，忽略上限，不降到低优先级的 bob）", got)
+	}
+}
+
+// TestCapStaysInCreditsTier 档位同样包含“有 Credits”：alice 有 Credits 且已满，bob 没有 Credits（只剩 Additional Budget）且空闲，
+// 两者优先级相同。新会话仍选有 Credits 的 alice，不降到无 Credits 档。
+func TestCapStaysInCreditsTier(t *testing.T) {
+	p := newCapPool(t, 1, priorityAccount("alice", 0), priorityAccount("bob", 0))
+	setQuota(t, p, "alice", quotaOf(creditsBucket(0.5)))
+	setQuota(t, p, "bob", quotaOf(creditsBucket(0), budgetBucket(0.9)))
+	p.affinity.bind("old", "alice", time.Now())
+	if got := userOf(p.choose("new", nil)); got != "alice" {
+		t.Fatalf("新会话 choose = %s, want alice（有 Credits 档已满，忽略上限，不降到无 Credits 档的 bob）", got)
+	}
+}
+
+// TestCapPicksOnlyAmongNonFullAccountsInTopTier 最优档内部分账号已满时，只在档内未满的账号中轮询，低档的空闲账号不参与。
+// alice、bob、carol 同为最高优先级，alice 已满；dave 为低优先级且空闲。不同键的新会话依次为 bob、carol、bob、carol（权重都为 1）。
+func TestCapPicksOnlyAmongNonFullAccountsInTopTier(t *testing.T) {
+	p := newCapPool(t, 1, priorityAccount("alice", 10), priorityAccount("bob", 10), priorityAccount("carol", 10), priorityAccount("dave", 0))
+	p.affinity.bind("old", "alice", time.Now())
+	for i, want := range []string{"bob", "carol", "bob", "carol"} {
+		if got := userOf(p.choose(fmt.Sprintf("new-%d", i), nil)); got != want {
+			t.Fatalf("第 %d 个新会话 choose = %s, want %s（只在最优档内未满的账号中选择）", i+1, got, want)
+		}
 	}
 }
 

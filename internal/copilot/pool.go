@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"maps"
 	"net/http"
 	"slices"
 	"strconv"
@@ -545,7 +544,7 @@ func (p *Pool) services() []*Service {
 }
 
 // choose 选择处理本次请求的账号。键非空且开启亲和时：会话已绑定且该账号仍可用（未禁用、未冷却、未耗尽、本请求未尝试过）则直接使用它，且不推进轮询；
-// 否则为无可用绑定的会话（新会话或故障切换）选择：先取最优档，排除有效绑定数已达上限的账号后再在档内轮询，见下方说明。
+// 否则为无可用绑定的会话（新会话或故障切换）选择：先取最优档，在档内排除有效绑定数已达上限的账号后轮询；最优档全满则忽略上限，不降档。
 // 键为空或未开启亲和时按 pickLocked 选择。没有候选（包括全部冷却）时返回 nil。
 func (p *Pool) choose(key string, tried map[*poolAccount]bool) *poolAccount {
 	p.mu.Lock()
@@ -560,15 +559,8 @@ func (p *Pool) choose(key string, tried map[*poolAccount]bool) *poolAccount {
 			return account
 		}
 	}
-	// 排除已满账号后仍有候选时采用排除后的结果；没有候选（例如其余账号都已禁用、冷却或耗尽）时忽略上限，仍按原候选轮询，
-	// 因此上限不会让会话落到没有候选的情况，也不会把会话推向冷却中的账号（冷却账号不在候选内）。上限为 0 时 overCapLocked 返回 nil，不做排除。
-	group := p.topGroupLocked(now, tried)
-	if skip := p.overCapLocked(now, tried); skip != nil {
-		if capped := p.topGroupLocked(now, skip); len(capped) > 0 {
-			group = capped
-		}
-	}
-	return swrrPickLocked(group)
+	// 上限只在最优档内生效：先取最优档，再排除其中已满的账号；最优档全满时忽略上限，仍对整个最优档轮询，绝不因上限降档。
+	return swrrPickLocked(p.withinCapLocked(p.topGroupLocked(now, tried), now))
 }
 
 // selectKey 是账号参与选择时的排序信息：priority 与 weight.hasCredits 决定档位（见 tierBefore）；
@@ -657,22 +649,25 @@ func (p *Pool) pickLocked(now time.Time, tried map[*poolAccount]bool) *poolAccou
 	return swrrPickLocked(p.topGroupLocked(now, tried))
 }
 
-// overCapLocked 返回不应接收无可用绑定会话的账号集合：本请求已尝试过的账号，以及有效绑定数已达 SessionAffinityMaxPerAccount 的账号。
-// 上限 <=0 或未开启亲和时返回 nil，表示不做排除。有效绑定数来自 affinityTable.activeCounts。调用方须持有 p.mu（锁顺序为先 p.mu 后 affinity.mu）。
-func (p *Pool) overCapLocked(now time.Time, tried map[*poolAccount]bool) map[*poolAccount]bool {
+// withinCapLocked 从最优档 group 中排除有效绑定数已达 SessionAffinityMaxPerAccount 的账号并返回剩余部分；
+// 剩余为空（全满）时返回原 group，即忽略上限。上限 <=0 或未开启亲和时不过滤。有效绑定数来自 affinityTable.activeCounts。
+// 过滤必须在 swrrPickLocked 之前完成（SWRR 会修改参与组的 swrrCurrent）。调用方须持有 p.mu（锁顺序为先 p.mu 后 affinity.mu）。
+func (p *Pool) withinCapLocked(group []candidate, now time.Time) []candidate {
 	limit := p.config.SessionAffinityMaxPerAccount
-	if limit <= 0 || p.affinity == nil {
-		return nil
+	if limit <= 0 || p.affinity == nil || len(group) == 0 {
+		return group
 	}
 	counts := p.affinity.activeCounts(now)
-	skip := make(map[*poolAccount]bool, len(tried))
-	maps.Copy(skip, tried)
-	for _, a := range p.accounts {
-		if counts[a.id] >= limit {
-			skip[a] = true
+	var free []candidate
+	for _, c := range group {
+		if counts[c.account.id] < limit {
+			free = append(free, c)
 		}
 	}
-	return skip
+	if len(free) == 0 {
+		return group
+	}
+	return free
 }
 
 // findLocked 按 ID 查找账号，调用方须持有 p.mu。
