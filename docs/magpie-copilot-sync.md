@@ -7,7 +7,7 @@
 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)（下称 cpa）的会话 ID 提取写法，
 两者的基线分别记录。
 
-当前实现对照的上游基线：`ea6be1592706ea4a0dd6cd526acec0b5d1fb967e`。
+当前实现对照的上游基线：`466cafa0cf681de30ce4cc68616db55f5de10cd9`。
 完成后续同步并通过验证时，应将本文和 README 中记录的基线更新为实际核对的上游提交。
 
 ## 获取或更新上游
@@ -48,7 +48,7 @@ git -C .local/magpie log -1 --format='%H %cs %s'
 从上次同步记录的提交开始查看相关差异。首次核对可用本文开头的基线：
 
 ```sh
-BASE=ea6be1592706ea4a0dd6cd526acec0b5d1fb967e
+BASE=466cafa0cf681de30ce4cc68616db55f5de10cd9
 git -C .local/magpie diff --name-status "${BASE}..HEAD"
 git -C .local/magpie diff "${BASE}..HEAD" -- \
   internal/provider/account.go \
@@ -99,7 +99,7 @@ provider 代理范围；不要整文件复制，也不要为追求代码结构�
 ## 同步 CLIProxyAPI 会话亲和键
 
 本项目会话键（`sessionKey`，见 `session-affinity.md`）的会话 ID 来源与优先级参照 cpa。cpa 的
-基线：`0db19025571684b198a2ef508f99b41c717337e8`（2026-10-21）。
+基线：`307803510bce87f986fcf7b1a84190f105c7b4aa`（2026-10-25）。
 
 首次获取与更新方式同 magpie，克隆到 `.local/cpa`：
 
@@ -116,7 +116,7 @@ git -C .local/cpa log -1 --format='%H %cs %s'
 核对差异：
 
 ```sh
-CPA_BASE=0db19025571684b198a2ef508f99b41c717337e8
+CPA_BASE=307803510bce87f986fcf7b1a84190f105c7b4aa
 git -C .local/cpa diff "${CPA_BASE}..HEAD" -- \
   sdk/cliproxy/session/info.go \
   sdk/cliproxy/session/identity.go \
