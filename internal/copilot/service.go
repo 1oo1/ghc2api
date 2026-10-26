@@ -347,6 +347,7 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 	xInitiator := initiator(body)
 	vision := hasVision(body)
 	s.log(r.Context(), slog.LevelInfo, "开始处理生成请求", "model", model, "upstream_path", path, "request_bytes", len(body))
+	staleRetried := false // 失效输出项重试每个请求最多一次，见 retryStaleItems
 	for attempt := 0; attempt < 3; attempt++ {
 		current, err := s.getSession(r.Context())
 		if err != nil {
@@ -391,26 +392,45 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 			return
 		}
 		s.acceptTerms(r.Context(), current, model)
-		req, err := s.apiRequest(r.Context(), current, http.MethodPost, path, outBody)
+		// send 向上游发送一次生成请求；同一账号、session 与模型的重发（见 retryStaleItems）只替换请求体。
+		send := func(payload []byte) (*http.Response, error) {
+			req, err := s.apiRequest(r.Context(), current, http.MethodPost, path, payload)
+			if err != nil {
+				return nil, err
+			}
+			req.URL.RawQuery = r.URL.RawQuery
+			copyRequestHeaders(req.Header, r.Header)
+			current.setHeaders(req.Header)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Openai-Intent", "conversation-panel")
+			req.Header.Set("X-Initiator", xInitiator)
+			if vision {
+				req.Header.Set("Copilot-Vision-Request", "true")
+			}
+			if pick.Token != "" {
+				req.Header.Set("Copilot-Session-Token", pick.Token)
+			}
+			res, err := s.doAPI(r.Context(), req)
+			if err != nil {
+				return nil, errors.New("Copilot 生成请求失败: " + err.Error())
+			}
+			return res, nil
+		}
+		res, err := send(outBody)
+		if err == nil && path == "/responses" {
+			// 输入项绑定在原连接上被上游拒绝：清理后重发一次，仍失败则原样返回且不惩罚账号。
+			var cleaned []byte
+			res, cleaned, err = s.retryStaleItems(r.Context(), w, res, outBody, model, !staleRetried, send)
+			if cleaned != nil {
+				// 清理后的输入沿用到后续 Auto 轮次：不再先发原始输入，也不会再次重试。
+				staleRetried = true
+				body = cleaned
+				request = nil
+				_ = json.Unmarshal(cleaned, &request)
+			}
+		}
 		if err != nil {
 			s.handleError(r.Context(), w, err)
-			return
-		}
-		req.URL.RawQuery = r.URL.RawQuery
-		copyRequestHeaders(req.Header, r.Header)
-		current.setHeaders(req.Header)
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Openai-Intent", "conversation-panel")
-		req.Header.Set("X-Initiator", xInitiator)
-		if vision {
-			req.Header.Set("Copilot-Vision-Request", "true")
-		}
-		if pick.Token != "" {
-			req.Header.Set("Copilot-Session-Token", pick.Token)
-		}
-		res, err := s.doAPI(r.Context(), req)
-		if err != nil {
-			s.handleError(r.Context(), w, errors.New("Copilot 生成请求失败: "+err.Error()))
 			return
 		}
 		// 只在任何响应尚未发给客户端时重试明确的 Auto 拒绝。

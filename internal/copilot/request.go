@@ -362,11 +362,20 @@ func withoutLoneToolChoice(body []byte) []byte {
 		}
 	}
 	delete(request, "tool_choice")
+	out, ok := marshalLiteral(request)
+	if !ok {
+		return body
+	}
+	return out
+}
+
+// marshalLiteral 重编码请求体：不转义 HTML 字符，json.RawMessage 中的数字原文保留（不经 float64）。
+func marshalLiteral(value any) ([]byte, bool) {
 	var out bytes.Buffer
 	encoder := json.NewEncoder(&out)
 	encoder.SetEscapeHTML(false)
-	if encoder.Encode(request) != nil {
-		return body
+	if encoder.Encode(value) != nil {
+		return nil, false
 	}
-	return bytes.TrimSuffix(out.Bytes(), []byte("\n"))
+	return bytes.TrimSuffix(out.Bytes(), []byte("\n")), true
 }
