@@ -1,7 +1,7 @@
 package copilot
 
 // 本文件实现风控记录：生成请求的 401/403 使账号进入冷却时，记录该请求的会话键与状态码；
-// 之后同一会话键的请求在选账号之前直接返回记录的状态码（见 Pool.forward），不再访问上游。
+// 之后同一会话键的请求在选账号之前直接返回 500，消息中附记录的原始状态码（见 Pool.forward），不再访问上游。
 // 记录有效期固定为 riskBlockTTL（命中不续期），新增时立即写入 <CacheDir>/risk_blocks.json，池创建时读回。
 
 import (
@@ -19,7 +19,7 @@ import (
 // riskBlockTTL 是一条风控记录的有效期。
 const riskBlockTTL = 48 * time.Hour
 
-// riskBlockMessage 是命中风控记录时返回给客户端的错误信息。
+// riskBlockMessage 是命中风控记录时返回给客户端的错误信息，其后附原始状态码。
 const riskBlockMessage = "别再重试了，已经触发风控了"
 
 // riskBlockFileName 是风控记录在缓存根目录下的文件名。
@@ -128,7 +128,7 @@ func isRiskStatus(status int) bool {
 	return status == http.StatusUnauthorized || status == http.StatusForbidden
 }
 
-// riskBlocked 在会话键命中风控记录时写出记录的状态码与 riskBlockMessage 并返回 true；未命中或未启用时返回 false。
+// riskBlocked 在会话键命中风控记录时写出 500 与 riskBlockMessage（附记录的原始状态码）并返回 true；未命中或未启用时返回 false。
 func (p *Pool) riskBlocked(ctx context.Context, w http.ResponseWriter, key string) bool {
 	if p.risk == nil || key == "" {
 		return false
@@ -138,7 +138,7 @@ func (p *Pool) riskBlocked(ctx context.Context, w http.ResponseWriter, key strin
 		return false
 	}
 	p.log(ctx, slog.LevelWarn, "风控：会话已被拦截", "session", key[:12], "status", status)
-	writeError(w, status, riskBlockMessage)
+	writeError(w, http.StatusInternalServerError, fmt.Sprintf("%s（原始状态码 %d）", riskBlockMessage, status))
 	return true
 }
 

@@ -1,12 +1,14 @@
 package copilot
 
-// 风控拦截（riskblock）的测试：记录触发 401/403 冷却时的会话亲和键与状态码，之后同键请求直接返回该状态码
-// 与固定错误消息，不选账号、不访问上游；记录持久化到 <CacheDir>/risk_blocks.json，每条有效期 2 天，重启后加载。
+// 风控拦截（riskblock）的测试：记录触发 401/403 冷却时的会话亲和键与原始状态码，之后同键请求直接返回
+// 服务端错误 500，错误消息为固定提示并附原始状态码（"别再重试了，已经触发风控了（原始状态码 403）"），
+// 不选账号、不访问上游；记录（riskTable）保存与持久化的仍是原始 401/403；记录持久化到 <CacheDir>/risk_blocks.json，每条有效期 2 天，重启后加载。
 // 单元部分直接检验 riskTable；集成部分经 HTTP 入口与测试上游观察行为。
 //
 // 实现者必须提供的新内部名字（测试按此书写，见 riskblock.go）：
 //   - const riskBlockTTL = 48 * time.Hour：每条记录的有效期（截止时刻及之后视为不存在，命中不续期）。
-//   - const riskBlockMessage = "别再重试了，已经触发风控了"：拦截时写给客户端的错误消息。
+//   - const riskBlockMessage = "别再重试了，已经触发风控了"：拦截时错误消息的固定前缀，完整消息为
+//     fmt.Sprintf("%s（原始状态码 %d）", riskBlockMessage, status)（全角括号），响应状态码恒为 500。
 //   - const riskBlockFileName = "risk_blocks.json"：记录文件名，位于 PoolConfig.CacheDir 根目录（与 session_affinity.json 同级）。
 //   - type riskTable、func newRiskTable() *riskTable，方法 add(key string, status int, now time.Time)、
 //     lookup(key string, now time.Time) (int, bool)、save(path string, now time.Time) error、
@@ -21,6 +23,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -33,8 +36,13 @@ import (
 	"time"
 )
 
-// riskWantMessage 是拦截响应必须返回的错误消息（规格固定）。
+// riskWantMessage 是拦截响应错误消息的固定前缀（规格固定）；完整消息还需附上原始状态码，见 riskWantFullMessage。
 const riskWantMessage = "别再重试了，已经触发风控了"
+
+// riskWantFullMessage 返回拦截响应必须返回的完整错误消息：固定前缀 + 全角括号包裹的原始状态码。
+func riskWantFullMessage(status int) string {
+	return fmt.Sprintf("%s（原始状态码 %d）", riskWantMessage, status)
+}
 
 // riskNow 返回 riskTable 单元测试的基准时刻（整秒，避免持久化序列化的精度差异）。
 func riskNow() time.Time {
@@ -120,11 +128,12 @@ func riskChat(p *Pool, session string) *httptest.ResponseRecorder {
 	return w
 }
 
-// riskAssertBlocked 断言响应是风控拦截：状态码为 status，正文为 writeError 格式且消息为固定的风控提示。
+// riskAssertBlocked 断言响应是风控拦截：状态码恒为 500，正文为 writeError 格式，
+// 消息为固定的风控提示并附原始状态码。status 是记录的原始状态码（401/403），不是响应状态码。
 func riskAssertBlocked(t *testing.T, w *httptest.ResponseRecorder, status int) {
 	t.Helper()
-	if w.Code != status {
-		t.Fatalf("拦截响应 status=%d body=%s, want %d", w.Code, w.Body.String(), status)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("拦截响应 status=%d body=%s, want 500（原始状态码 %d 只出现在消息里）", w.Code, w.Body.String(), status)
 	}
 	var body struct {
 		Error struct {
@@ -135,8 +144,9 @@ func riskAssertBlocked(t *testing.T, w *httptest.ResponseRecorder, status int) {
 	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
 		t.Fatalf("拦截响应不是 JSON: %v; body=%s", err, w.Body.String())
 	}
-	if body.Error.Message != riskWantMessage || body.Error.Type != "copilot_proxy_error" {
-		t.Fatalf("拦截响应 error = %+v, want message=%q type=copilot_proxy_error", body.Error, riskWantMessage)
+	want := riskWantFullMessage(status)
+	if body.Error.Message != want || body.Error.Type != "copilot_proxy_error" {
+		t.Fatalf("拦截响应 error = %+v, want message=%q type=copilot_proxy_error", body.Error, want)
 	}
 }
 
@@ -405,7 +415,7 @@ func TestRiskBlockRecordedOnGenerationAuthFailure(t *testing.T) {
 	}
 }
 
-// TestRiskBlockRejectsRetryOfRecordedSession 命中记录的同键请求直接返回记录的状态码与固定消息：
+// TestRiskBlockRejectsRetryOfRecordedSession 命中记录的同键请求直接返回 500 与附原始状态码的固定消息：
 // 上游不再收到请求（生成次数不增加），其他账号也未被选，且不计入任何账号的请求数。
 func TestRiskBlockRejectsRetryOfRecordedSession(t *testing.T) {
 	f := newCooldownFixture(t, "a", "b")

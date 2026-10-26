@@ -354,7 +354,7 @@ func (p *Pool) affinityKey(r *http.Request, upstream string) (key string, ok boo
 // 请求体校验（生成接口）在预取 session 之后才执行，因此全部账号的 session 都失败时，
 // 无效请求体会收到 session 错误而不是 400，这是有意的取舍。
 //
-// 会话键命中风控记录（见 riskblock.go）时，在会话门与选账号之前直接返回记录的状态码，不访问上游。
+// 会话键命中风控记录（见 riskblock.go）时，在会话门与选账号之前直接返回 500（消息附原始状态码），不访问上游。
 func (p *Pool) forward(w http.ResponseWriter, r *http.Request, key string) {
 	if p.riskBlocked(r.Context(), w, key) {
 		return
