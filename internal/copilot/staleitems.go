@@ -8,7 +8,8 @@ package copilot
 //   - 400 "The encrypted content for item rs_... could not be verified. ..."。
 //
 // 这是请求内容与连接不匹配，不是账号凭证问题：Service 去掉这些项后在同一账号、同一 session、同一模型上重发一次；
-// 无法重试或重试后仍失败时原样返回上游响应，但不计账号错误、不冷却、不写风控记录（见 retryStaleItems）。
+// 无法重试或重试后仍失败时返回上游响应（401 改为 500，正文不变），但不计账号错误、不冷却、不写风控记录（见 retryStaleItems）。
+// 401 改写为 500 是因为服务前端对过多的 401 会封禁客户端 IP，而这类错误不代表客户端鉴权失败。
 
 import (
 	"bytes"
@@ -116,7 +117,8 @@ func rejectedStaleItems(res *http.Response) bool {
 // retryStaleItems 处理上游 /responses 的首次响应 res：不是失效项错误时原样返回；
 // 是且 canRetry 时清理 outBody（Auto 下须是已改写 model 的请求体）并用 send 重发一次（同一账号、session 与模型，头部与首次一致），
 // 同时返回重发所用的请求体，调用方应以它替换后续轮次的请求体（Auto 重新解析后无需再次清理）；未重发时返回 nil。
-// 最终响应仍是失效项错误（不能重试、无法清理，或重试后仍是）时标记 failureIgnored：原样返回给客户端，但不计账号错误、不冷却、不写风控记录。
+// 最终响应仍是失效项错误（不能重试、无法清理，或重试后仍是）时由 ignoreStaleItems 标记 failureIgnored 并把 401 改为 500：
+// 正文原样返回给客户端，但不计账号错误、不冷却、不写风控记录。
 // 调用方在整个请求内只在首次清理成功后把 canRetry 置 false，因此每个请求最多重试一次。
 func (s *Service) retryStaleItems(ctx context.Context, w http.ResponseWriter, res *http.Response, outBody []byte, model string,
 	canRetry bool, send func(body []byte) (*http.Response, error)) (*http.Response, []byte, error) {
@@ -130,7 +132,7 @@ func (s *Service) retryStaleItems(ctx context.Context, w http.ResponseWriter, re
 	// 日志不含请求正文。
 	s.log(ctx, slog.LevelWarn, "上游拒绝了与连接绑定的输入项", "status", res.StatusCode, "model", model, "retry", canRetry)
 	if !canRetry {
-		markFailure(w, failureIgnored)
+		ignoreStaleItems(w, res)
 		return res, nil, nil
 	}
 	_ = res.Body.Close()
@@ -141,7 +143,17 @@ func (s *Service) retryStaleItems(ctx context.Context, w http.ResponseWriter, re
 	}
 	if rejectedStaleItems(retry) {
 		s.log(ctx, slog.LevelWarn, "清理输入项后上游仍拒绝", "status", retry.StatusCode, "model", model, "retry", false)
-		markFailure(w, failureIgnored)
+		ignoreStaleItems(w, retry)
 	}
 	return retry, cleaned, nil
+}
+
+// ignoreStaleItems 把最终仍是失效项错误的响应 res 标记为 failureIgnored，并把 401 改为 500（400 不变）：
+// 服务前端会因过多的 401 封禁客户端 IP，而这里的 401 只是输入项与连接不匹配。正文与其他头部不变。
+func ignoreStaleItems(w http.ResponseWriter, res *http.Response) {
+	markFailure(w, failureIgnored)
+	if res.StatusCode == http.StatusUnauthorized {
+		res.StatusCode = http.StatusInternalServerError
+		res.Status = "500 Internal Server Error"
+	}
 }

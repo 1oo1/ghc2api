@@ -82,7 +82,7 @@ flowchart TD
     E -- 否 --> C{"错误类别"}
     C -- "400 与其他 4xx" --> X2["既不加也不清零，不冷却"]
     C -- "401 / 403" --> C1{"/responses 的失效输出项错误？"}
-    C1 -- 是 --> X5["忽略：不计数、不冷却、不写风控记录"]
+    C1 -- 是 --> X5["忽略：不计数、不冷却、不写风控记录；401 改为 500 返回"]
     C1 -- 否 --> D["立即触发冷却"]
     C -- "429 / ≥500 / 网络错误 / session 非上游错误" --> F["连续错误计数 +1"]
     F --> G{"计数 ≥ 3？"}
@@ -152,7 +152,7 @@ flowchart TD
 - 客户端写入失败（含写超时）：上游已返回 200，写给客户端失败视为成功并清零连续错误计数（不计为错误，也不保留之前的计数）。客户端取消既不计数也不清零。
 - 不计入：400 以及其他 4xx（404、413、422 等），既不加也不清零；客户端取消（`context.Canceled`）不计入。
 - 成功（状态 < 300）清零连续错误计数。
-- 例外：上游 `/responses` 因输出项绑定在原连接上而拒绝回放（401 `does not belong to this connection`，或 400 `encrypted content … could not be verified`，见 `http-api.md`）是请求内容问题，不是账号凭证问题。`Service` 清理后重试一次；无法重试或重试后仍失败时，原样返回上游响应，并在响应写入器上标记 `failureIgnored`（经 `generationWriter` 的 `Unwrap` 传到 `statusResponseWriter`），因此既不计入账号的 `errors`，也不计入连续错误（不加也不清零），401 也不冷却、不写风控记录（`recordRisk` 因未进入冷却而不触发）。重试成功得到的响应按其状态码照常处理。
+- 例外：上游 `/responses` 因输出项绑定在原连接上而拒绝回放（401 `does not belong to this connection`，或 400 `encrypted content … could not be verified`，见 `http-api.md`）是请求内容问题，不是账号凭证问题。`Service` 清理后重试一次；无法重试或重试后仍失败时，返回上游响应（401 改为 500，正文不变，避免服务前端因过多 401 封禁客户端 IP；400 不变），并在响应写入器上标记 `failureIgnored`（经 `generationWriter` 的 `Unwrap` 传到 `statusResponseWriter`），因此既不计入账号的 `errors`，也不计入连续错误（不加也不清零），401 也不冷却、不写风控记录（`recordRisk` 因未进入冷却而不触发）。重试成功得到的响应按其状态码照常处理。
 - 401 或 403 一次即冷却（账号已在冷却中则不计，见下；上一条的失效输出项错误除外）。其他计入的错误（429、5xx、网络错误、session 获取失败）连续第 3 次触发冷却。
 - 触发冷却后计数清零；账号已在冷却中时再出错不延长冷却、不重复触发、不计数。
 - 同一请求只计一次：session 获取失败在 `pickSession` 中计入；若该账号是最后一个尝试的账号并经 `handleError` 写出错误，`forward` 只更新统计，不再计数。

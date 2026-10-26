@@ -12,7 +12,9 @@ package copilot
 //   - withoutConnectionItems(body) 丢弃 reasoning 与 item_reference 项、删去其余对象项的顶层 id，
 //     没有可改内容或请求体不合法时返回原 body 与 false。
 //   - Service 在同一账号、同一 session、同一模型（Auto 不重新解析）上用清理后的请求体最多重发一次，仅限上游 /responses。
-//   - 无法重试或重试后仍失败时，原样返回上游状态码与正文，但 Pool 不计账号错误、不冷却、不写风控记录。
+//   - 无法重试或重试后仍失败时，最终响应标记 failureIgnored：Pool 不计账号错误、不冷却、不写风控记录。
+//   - 最终响应是失效项 401 时不能把 401 返回客户端（入口按 401 频率封禁 IP）：状态改为 500，正文仍为上游正文；
+//     是否 stream 不影响该转换。失效项 400 的最终响应仍按 400 原样返回；重试后是其他错误也原样返回。
 //
 // 实现者必须提供的内部名字（测试按此书写）：
 //   - func staleItemError(status int, body []byte) bool
@@ -502,23 +504,25 @@ func TestStaleItemsKeepsToolChoiceWhenToolsDeclared(t *testing.T) {
 	}
 }
 
-// TestStaleItemsNoRetryWhenNothingToClean 输入没有可清理内容：不重试（上游 1 次），客户端原样收到 401 与正文。
+// TestStaleItemsNoRetryWhenNothingToClean 输入没有可清理内容：不重试（上游 1 次）。
+// 最终响应是失效项 401 时客户端收到 500（正文不变，避免入口按 401 频率封禁）；失效项 400 仍原样 400。
 func TestStaleItemsNoRetryWhenNothingToClean(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		status int
-		body   string
-		input  string
+		name       string
+		status     int
+		wantStatus int // 客户端收到的状态码
+		body       string
+		input      string
 	}{
-		{"401-no-ids", 401, stale401Body, staleUncleanableBody},
-		{"401-string-input", 401, stale401BodyB, `{"model":"gpt-4.1","input":"hi"}`},
-		{"400-no-ids", 400, stale400Body, staleUncleanableBody},
+		{"401-no-ids", 401, 500, stale401Body, staleUncleanableBody},
+		{"401-string-input", 401, 500, stale401BodyB, `{"model":"gpt-4.1","input":"hi"}`},
+		{"400-no-ids", 400, 400, stale400Body, staleUncleanableBody},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, u := staleServiceWith(t, staleSequence(staleReply{status: tc.status, body: tc.body, contentType: "application/json"}, staleOK))
 			w := testRequest(s, "POST", "/v1/responses", tc.input)
-			if w.Code != tc.status || w.Body.String() != tc.body {
-				t.Fatalf("status=%d body=%s, want 原样返回 %d %s", w.Code, w.Body.String(), tc.status, tc.body)
+			if w.Code != tc.wantStatus || w.Body.String() != tc.body {
+				t.Fatalf("status=%d body=%s, want %d 与上游正文 %s", w.Code, w.Body.String(), tc.wantStatus, tc.body)
 			}
 			if got := u.sent("/responses"); len(got) != 1 {
 				t.Fatalf("上游 /responses 收到 %d 次请求, want 1", len(got))
@@ -527,21 +531,39 @@ func TestStaleItemsNoRetryWhenNothingToClean(t *testing.T) {
 	}
 }
 
-// TestStaleItemsRetryFailureReturnsSecondError 重试后仍失败：上游收到 2 次，客户端收到第二次的状态与正文，且不再重试。
-func TestStaleItemsRetryFailureReturnsSecondError(t *testing.T) {
+// TestStaleItemsStreamFlagAlsoConverts401To500 请求带 "stream":true 时同样适用：重试后仍是失效项 401，
+// 客户端收到 500 与第二次正文（stream 标志不影响 401→500 转换）。
+func TestStaleItemsStreamFlagAlsoConverts401To500(t *testing.T) {
+	body := strings.Replace(staleRequestBody, `"model":"gpt-4.1"`, `"model":"gpt-4.1","stream":true`, 1)
+	s, u := staleServiceWith(t, staleSequence(
+		staleReply{status: 401, body: stale401Body},
+		staleReply{status: 401, body: stale401BodyB},
+	))
+	w := testRequest(s, "POST", "/v1/responses", body)
+	if w.Code != 500 || w.Body.String() != stale401BodyB {
+		t.Fatalf("status=%d body=%s, want 500 与第二次正文 %s", w.Code, w.Body.String(), stale401BodyB)
+	}
+	assertStaleBodies(t, u, body, strings.Replace(staleCleanedBody, `"model":"gpt-4.1"`, `"model":"gpt-4.1","stream":true`, 1))
+}
+
+// TestStaleItemsRetryFailureReturnsFinalError 重试后仍失败：上游收到 2 次，客户端收到第二次的正文，且不再重试。
+// 第二次是失效项 401 时状态改为 500（正文不变）；失效项 400 仍原样 400。
+func TestStaleItemsRetryFailureReturnsFinalError(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
 		first, second staleReply
+		wantStatus    int // 客户端收到的状态码
 	}{
-		{"401-then-401", staleReply{status: 401, body: stale401Body}, staleReply{status: 401, body: stale401BodyB}},
-		{"401-then-400", staleReply{status: 401, body: stale401Body}, staleReply{status: 400, body: stale400Body}},
-		{"400-then-401", staleReply{status: 400, body: stale400Body}, staleReply{status: 401, body: stale401Body}},
+		{"401-then-401", staleReply{status: 401, body: stale401Body}, staleReply{status: 401, body: stale401BodyB}, 500},
+		{"401-then-400", staleReply{status: 401, body: stale401Body}, staleReply{status: 400, body: stale400Body}, 400},
+		{"400-then-401", staleReply{status: 400, body: stale400Body}, staleReply{status: 401, body: stale401Body}, 500},
+		{"400-then-400", staleReply{status: 400, body: stale400Body}, staleReply{status: 400, body: stale400Body}, 400},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, u := staleServiceWith(t, staleSequence(tc.first, tc.second, staleOK))
 			w := testRequest(s, "POST", "/v1/responses", staleRequestBody)
-			if w.Code != tc.second.status || w.Body.String() != tc.second.body {
-				t.Fatalf("status=%d body=%s, want 第二次的 %d %s", w.Code, w.Body.String(), tc.second.status, tc.second.body)
+			if w.Code != tc.wantStatus || w.Body.String() != tc.second.body {
+				t.Fatalf("status=%d body=%s, want %d 与第二次正文 %s", w.Code, w.Body.String(), tc.wantStatus, tc.second.body)
 			}
 			assertStaleBodies(t, u, staleRequestBody, staleCleanedBody)
 		})
@@ -620,16 +642,17 @@ func TestStaleItemsAutoRetryKeepsModelAndSession(t *testing.T) {
 	}
 }
 
-// TestStaleItemsAutoRetryFailureReturnsSecondErrorWithoutReresolve Auto 重试后仍失败：返回第二次错误，/auto 仍只调用一次、上游只收到 2 次。
-func TestStaleItemsAutoRetryFailureReturnsSecondErrorWithoutReresolve(t *testing.T) {
+// TestStaleItemsAutoRetryFailureReturns500WithoutReresolve Auto 重试后仍是失效项 401：客户端收到 500 与第二次正文，
+// /auto 仍只调用一次、上游只收到 2 次。
+func TestStaleItemsAutoRetryFailureReturns500WithoutReresolve(t *testing.T) {
 	body := strings.Replace(staleRequestBody, `"model":"gpt-4.1"`, `"model":"auto"`, 1)
 	s, u := staleServiceWith(t, staleSequence(
 		staleReply{status: 401, body: stale401Body},
 		staleReply{status: 401, body: stale401BodyB},
 	))
 	w := testRequest(s, "POST", "/v1/responses", body)
-	if w.Code != 401 || w.Body.String() != stale401BodyB {
-		t.Fatalf("status=%d body=%s, want 401 与第二次正文", w.Code, w.Body.String())
+	if w.Code != 500 || w.Body.String() != stale401BodyB {
+		t.Fatalf("status=%d body=%s, want 500 与第二次正文", w.Code, w.Body.String())
 	}
 	if n := u.autoCount(); n != 1 {
 		t.Fatalf("/auto 调用 %d 次, want 1", n)
@@ -769,9 +792,10 @@ func TestStalePoolRetry400DoesNotPenalize(t *testing.T) {
 	staleAssertNotPenalized(t, f, p, "stale-400", staleRequestBody)
 }
 
-// TestStalePoolUnretriable401PassesThroughWithoutCooldown 无法重试（输入没有可清理内容）时直接把 401 原样返回给客户端，
-// 但不冷却账号、不写风控记录；即使连续多次（超过连续错误阈值）账号仍可用，同一会话不会被风控拦截。
-func TestStalePoolUnretriable401PassesThroughWithoutCooldown(t *testing.T) {
+// TestStalePoolUnretriable401Returns500WithoutCooldown 无法重试（输入没有可清理内容）时客户端收到 500 而非 401
+// （入口按 401 频率封禁 IP），正文仍是上游正文；但不冷却账号、不写风控记录；
+// 即使连续多次（超过连续错误阈值）账号仍可用，同一会话不会被风控拦截。
+func TestStalePoolUnretriable401Returns500WithoutCooldown(t *testing.T) {
 	failing := true
 	var mu sync.Mutex
 	f, p, u := stalePoolFixture(t, func(int, []byte) staleReply {
@@ -785,8 +809,8 @@ func TestStalePoolUnretriable401PassesThroughWithoutCooldown(t *testing.T) {
 	const rounds = cooldownStreakLimit + 1
 	for i := 0; i < rounds; i++ {
 		w := staleSend(p, "stale-pass", staleUncleanableBody)
-		if w.Code != 401 || w.Body.String() != stale401Body {
-			t.Fatalf("第 %d 次 status=%d body=%s, want 原样返回 401", i+1, w.Code, w.Body.String())
+		if w.Code != 500 || w.Body.String() != stale401Body {
+			t.Fatalf("第 %d 次 status=%d body=%s, want 500 与上游正文 %s", i+1, w.Code, w.Body.String(), stale401Body)
 		}
 		staleAssertNotPenalized(t, f, p, "stale-pass", staleUncleanableBody)
 	}
@@ -802,8 +826,8 @@ func TestStalePoolUnretriable401PassesThroughWithoutCooldown(t *testing.T) {
 	}
 }
 
-// TestStalePoolRetryStillFailsDoesNotCoolOrRecord 重试后仍是失效项 401：客户端收到第二次的 401，
-// 账号不冷却、不写风控记录，后续请求仍可用。
+// TestStalePoolRetryStillFailsDoesNotCoolOrRecord 重试后仍是失效项 401：客户端收到 500 与第二次正文
+// （不把 401 返回给客户端，避免入口按 401 频率封禁），账号不冷却、不写风控记录，后续请求仍可用。
 func TestStalePoolRetryStillFailsDoesNotCoolOrRecord(t *testing.T) {
 	var mu sync.Mutex
 	failing := true
@@ -820,8 +844,8 @@ func TestStalePoolRetryStillFailsDoesNotCoolOrRecord(t *testing.T) {
 		}
 	})
 	w := staleSend(p, "stale-fail", staleRequestBody)
-	if w.Code != 401 || w.Body.String() != stale401BodyB {
-		t.Fatalf("status=%d body=%s, want 第二次的 401 %s", w.Code, w.Body.String(), stale401BodyB)
+	if w.Code != 500 || w.Body.String() != stale401BodyB {
+		t.Fatalf("status=%d body=%s, want 500 与第二次正文 %s", w.Code, w.Body.String(), stale401BodyB)
 	}
 	if got := u.sent(); len(got) != 2 {
 		t.Fatalf("上游收到 %d 次请求, want 2", len(got))

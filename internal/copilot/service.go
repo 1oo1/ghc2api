@@ -418,7 +418,7 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 		}
 		res, err := send(outBody)
 		if err == nil && path == "/responses" {
-			// 输入项绑定在原连接上被上游拒绝：清理后重发一次，仍失败则原样返回且不惩罚账号。
+			// 输入项绑定在原连接上被上游拒绝：清理后重发一次，仍失败则返回上游响应（401 改为 500）且不惩罚账号。
 			var cleaned []byte
 			res, cleaned, err = s.retryStaleItems(r.Context(), w, res, outBody, model, !staleRetried, send)
 			if cleaned != nil {

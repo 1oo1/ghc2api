@@ -66,4 +66,4 @@ JSON 名为小驼峰（如 `remainingFraction`、`observedAt`），完整定义�
 
 - session 失败后切换账号，只计入最终处理的账号；所有账号都失败时计入最后尝试的账号（`requests`、`errors` 各 +1）。
 - 客户端取消不计 `errors`（`requests` 可计）。
-- `/responses` 的失效输出项错误（401/400，见 `http-api.md`）标记为忽略：不计 `errors`，也不触发错误后的额度刷新（`requests` 照常计）。
+- `/responses` 的失效输出项错误（401/400，见 `http-api.md`）标记为忽略（写给客户端的 401 改为 500）：不计 `errors`，也不触发错误后的额度刷新（`requests` 照常计）。
