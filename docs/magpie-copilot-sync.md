@@ -149,7 +149,7 @@ git -C .local/cpa grep -n -i -E \
 | cpa 行为 | 本项目 |
 | --- | --- |
 | 显式会话 ID 的来源、顺序与前缀（`claude:`、`codex:`、`header:`、`affinity:`、`slot:`、`pck:` 等） | 同步，前缀与 cpa 一致 |
-| （cpa 无此来源） | 本项目扩展：通用请求头末尾追加 `X-Agent-Task-Id` → `agenttask:`、`X-Request-Id` → `req:`，同步 cpa 时保留 |
+| （cpa 无此来源） | 不使用 `X-Agent-Task-Id`、`X-Request-Id` 作为会话来源：VS Code Copilot（BYOK）把二者设为每轮用户消息都不同的 ID，会使每轮会话键都不同、亲和无法命中；同步 cpa 时不要加回 |
 | `NormalizeExplicitID`：拒绝控制字符，裁剪空白，限 256 字节 | 同步 |
 | 父会话、子代理、fork 识别与绑定继承 | 不同步。本项目绑定表是扁平的；Codex 取 `Session-Id` 优先于 `Thread-Id`，Claude Code 子代理与主会话共用会话 ID，因此子代理自然落到主会话账号 |
 | Gemini `cachedContent`、请求体外层 `request` 包装 | 不同步，本项目不接收 Gemini 协议 |

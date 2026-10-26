@@ -28,6 +28,8 @@ type sessionSource struct {
 }
 
 // headerSessionSources 是 Claude Code 与 Codex 之后的通用请求头来源，按优先级排列。
+// 刻意不含 X-Agent-Task-Id、X-Request-Id：VS Code Copilot（BYOK）把二者设为每轮用户消息都不同的 ID，
+// 优先级又高于请求体信号与内容兜底，会拆散亲和（见 docs/session-affinity.md「会话键」）。
 var headerSessionSources = []sessionSource{
 	{"agy:", []string{"X-Http-Session-Id"}},       // Antigravity CLI
 	{"header:", []string{"X-Session-ID"}},         // 通用
@@ -37,8 +39,6 @@ var headerSessionSources = []sessionSource{
 	{"conv:", []string{"X-Conversation-Id"}},
 	{"thread:", []string{"X-Thread-Id"}},
 	{"clientreq:", []string{"X-Client-Request-Id"}},
-	{"agenttask:", []string{"X-Agent-Task-Id"}},
-	{"req:", []string{"X-Request-Id"}},
 }
 
 // bodySessionSources 是请求体中的来源，排在所有请求头来源之后，按优先级排列。
