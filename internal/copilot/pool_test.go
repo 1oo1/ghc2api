@@ -857,3 +857,101 @@ func TestPoolLogsUserAndAccountIndexPerAccount(t *testing.T) {
 		}
 	}
 }
+
+// TestPoolSessionFailureBeforeModelValidation Pool 先选账号并交换 session 再交给 Service 校验 model；
+// session 失败时按 session 错误处理（冷却、风控），单独的 Service 则先校验请求体、不取 session。
+func TestPoolSessionFailureBeforeModelValidation(t *testing.T) {
+	const sessionID = "invalid-model"
+	const sessionBody = `{"error":"session unauthorized"}`
+	for _, tc := range []struct{ name, body string }{
+		{"missing", `{"input":"hi"}`},
+		{"null", `{"model":null,"input":"hi"}`},
+		{"nonstring", `{"model":42,"input":"hi"}`},
+		{"blank", `{"model":"  ","input":"hi"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCooldownFixture(t, "a")
+			f.config.SessionAffinityTTL = DefaultSessionAffinityTTL
+			f.config.AccountCooldown = time.Minute
+			f.up.pool.failSession("oauth-a", poolFailure{status: http.StatusUnauthorized, body: sessionBody})
+
+			// 单独的 Service 先校验请求体，不会尝试获取 session。
+			direct := testService(t, Config{APIKey: testAPIKey, Token: "oauth-a", Client: f.up.client})
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Session-ID", sessionID)
+			rec := httptest.NewRecorder()
+			withTestAPIKey(direct.Handler()).ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "请求必须是 JSON 对象，并包含非空字符串 model") {
+				t.Fatalf("直接 Service status=%d body=%s, want 本地校验 400", rec.Code, rec.Body.String())
+			}
+			if n := f.up.pool.requestCount(); n != 0 {
+				t.Fatalf("直接 Service 访问上游 %d 次, want 0", n)
+			}
+
+			// 池先选择账号并交换 session；失败时不会进入 Service 的 model 校验。
+			p := f.start()
+			before := time.Now()
+			response := staleSend(p, sessionID, tc.body)
+			after := time.Now()
+			if response.Code != http.StatusUnauthorized || response.Body.String() != sessionBody {
+				t.Fatalf("Pool status=%d body=%s, want 上游 session 的 401 与原正文", response.Code, response.Body.String())
+			}
+			if n := f.up.pool.sessionCount("oauth-a"); n != 1 {
+				t.Fatalf("Pool 的 session 交换 %d 次, want 1", n)
+			}
+			if n := f.up.pool.requestCount(); n != 1 {
+				t.Fatalf("生成链上游请求数 = %d, want 只有 1 次 session 交换", n)
+			}
+			assertGenerationOrder(t, f.up.pool)
+			view := cooldownView(t, p, "a")
+			if view.CooldownUntil == nil || view.CooldownReason != "401" {
+				t.Fatalf("session 401 后的冷却状态 = %+v, want 原因 401", view)
+			}
+			cooldownAssertWindow(t, *view.CooldownUntil, before, after, f.config.AccountCooldown)
+			if view.Stats.Requests != 1 || view.Stats.Errors != 1 {
+				t.Fatalf("账号统计 = %+v, want 一次请求和一次错误", view.Stats)
+			}
+
+			key := staleSessionKey(t, sessionID, tc.body)
+			riskMustHit(t, p.risk, key, time.Now(), http.StatusUnauthorized)
+			p.WaitCooldownEffects()
+			file := riskReadFile(t, riskFilePath(f))
+			if file.Version != 1 || len(file.Blocks) != 1 || file.Blocks[0].Key != key || file.Blocks[0].Status != http.StatusUnauthorized {
+				t.Fatalf("风控持久化记录 = %+v, want 该会话的一条 401 记录", file)
+			}
+
+			// 同一会话即使改用有效 model，也应命中之前记录的风控而不访问上游。
+			blocked := staleSend(p, sessionID, `{"model":"gpt-4.1","input":"hi"}`)
+			riskAssertBlocked(t, blocked, http.StatusUnauthorized)
+			if n := f.up.pool.requestCount(); n != 1 {
+				t.Fatalf("风控拦截后生成链上游请求数 = %d, want 1", n)
+			}
+		})
+	}
+}
+
+// TestPoolModelValidationAfterSessionSuccess session 获取成功后 model 无效返回本地 400，不冷却账号、不写风控。
+func TestPoolModelValidationAfterSessionSuccess(t *testing.T) {
+	const sessionID = "invalid-model-successful-session"
+	const body = `{"model":null,"input":"hi"}`
+	f := newCooldownFixture(t, "a")
+	f.config.SessionAffinityTTL = DefaultSessionAffinityTTL
+	p := f.start()
+
+	response := staleSend(p, sessionID, body)
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "请求必须是 JSON 对象，并包含非空字符串 model") {
+		t.Fatalf("session 成功后的 Pool status=%d body=%s, want 本地校验 400", response.Code, response.Body.String())
+	}
+	if n := f.up.pool.sessionCount("oauth-a"); n != 1 {
+		t.Fatalf("Pool 的 session 交换 %d 次, want 1", n)
+	}
+	if n := f.up.pool.requestCount(); n != 1 {
+		t.Fatalf("生成链上游请求数 = %d, want 只有 1 次 session 交换", n)
+	}
+	assertGenerationOrder(t, f.up.pool)
+	if view := cooldownView(t, p, "a"); view.CooldownUntil != nil {
+		t.Fatalf("本地 400 不应冷却账号: %+v", view)
+	}
+	riskMustMiss(t, p.risk, staleSessionKey(t, sessionID, body), time.Now())
+}

@@ -38,6 +38,11 @@ type modelList struct {
 	At        time.Time           `json:"at"`
 }
 
+type refusedModel struct {
+	at      time.Time
+	version uint64
+}
+
 func (s *Service) getModels(ctx context.Context, current session) (modelList, error) {
 	if err := s.modelsMu.lock(ctx); err != nil {
 		return modelList{}, err
@@ -192,22 +197,31 @@ func (s *Service) acceptTerms(ctx context.Context, current session, model string
 	}
 }
 
-func (s *Service) isRefused(model string) bool {
+func (s *Service) refusalVersion(model string) uint64 {
 	s.refusedMu.Lock()
 	defer s.refusedMu.Unlock()
-	at, ok := s.refused[model]
-	return ok && time.Since(at) < 6*time.Hour
+	return s.refused[model].version
+}
+
+func (s *Service) isRefused(model string) bool {
+	s.refusedMu.Lock()
+	at := s.refused[model].at
+	s.refusedMu.Unlock()
+	return !at.IsZero() && time.Since(at) < 6*time.Hour
 }
 
 func (s *Service) refuse(model string) {
 	s.refusedMu.Lock()
 	defer s.refusedMu.Unlock()
-	s.refused[model] = time.Now()
+	s.refusalSeq++
+	s.refused[model] = refusedModel{at: time.Now(), version: s.refusalSeq}
 }
 
-// unrefuse 清除模型的拒绝记录；该模型生成成功后调用，使其重新出现在 /v1/models 中。
-func (s *Service) unrefuse(model string) {
+// unrefuse 仅清除请求发出前观察到的拒绝，避免覆盖请求期间产生的新拒绝。
+func (s *Service) unrefuse(model string, observed uint64) {
 	s.refusedMu.Lock()
 	defer s.refusedMu.Unlock()
-	delete(s.refused, model)
+	if refusal, ok := s.refused[model]; ok && refusal.version == observed {
+		delete(s.refused, model)
+	}
 }

@@ -1328,10 +1328,34 @@ func TestGenerationAcceptsCaseInsensitiveModelKey(t *testing.T) {
 	}
 }
 
+// TestGenerationForwardsModelKeyVerbatim model 校验按 encoding/json 规则：键不区分大小写、重复键取最后一个；
+// 请求体不改写，原样转发（如 MODEL 键不会被改成 model）。
+func TestGenerationForwardsModelKeyVerbatim(t *testing.T) {
+	const rest = `"messages":[{"role":"user","content":"hello"}]`
+	for _, tc := range []struct{ name, body string }{
+		{"uppercase", `{"MODEL":"gpt-4.1",` + rest + `}`},
+		{"mixed-case", `{"MoDeL":"gpt-4.1",` + rest + `}`},
+		{"duplicate-last-wins", `{"model":"unknown-model","model":"gpt-4.1",` + rest + `}`},
+		{"case-variant-last-wins", `{"model":"unknown-model","MODEL":"gpt-4.1",` + rest + `}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, upstreamBody := toolChoiceUpstream(t, "/chat/completions")
+			if w := testRequest(s, "POST", "/v1/chat/completions", tc.body); w.Code != 200 {
+				t.Fatalf("status=%d body=%s, want 200", w.Code, w.Body.String())
+			}
+			if out := upstreamBody(); string(out) != tc.body {
+				t.Fatalf("上游请求体应逐字节一致:\n got=%s\nwant=%s", out, tc.body)
+			}
+		})
+	}
+}
+
 // TestGenerationRejectsInvalidModelField 请求体不是 JSON 对象或 model 不是非空字符串时返回 400，且不访问上游。
 func TestGenerationRejectsInvalidModelField(t *testing.T) {
 	for _, body := range []string{
 		`{`, `null`, `[]`, `"x"`, `{}`, `{"model":1}`, `{"model":null}`, `{"model":"  "}`,
+		// 重复键取最后一个，最后一个无效即无效。
+		`{"model":"gpt-4.1","model":null}`, `{"model":"gpt-4.1","MODEL":"  "}`,
 	} {
 		for _, path := range []string{"/v1/chat/completions", "/v1/responses", "/v1/messages"} {
 			t.Run(path+" "+body, func(t *testing.T) {
@@ -1342,7 +1366,13 @@ func TestGenerationRejectsInvalidModelField(t *testing.T) {
 					w.WriteHeader(500)
 				})})
 				w := testRequest(s, "POST", path, body)
-				if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "请求必须是 JSON 对象，并包含非空字符串 model") {
+				var response struct {
+					Error struct {
+						Message string `json:"message"`
+					} `json:"error"`
+				}
+				_ = json.Unmarshal(w.Body.Bytes(), &response)
+				if w.Code != http.StatusBadRequest || response.Error.Message != "请求必须是 JSON 对象，并包含非空字符串 model" {
 					t.Fatalf("status=%d body=%s, want 400 与 model 字段提示", w.Code, w.Body.String())
 				}
 				if got := upstream.Load(); got != 0 {

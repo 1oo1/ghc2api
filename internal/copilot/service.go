@@ -48,7 +48,9 @@ type Service struct {
 	modelsMu  contextMutex
 	models    modelList
 	refusedMu sync.Mutex
-	refused   map[string]time.Time
+	refused   map[string]refusedModel
+	// refusalSeq 在锁内递增，删除记录后也不重置，避免不同拒绝的版本相同。
+	refusalSeq uint64
 }
 
 // New 不发网络请求；凭证的有效性在首次访问上游时检查。
@@ -94,7 +96,7 @@ func New(config Config) (*Service, error) {
 		quotaRefreshInterval = DefaultQuotaRefreshInterval
 	}
 	service := &Service{
-		config: config, client: safeClient(config.Client), refused: make(map[string]time.Time),
+		config: config, client: safeClient(config.Client), refused: make(map[string]refusedModel),
 		logger: config.Logger, secrets: make(map[string]struct{}),
 		cacheDir: cacheDir, modelsCacheTTL: modelsCacheTTL, quotaRefreshInterval: quotaRefreshInterval,
 		sessionMu: make(contextMutex, 1), modelsMu: make(contextMutex, 1),
@@ -392,6 +394,7 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 		}
 		return res, nil
 	}
+	refusedVersion := s.refusalVersion(model)
 	res, err := send(body)
 	if err == nil && path == "/responses" {
 		// 输入项绑定在原连接上被上游拒绝：清理后重发一次，仍失败则返回上游响应（401 改为 500）且不惩罚账号。
@@ -420,8 +423,8 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 		return
 	}
 	if res.StatusCode/100 == 2 {
-		// 生成成功说明模型可用，撤销此前的拒绝隐藏。
-		s.unrefuse(model)
+		// 仅清除请求发出前的拒绝，避免旧请求覆盖在途期间的新拒绝。
+		s.unrefuse(model, refusedVersion)
 	}
 	s.log(r.Context(), apiStatusLogLevel(res.StatusCode), "生成响应开始返回客户端",
 		"status", res.StatusCode, "model", model)
