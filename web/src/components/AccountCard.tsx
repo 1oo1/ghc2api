@@ -14,6 +14,10 @@ import {
   parsePriority,
 } from "../account";
 import { buckets, resetLabel, usedPercent, type Bucket, type Quota } from "../quota";
+import { ConfirmDialog } from "./ConfirmDialog";
+
+/** 需在对话框中确认后才执行的操作。 */
+type PendingAction = { message: string; task: () => Promise<string> };
 
 /** 已用比例达到该值时进度条改用警示色。 */
 const HIGH_USAGE_PERCENT = 90;
@@ -30,6 +34,12 @@ export function AccountCard({
   // 冷却与禁用相互独立：禁用的账号仍可能处于冷却中，此时同样显示原因、截止时间与解除按钮。
   const cooling = isCooling(account, now);
   const { busy, client, run } = actions;
+  // 禁用、删除需二次确认：点击按钮只记录待执行操作，在对话框中确认后才执行。
+  const [pending, setPending] = useState<PendingAction | null>(null);
+  const toggleDisabled = async () => {
+    await client.setDisabled(account.id, !account.disabled);
+    return `${account.user} 已${account.disabled ? "启用" : "禁用"}`;
+  };
   return (
     <article className="account-card">
       <header className="account-heading">
@@ -82,10 +92,12 @@ export function AccountCard({
         <button
           disabled={busy}
           onClick={() =>
-            void run(async () => {
-              await client.setDisabled(account.id, !account.disabled);
-              return `${account.user} 已${account.disabled ? "启用" : "禁用"}`;
-            })
+            account.disabled
+              ? void run(toggleDisabled)
+              : setPending({
+                  message: `禁用账号 ${account.user}？禁用后不再参与请求分配。`,
+                  task: toggleDisabled,
+                })
           }
         >
           {account.disabled ? "启用" : "禁用"}
@@ -93,18 +105,29 @@ export function AccountCard({
         <button
           className="danger"
           disabled={busy}
-          onClick={() => {
-            if (!window.confirm(`删除账号 ${account.user}？其凭证文件也会被删除。`))
-              return;
-            void run(async () => {
-              await client.deleteAccount(account.id);
-              return `已删除 ${account.user}`;
-            });
-          }}
+          onClick={() =>
+            setPending({
+              message: `删除账号 ${account.user}？其凭证文件也会被删除。`,
+              task: async () => {
+                await client.deleteAccount(account.id);
+                return `已删除 ${account.user}`;
+              },
+            })
+          }
         >
           删除
         </button>
       </footer>
+      {pending && (
+        <ConfirmDialog
+          message={pending.message}
+          onCancel={() => setPending(null)}
+          onConfirm={() => {
+            setPending(null);
+            void run(pending.task);
+          }}
+        />
+      )}
     </article>
   );
 }

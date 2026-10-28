@@ -456,6 +456,29 @@ tr:last-child td {
   margin: 16px 0 12px;
 }
 
+/* 确认对话框 */
+.confirm-dialog {
+  border: 1px solid #dfe5dc;
+  border-radius: 12px;
+  padding: 22px;
+  max-width: 380px;
+  background: #fcfdf9;
+  color: inherit;
+  box-shadow: 0 12px 32px #17432f26;
+}
+.confirm-dialog::backdrop {
+  background: #22312c4d;
+}
+.confirm-dialog p {
+  margin: 0 0 18px;
+  color: #22312c;
+}
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 /* 顶部提示条 */
 .banner {
   background: #e1efdf;
