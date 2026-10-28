@@ -32,8 +32,6 @@ type model struct {
 
 type modelList struct {
 	Data []json.RawMessage `json:"data"`
-	// Picks 是可选（策略已启用）模型的 id 列表。
-	Picks []string `json:"picks"`
 	// Endpoints 记录每个 chat 模型（含隐藏模型）支持的路径；旧缓存没有该字段。
 	Endpoints map[string][]string `json:"endpoints"`
 	Waiting   map[string]bool     `json:"waiting"`
@@ -83,12 +81,13 @@ func (s *Service) getModels(ctx context.Context, current session) (modelList, er
 		if internalModel.MatchString(m.ID) || m.Vendor == "Experimental" || (!m.Picker && m.Category == "") {
 			continue
 		}
-		if (m.Policy != nil && m.Policy.State == "enabled") || (m.Policy == nil && m.Picker) {
-			list.Picks = append(list.Picks, m.ID)
-		} else if m.Policy != nil && m.Policy.Terms != "" {
+		// 策略已启用（或无策略且在选择器中）的模型直接可见；待接受条款的模型可见并记入 Waiting；其余跳过。
+		enabled := (m.Policy != nil && m.Policy.State == "enabled") || (m.Policy == nil && m.Picker)
+		if !enabled {
+			if m.Policy == nil || m.Policy.Terms == "" {
+				continue
+			}
 			list.Waiting[m.ID] = true
-		} else {
-			continue
 		}
 		var metadata map[string]any
 		_ = json.Unmarshal(raw, &metadata)
@@ -104,7 +103,7 @@ func (s *Service) getModels(ctx context.Context, current session) (modelList, er
 	if err := s.writeCacheUnlessCooling("models", list); err != nil {
 		s.log(ctx, slog.LevelWarn, "写入磁盘模型缓存失败", "error", s.redactString(err.Error()))
 	}
-	s.log(ctx, slog.LevelInfo, "Copilot 模型列表刷新完成", "visible_count", len(list.Data), "selectable_count", len(list.Picks))
+	s.log(ctx, slog.LevelInfo, "Copilot 模型列表刷新完成", "visible_count", len(list.Data))
 	return list, nil
 }
 
@@ -204,4 +203,11 @@ func (s *Service) refuse(model string) {
 	s.refusedMu.Lock()
 	defer s.refusedMu.Unlock()
 	s.refused[model] = time.Now()
+}
+
+// unrefuse 清除模型的拒绝记录；该模型生成成功后调用，使其重新出现在 /v1/models 中。
+func (s *Service) unrefuse(model string) {
+	s.refusedMu.Lock()
+	defer s.refusedMu.Unlock()
+	delete(s.refused, model)
 }

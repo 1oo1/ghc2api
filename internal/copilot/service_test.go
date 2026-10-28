@@ -1179,8 +1179,105 @@ func TestManualModelSurvivesModelListFailureAndDoesNotRetry(t *testing.T) {
 	}
 }
 
-// 上游以 model_not_supported 拒绝手选模型后，客户端原样收到 400，且该模型从 /v1/models 中隐藏，其他模型仍可见。
+// 上游以 model_not_supported 拒绝手选模型后，客户端原样收到 400，且该模型从 /v1/models 中隐藏，其他模型仍可见；
+// 之后该模型的生成请求再次成功（2xx），拒绝记录被清除，模型重新出现在 /v1/models 中。
 func TestRefusedModelIsHiddenFromModelList(t *testing.T) {
+	var generationStatus atomic.Int32
+	generationStatus.Store(400)
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/copilot_internal/v2/token":
+			testSession(w, "", time.Now().Add(time.Hour))
+		case "/models":
+			_, _ = io.WriteString(w, testModels)
+		case "/chat/completions":
+			if generationStatus.Load() == 400 {
+				w.WriteHeader(400)
+				_, _ = io.WriteString(w, `{"error":{"code":"model_not_supported"}}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(500)
+		}
+	})})
+	listIDs := func() map[string]bool {
+		t.Helper()
+		w := testRequest(s, "GET", "/v1/models", "")
+		if w.Code != 200 {
+			t.Fatalf("models status = %d, body = %s", w.Code, w.Body.String())
+		}
+		var got struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		ids := map[string]bool{}
+		for _, m := range got.Data {
+			ids[m.ID] = true
+		}
+		return ids
+	}
+	const generation = `{"model":"gpt-4.1","messages":[{"role":"user","content":"hello"}]}`
+	w := testRequest(s, "POST", "/v1/chat/completions", generation)
+	if w.Code != 400 || w.Body.String() != `{"error":{"code":"model_not_supported"}}` {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if ids := listIDs(); !reflect.DeepEqual(ids, map[string]bool{"terms-model": true}) {
+		t.Fatalf("visible IDs = %v, want only terms-model", ids)
+	}
+
+	// 上游恢复支持该模型：一次成功的生成响应清除拒绝记录。
+	generationStatus.Store(200)
+	if w := testRequest(s, "POST", "/v1/chat/completions", generation); w.Code != 200 {
+		t.Fatalf("恢复后的生成请求 status=%d body=%s, want 200", w.Code, w.Body.String())
+	}
+	if ids := listIDs(); !reflect.DeepEqual(ids, map[string]bool{"gpt-4.1": true, "terms-model": true}) {
+		t.Fatalf("成功生成后 visible IDs = %v, want gpt-4.1 与 terms-model", ids)
+	}
+}
+
+// TestModelRefusal 只识别结构化的上游错误：顶层 JSON 对象，且 error.code 为 model_not_supported，
+// 或 error.message 含 requested model is not supported（不区分大小写）；
+// 同样的文本出现在其他位置、或正文不是 JSON 时都不算模型拒绝。
+func TestModelRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"real-upstream-shape", `{"error":{"message":"The requested model is not supported.","code":"model_not_supported","param":"model","type":"invalid_request_error"}}`, true},
+		{"code-only", `{"error":{"code":"model_not_supported"}}`, true},
+		{"message-only", `{"error":{"code":"invalid_request","message":"bad input: requested model is not supported"}}`, true},
+		{"message-case-insensitive", `{"error":{"message":"The Requested Model Is Not Supported."}}`, true},
+		{"numeric-code-message-matches", `{"error":{"code":400,"message":"The requested model is not supported."}}`, true},
+		{"non-string-message-code-matches", `{"error":{"code":"model_not_supported","message":{"x":1}}}`, true},
+		{"numeric-code-unrelated-message", `{"error":{"code":400,"message":"bad"}}`, false},
+		{"text-in-sibling-field", `{"error":{"code":"invalid_request","message":"bad"},"echo":"requested model is not supported"}`, false},
+		{"code-text-in-other-error-field", `{"error":{"code":"x","param":"model_not_supported"}}`, false},
+		{"code-text-in-top-level-field", `{"code":"model_not_supported","message":"requested model is not supported"}`, false},
+		{"unrelated-error", `{"error":{"code":"invalid_request","message":"bad"}}`, false},
+		{"error-null", `{"error":null}`, false},
+		{"plain-text-message", `requested model is not supported`, false},
+		{"plain-text-code", `"model_not_supported"`, false},
+		{"top-level-array", `[{"error":{"code":"model_not_supported"}}]`, false},
+		{"empty", ``, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := modelRefusal([]byte(tc.body)); got != tc.want {
+				t.Fatalf("modelRefusal(%s) = %v, want %v", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRefusalTextOutsideErrorDoesNotHideModel 上游 400 正文里的拒绝文本不在 error.code / error.message 中时，
+// 客户端照常收到 400，但模型不会从 /v1/models 中隐藏。
+func TestRefusalTextOutsideErrorDoesNotHideModel(t *testing.T) {
 	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/copilot_internal/v2/token":
@@ -1189,34 +1286,70 @@ func TestRefusedModelIsHiddenFromModelList(t *testing.T) {
 			_, _ = io.WriteString(w, testModels)
 		case "/chat/completions":
 			w.WriteHeader(400)
-			_, _ = io.WriteString(w, `{"error":{"code":"model_not_supported"}}`)
+			_, _ = io.WriteString(w, `{"error":{"code":"invalid_request","message":"bad"},"echo":"requested model is not supported"}`)
 		default:
 			t.Errorf("unexpected path %s", r.URL.Path)
 			w.WriteHeader(500)
 		}
 	})})
-	w := testRequest(s, "POST", "/v1/chat/completions", `{"model":"gpt-4.1","messages":[{"role":"user","content":"hello"}]}`)
-	if w.Code != 400 || w.Body.String() != `{"error":{"code":"model_not_supported"}}` {
-		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	if w := testRequest(s, "POST", "/v1/chat/completions", `{"model":"gpt-4.1","messages":[{"role":"user","content":"hello"}]}`); w.Code != 400 {
+		t.Fatalf("status=%d body=%s, want 400", w.Code, w.Body.String())
 	}
-	w = testRequest(s, "GET", "/v1/models", "")
-	if w.Code != 200 {
-		t.Fatalf("models status = %d, body = %s", w.Code, w.Body.String())
+	w := testRequest(s, "GET", "/v1/models", "")
+	if !strings.Contains(w.Body.String(), `"gpt-4.1"`) {
+		t.Fatalf("非结构化拒绝不应隐藏模型，/v1/models = %s", w.Body.String())
 	}
-	var got struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
+}
+
+// TestGenerationAcceptsCaseInsensitiveModelKey encoding/json 按不区分大小写匹配键，
+// 因此 {"MODEL":"gpt-4.1"} 能通过本地校验并被转发到上游（上游调用一次），不会得到本地的“请求必须是 JSON 对象”400。
+func TestGenerationAcceptsCaseInsensitiveModelKey(t *testing.T) {
+	var generations atomic.Int32
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/copilot_internal/v2/token":
+			testSession(w, "", time.Now().Add(time.Hour))
+		case "/models":
+			_, _ = io.WriteString(w, testModels)
+		case "/chat/completions":
+			generations.Add(1)
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(500)
+		}
+	})})
+	w := testRequest(s, "POST", "/v1/chat/completions", `{"MODEL":"gpt-4.1","messages":[{"role":"user","content":"hello"}]}`)
+	if strings.Contains(w.Body.String(), "请求必须是 JSON 对象") {
+		t.Fatalf("不应被本地校验拒绝: status=%d body=%s", w.Code, w.Body.String())
 	}
-	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
-		t.Fatal(err)
+	if w.Code != 200 || generations.Load() != 1 {
+		t.Fatalf("status=%d body=%s generations=%d, want 200 且上游调用 1 次", w.Code, w.Body.String(), generations.Load())
 	}
-	ids := map[string]bool{}
-	for _, m := range got.Data {
-		ids[m.ID] = true
-	}
-	if !reflect.DeepEqual(ids, map[string]bool{"terms-model": true}) {
-		t.Fatalf("visible IDs = %v, want only terms-model", ids)
+}
+
+// TestGenerationRejectsInvalidModelField 请求体不是 JSON 对象或 model 不是非空字符串时返回 400，且不访问上游。
+func TestGenerationRejectsInvalidModelField(t *testing.T) {
+	for _, body := range []string{
+		`{`, `null`, `[]`, `"x"`, `{}`, `{"model":1}`, `{"model":null}`, `{"model":"  "}`,
+	} {
+		for _, path := range []string{"/v1/chat/completions", "/v1/responses", "/v1/messages"} {
+			t.Run(path+" "+body, func(t *testing.T) {
+				var upstream atomic.Int32
+				s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+					upstream.Add(1)
+					t.Errorf("unexpected upstream path %s", r.URL.Path)
+					w.WriteHeader(500)
+				})})
+				w := testRequest(s, "POST", path, body)
+				if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "请求必须是 JSON 对象，并包含非空字符串 model") {
+					t.Fatalf("status=%d body=%s, want 400 与 model 字段提示", w.Code, w.Body.String())
+				}
+				if got := upstream.Load(); got != 0 {
+					t.Fatalf("上游请求次数 = %d, want 0", got)
+				}
+			})
+		}
 	}
 }
 

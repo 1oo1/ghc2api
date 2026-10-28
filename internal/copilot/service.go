@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -326,14 +327,16 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 	if path == "/responses" {
 		body = withoutLoneToolChoice(body)
 	}
-	var request map[string]json.RawMessage
-	var model string
-	if json.Unmarshal(body, &request) != nil || request == nil ||
-		json.Unmarshal(request["model"], &model) != nil || strings.TrimSpace(model) == "" {
+	// 请求体不是对象、model 缺失/为 null/非字符串/空白时都视为无效（null 能成功解码为空结构体，故还要检查 Model 是否为 nil）。
+	var request struct {
+		Model *string `json:"model"`
+	}
+	if json.Unmarshal(body, &request) != nil || request.Model == nil || strings.TrimSpace(*request.Model) == "" {
 		s.log(r.Context(), slog.LevelWarn, "生成请求 JSON 或 model 字段无效", "bytes", len(body))
 		writeError(w, http.StatusBadRequest, "请求必须是 JSON 对象，并包含非空字符串 model")
 		return
 	}
+	model := *request.Model
 	// 写超时只针对响应写入，因此包装放在读取请求体之后（读取阶段不写响应）。请求结束时不清除截止时间，见 generationWriter。
 	// 注意：http.MaxBytesReader 超限时只有底层 w 实现 requestTooLarge 才会标记关闭连接（net/http 的 *response 实现了它）。
 	// 这里的 w 已被 withRequestLog（Pool 另有 record）包装为 statusResponseWriter，不实现该方法，
@@ -353,11 +356,19 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 	if modelErr != nil {
 		s.log(r.Context(), slog.LevelWarn, "读取模型列表失败", "error", s.redactString(modelErr.Error()))
 	}
-	if modelErr == nil && !list.supportsEndpoint(model, path) {
-		s.log(r.Context(), slog.LevelWarn, "所选模型不支持当前 API 路径",
-			"model", model, "upstream_path", path)
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("模型 %q 不支持 API 路径 %s", model, path))
-		return
+	if modelErr == nil {
+		endpoints := list.endpoints(model)
+		if endpoints == nil {
+			s.log(r.Context(), slog.LevelWarn, "所选模型不在模型列表中", "model", model)
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("模型 %q 不存在或当前账号不可用", model))
+			return
+		}
+		if !slices.Contains(endpoints, path) {
+			s.log(r.Context(), slog.LevelWarn, "所选模型不支持当前 API 路径",
+				"model", model, "upstream_path", path)
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("模型 %q 不支持 API 路径 %s", model, path))
+			return
+		}
 	}
 	s.acceptTerms(r.Context(), current, model)
 	// send 向上游发送一次生成请求；同一账号、session 与模型的重发（见 retryStaleItems）只替换请求体。
@@ -408,15 +419,32 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 		s.log(r.Context(), slog.LevelWarn, "生成请求返回客户端错误", "status", res.StatusCode, "model", model)
 		return
 	}
+	if res.StatusCode/100 == 2 {
+		// 生成成功说明模型可用，撤销此前的拒绝隐藏。
+		s.unrefuse(model)
+	}
 	s.log(r.Context(), apiStatusLogLevel(res.StatusCode), "生成响应开始返回客户端",
 		"status", res.StatusCode, "model", model)
 	// 429 与其他错误的计数、冷却由 Pool 按写给客户端的状态码处理（见 cooldown.go）；这里原样流式透传。
 	streamResponse(w, res, path == "/responses")
 }
 
-// modelRefusal 判断上游 400 正文是否为模型不可用的拒绝。
+// modelRefusal 判断上游 400 正文是否为模型不可用的拒绝：
+// 仅识别结构化错误，即 error.code 为 model_not_supported，或 error.message 含 requested model is not supported（不区分大小写）。
+// code、message 只有是 JSON 字符串时才参与判断，其他类型的字段被忽略，不影响另一个字段。
 func modelRefusal(body []byte) bool {
-	lower := bytes.ToLower(body)
-	return bytes.Contains(lower, []byte(`"model_not_supported"`)) ||
-		strings.Contains(string(lower), "requested model is not supported")
+	var wire struct {
+		Error struct {
+			Code    json.RawMessage `json:"code"`
+			Message json.RawMessage `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &wire) != nil {
+		return false
+	}
+	var code, message string
+	_ = json.Unmarshal(wire.Error.Code, &code) // 非字符串时保持空串
+	_ = json.Unmarshal(wire.Error.Message, &message)
+	return code == "model_not_supported" ||
+		strings.Contains(strings.ToLower(message), "requested model is not supported")
 }

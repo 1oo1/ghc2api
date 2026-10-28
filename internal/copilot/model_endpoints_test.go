@@ -214,7 +214,7 @@ func TestModelsEndpointStillHidesHiddenModels(t *testing.T) {
 }
 
 // TestAutoModelIsTreatedAsManualModel 模型名 "auto" 与其他手选模型一致：模型列表中没有 auto 时返回 400，
-// 提示不支持该 API 路径，不转发生成请求，也不访问 /auto 与 /models/session。
+// 提示模型不存在或当前账号不可用，不转发生成请求，也不访问 /auto 与 /models/session。
 func TestAutoModelIsTreatedAsManualModel(t *testing.T) {
 	for _, path := range []string{"/v1/chat/completions", "/v1/responses", "/v1/messages"} {
 		t.Run(path, func(t *testing.T) {
@@ -224,7 +224,7 @@ func TestAutoModelIsTreatedAsManualModel(t *testing.T) {
 			if w.Code != http.StatusBadRequest {
 				t.Fatalf("POST %s model=auto status=%d body=%s, want 400", path, w.Code, w.Body.String())
 			}
-			if want := `模型 \"auto\" 不支持 API 路径 ` + endpointTestUpstreamPath(path); !strings.Contains(w.Body.String(), want) {
+			if want := `模型 \"auto\" 不存在或当前账号不可用`; !strings.Contains(w.Body.String(), want) {
 				t.Fatalf("响应 %s 应包含 %s", w.Body.String(), want)
 			}
 			if calls := u.generationCalls(); len(calls) != 0 {
@@ -234,6 +234,37 @@ func TestAutoModelIsTreatedAsManualModel(t *testing.T) {
 				if p == "/auto" || p == "/models/session" {
 					t.Fatalf("不应访问上游 %s，实际请求路径 %v", p, u.requestedPaths())
 				}
+			}
+		})
+	}
+}
+
+// TestUnknownModelAndUnsupportedPathMessages 模型列表加载成功时区分两种 400：
+// 模型完全不在列表中（既非可见模型也非隐藏 chat 模型，含非 chat 模型）提示“不存在或当前账号不可用”；
+// 模型存在（可见或隐藏）但不支持当前路径时提示“不支持 API 路径”。两种情况都不转发生成请求。
+func TestUnknownModelAndUnsupportedPathMessages(t *testing.T) {
+	for _, tc := range []struct {
+		name, path, model, want string
+	}{
+		{"unknown-chat", "/v1/chat/completions", "not-in-models", `模型 \"not-in-models\" 不存在或当前账号不可用`},
+		{"unknown-responses", "/v1/responses", "not-in-models", `模型 \"not-in-models\" 不存在或当前账号不可用`},
+		{"non-chat-model", "/v1/responses", "embed-model", `模型 \"embed-model\" 不存在或当前账号不可用`},
+		{"visible-unsupported-path", "/v1/responses", "visible-chat", `模型 \"visible-chat\" 不支持 API 路径 /responses`},
+		{"hidden-unsupported-path", "/v1/chat/completions", "hidden-resp", `模型 \"hidden-resp\" 不支持 API 路径 /chat/completions`},
+		{"hidden-noep-unsupported-path", "/v1/responses", "hidden-noep", `模型 \"hidden-noep\" 不支持 API 路径 /responses`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			u := &endpointTestUpstream{}
+			s := newEndpointTestService(t, u)
+			w := testRequest(s, http.MethodPost, tc.path, endpointTestBody(tc.path, tc.model))
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s, want 400", w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), tc.want) {
+				t.Fatalf("响应 %s 应包含 %s", w.Body.String(), tc.want)
+			}
+			if calls := u.generationCalls(); len(calls) != 0 {
+				t.Fatalf("400 时上游生成接口不应被调用，实际 %+v", calls)
 			}
 		})
 	}

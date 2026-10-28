@@ -131,7 +131,7 @@ func (s *Service) retryStaleItems(ctx context.Context, w http.ResponseWriter, re
 		return res, nil
 	}
 	_ = res.Body.Close()
-	retry, err := send(withoutLoneToolChoice(cleaned))
+	retry, err := send(cleaned)
 	if err != nil {
 		return nil, err
 	}
