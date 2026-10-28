@@ -1768,10 +1768,35 @@ func TestOversizedGenerationBodyDoesNotReachUpstream(t *testing.T) {
 		calls.Add(1)
 		return nil, errors.New("oversized body must not reach upstream")
 	})}})
-	body := `{"model":"gpt-4.1","input":"` + strings.Repeat("a", 16<<20) + `"}`
+	body := `{"model":"gpt-4.1","input":"` + strings.Repeat("a", 100<<20) + `"}`
 	w := testRequest(s, "POST", "/v1/responses", body)
-	if w.Code != http.StatusRequestEntityTooLarge || calls.Load() != 0 {
-		t.Fatalf("oversized request = %d, upstream calls=%d", w.Code, calls.Load())
+	if w.Code != http.StatusRequestEntityTooLarge || calls.Load() != 0 || !strings.Contains(w.Body.String(), "100 MiB") {
+		t.Fatalf("oversized request = %d, upstream calls=%d, body=%.200s", w.Code, calls.Load(), w.Body.String())
+	}
+}
+
+// TestGenerationBodyAbove16MiBReachesUpstream 请求体上限为 100 MiB：超过旧上限 16 MiB 的请求体应完整转发到上游。
+func TestGenerationBodyAbove16MiBReachesUpstream(t *testing.T) {
+	var received atomic.Int64
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/copilot_internal/v2/token":
+			testSession(w, "", time.Now().Add(time.Hour))
+		case "/models":
+			_, _ = io.WriteString(w, testModels)
+		case "/responses":
+			n, _ := io.Copy(io.Discard, r.Body)
+			received.Store(n)
+			_, _ = io.WriteString(w, `{"id":"resp_1","object":"response","output":[]}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(500)
+		}
+	})})
+	body := `{"model":"gpt-4.1","input":"` + strings.Repeat("a", 20<<20) + `"}`
+	w := testRequest(s, "POST", "/v1/responses", body)
+	if w.Code != http.StatusOK || received.Load() < 20<<20 {
+		t.Fatalf("20 MiB request = %d, upstream received %d bytes, body=%.200s", w.Code, received.Load(), w.Body.String())
 	}
 }
 

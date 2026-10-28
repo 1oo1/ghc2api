@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-const maxRequestBody = 16 << 20
+const maxRequestBody = 100 << 20
 const maxMetadataBody = 4 << 20
 
 // Service 独立保存一个账号的 session 与模型缓存。
@@ -319,7 +319,7 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			s.log(r.Context(), slog.LevelWarn, "生成请求体超过大小限制", "limit_bytes", maxRequestBody)
-			writeError(w, http.StatusRequestEntityTooLarge, "请求体超过 16 MiB")
+			writeError(w, http.StatusRequestEntityTooLarge, "请求体超过 100 MiB")
 		} else {
 			s.log(r.Context(), slog.LevelWarn, "读取生成请求体失败", "error", err)
 			writeError(w, http.StatusBadRequest, "无法读取请求体")

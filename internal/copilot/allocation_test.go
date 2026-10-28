@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	// allocBodyBytes 是恶意请求体的大小，与生成接口的请求体上限同为 16 MiB。
+	// allocBodyBytes 是恶意请求体的大小。取 16 MiB（低于生成接口 100 MiB 的上限）已足以暴露按元素分配的问题，又不拖慢测试。
 	allocBodyBytes = 16 << 20
 	// allocParseLimit 是 sessionKey、initiator 单次调用允许的 TotalAlloc 增量上限，取 6 倍请求体。
 	// 实测（数字数组分别作为 messages、content、Responses input）：三个函数的增量约为请求体的 1 到 2 倍。

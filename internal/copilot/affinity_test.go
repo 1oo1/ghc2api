@@ -495,14 +495,14 @@ func TestSessionAffinityNoSignal500ReleasesConcurrencySlot(t *testing.T) {
 	}
 }
 
-// TestSessionAffinityOversizedBodyStillReturns413 超过 16 MiB 的请求体不计算会话键，但下游仍须读到完整请求体并返回 413。
+// TestSessionAffinityOversizedBodyStillReturns413 超过 100 MiB 的请求体不计算会话键，但下游仍须读到完整请求体并返回 413。
 func TestSessionAffinityOversizedBodyStillReturns413(t *testing.T) {
 	up := newMgmtUpstream(t)
 	p, _ := mgmtNewPool(t, up, DefaultSessionAffinityTTL, "alice", "bob")
-	body := `{"model":"gpt-4.1","messages":[{"role":"user","content":"` + strings.Repeat("a", 16<<20) + `"}]}`
+	body := `{"model":"gpt-4.1","messages":[{"role":"user","content":"` + strings.Repeat("a", 100<<20) + `"}]}`
 	w := poolRequest(p, "POST", "/v1/chat/completions", body)
-	if w.Code != http.StatusRequestEntityTooLarge || !strings.Contains(w.Body.String(), "16 MiB") {
-		t.Fatalf("超大请求体 status=%d body=%.200s, want 413 且提示 16 MiB", w.Code, w.Body.String())
+	if w.Code != http.StatusRequestEntityTooLarge || !strings.Contains(w.Body.String(), "100 MiB") {
+		t.Fatalf("超大请求体 status=%d body=%.200s, want 413 且提示 100 MiB", w.Code, w.Body.String())
 	}
 	if got := up.pool.generationOrder(); len(got) != 0 {
 		t.Fatalf("超大请求体不应到达上游生成接口: %v", got)
