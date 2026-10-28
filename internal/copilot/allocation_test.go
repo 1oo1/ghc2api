@@ -1,7 +1,7 @@
 package copilot
 
 // 本文件是请求体分配量的回归测试：messages、input 或 content 数组中含有大量非对象元素（如约 800 万个数字）时，
-// 会话键、initiator、promptFrom 与 hasVision 不得按元素数量分配内存（不得为每个元素建切片项或做 json.Unmarshal）。
+// 会话键、initiator 与 hasVision 不得按元素数量分配内存（不得为每个元素建切片项或做 json.Unmarshal）。
 
 import (
 	"net/http"
@@ -14,7 +14,7 @@ import (
 const (
 	// allocBodyBytes 是恶意请求体的大小，与生成接口的请求体上限同为 16 MiB。
 	allocBodyBytes = 16 << 20
-	// allocParseLimit 是 sessionKey、initiator、promptFrom 单次调用允许的 TotalAlloc 增量上限，取 6 倍请求体。
+	// allocParseLimit 是 sessionKey、initiator 单次调用允许的 TotalAlloc 增量上限，取 6 倍请求体。
 	// 实测（数字数组分别作为 messages、content、Responses input）：三个函数的增量约为请求体的 1 到 2 倍。
 	// 增量来自 json.Unmarshal 为 RawMessage 字段复制的字节：messages 或 input 数组整体复制一次（约 1 倍）；
 	// content 位于消息对象内部时，消息对象解码时再复制一次 content（合计约 2 倍）。6 倍留出余量。
@@ -46,7 +46,7 @@ func allocDelta(fn func()) uint64 {
 }
 
 // TestRequestBodyArrayAllocationIsBounded 三种恶意请求体（数字数组作为 messages、作为 content、作为 Responses input）上，
-// 会话键、initiator、promptFrom 的 TotalAlloc 增量必须低于 allocParseLimit，hasVision 必须低于 allocScanLimit。
+// 会话键、initiator 的 TotalAlloc 增量必须低于 allocParseLimit，hasVision 必须低于 allocScanLimit。
 func TestRequestBodyArrayAllocationIsBounded(t *testing.T) {
 	const chat = `{"model":"gpt-4.1","messages":[`
 	bodies := []struct {
@@ -68,7 +68,6 @@ func TestRequestBodyArrayAllocationIsBounded(t *testing.T) {
 		}{
 			{name: "sessionKey", limit: allocParseLimit, call: func() { sessionKey(r, tc.body, tc.upstream) }},
 			{name: "initiator", limit: allocParseLimit, call: func() { initiator(tc.body) }},
-			{name: "promptFrom", limit: allocParseLimit, call: func() { promptFrom(tc.body) }},
 			{name: "hasVision", limit: allocScanLimit, call: func() { hasVision(tc.body) }},
 		}
 		for _, c := range calls {

@@ -10,23 +10,17 @@ import (
 	"os"
 	"regexp"
 	"slices"
-	"sort"
 	"time"
 )
 
 var internalModel = regexp.MustCompile(`^(copilot-search|exec-agent|trajectory)|-(secondary|tertiary|4th|free-auto)$`)
 
 type model struct {
-	ID        string   `json:"id"`
-	Vendor    string   `json:"vendor"`
-	Picker    bool     `json:"model_picker_enabled"`
-	Category  string   `json:"model_picker_category"`
-	Default   bool     `json:"is_chat_default"`
-	Fallback  bool     `json:"is_chat_fallback"`
-	Endpoints []string `json:"supported_endpoints"`
-	Billing   *struct {
-		Premium bool `json:"is_premium"`
-	} `json:"billing"`
+	ID           string   `json:"id"`
+	Vendor       string   `json:"vendor"`
+	Picker       bool     `json:"model_picker_enabled"`
+	Category     string   `json:"model_picker_category"`
+	Endpoints    []string `json:"supported_endpoints"`
 	Capabilities struct {
 		Type string `json:"type"`
 	} `json:"capabilities"`
@@ -37,9 +31,9 @@ type model struct {
 }
 
 type modelList struct {
-	Data  []json.RawMessage `json:"data"`
-	Picks []string          `json:"picks"`
-	Known map[string]bool   `json:"known"`
+	Data []json.RawMessage `json:"data"`
+	// Picks 是可选（策略已启用）模型的 id 列表。
+	Picks []string `json:"picks"`
 	// Endpoints 记录每个 chat 模型（含隐藏模型）支持的路径；旧缓存没有该字段。
 	Endpoints map[string][]string `json:"endpoints"`
 	Waiting   map[string]bool     `json:"waiting"`
@@ -75,14 +69,12 @@ func (s *Service) getModels(ctx context.Context, current session) (modelList, er
 		s.log(ctx, slog.LevelWarn, "刷新 Copilot 模型列表失败", "error", s.redactString(err.Error()))
 		return modelList{}, err
 	}
-	list := modelList{Data: []json.RawMessage{}, Known: map[string]bool{}, Endpoints: map[string][]string{}, Waiting: map[string]bool{}, At: time.Now()}
-	rank := map[string]int{}
+	list := modelList{Data: []json.RawMessage{}, Endpoints: map[string][]string{}, Waiting: map[string]bool{}, At: time.Now()}
 	for _, raw := range wire.Data {
 		var m model
 		if json.Unmarshal(raw, &m) != nil || m.ID == "" || m.Capabilities.Type != "chat" {
 			continue
 		}
-		list.Known[m.ID] = true
 		if len(m.Endpoints) == 0 {
 			list.Endpoints[m.ID] = []string{"/chat/completions"}
 		} else {
@@ -93,18 +85,6 @@ func (s *Service) getModels(ctx context.Context, current session) (modelList, er
 		}
 		if (m.Policy != nil && m.Policy.State == "enabled") || (m.Policy == nil && m.Picker) {
 			list.Picks = append(list.Picks, m.ID)
-			switch {
-			case m.Fallback:
-				rank[m.ID] = 0
-			case m.Default:
-				rank[m.ID] = 1
-			case m.ID == "gpt-4.1":
-				rank[m.ID] = 2
-			case m.Billing != nil && !m.Billing.Premium:
-				rank[m.ID] = 3
-			default:
-				rank[m.ID] = 4
-			}
 		} else if m.Policy != nil && m.Policy.Terms != "" {
 			list.Waiting[m.ID] = true
 		} else {
@@ -120,7 +100,6 @@ func (s *Service) getModels(ctx context.Context, current session) (modelList, er
 		normalized, _ := json.Marshal(metadata)
 		list.Data = append(list.Data, normalized)
 	}
-	sort.SliceStable(list.Picks, func(i, j int) bool { return rank[list.Picks[i]] < rank[list.Picks[j]] })
 	s.models = list
 	if err := s.writeCacheUnlessCooling("models", list); err != nil {
 		s.log(ctx, slog.LevelWarn, "写入磁盘模型缓存失败", "error", s.redactString(err.Error()))
@@ -146,31 +125,20 @@ func modelCacheFresh(at time.Time, ttl time.Duration) bool {
 	return !at.IsZero() && age >= 0 && age < ttl
 }
 
-// supportsEndpoint 判断模型是否支持 path；pick 为本次 Auto 选择，手选模型传零值。
-func (list modelList) supportsEndpoint(id, path string, pick autoSession) bool {
-	return slices.Contains(list.endpoints(id, pick), path)
+// supportsEndpoint 判断模型是否支持 path。
+func (list modelList) supportsEndpoint(id, path string) bool {
+	return slices.Contains(list.endpoints(id), path)
 }
 
-// endpoints 依次取：可见模型的 /models 路径、/auto 声明的路径、隐藏 chat 模型的路径；
-// Auto 选中但 /models 不认识的模型视为只支持 /chat/completions，其余返回 nil。
-func (list modelList) endpoints(id string, pick autoSession) []string {
+// endpoints 依次取：可见模型的 /models 路径、隐藏 chat 模型的路径，其余返回 nil。
+func (list modelList) endpoints(id string) []string {
 	for _, raw := range list.Data {
 		var entry model
 		if json.Unmarshal(raw, &entry) == nil && entry.ID == id {
 			return entry.Endpoints
 		}
 	}
-	isAuto := id != "" && pick.Model == id
-	if isAuto && len(pick.Endpoints) > 0 {
-		return pick.Endpoints
-	}
-	if endpoints, ok := list.Endpoints[id]; ok {
-		return endpoints
-	}
-	if isAuto {
-		return []string{"/chat/completions"}
-	}
-	return nil
+	return list.Endpoints[id]
 }
 
 func (s *Service) handleModels(w http.ResponseWriter, r *http.Request) {
@@ -185,7 +153,7 @@ func (s *Service) handleModels(w http.ResponseWriter, r *http.Request) {
 		s.handleError(r.Context(), w, err)
 		return
 	}
-	data := make([]json.RawMessage, 0, len(list.Data)+1)
+	data := make([]json.RawMessage, 0, len(list.Data))
 	for _, raw := range list.Data {
 		var m model
 		_ = json.Unmarshal(raw, &m)
@@ -193,7 +161,6 @@ func (s *Service) handleModels(w http.ResponseWriter, r *http.Request) {
 			data = append(data, raw)
 		}
 	}
-	data = append(data, json.RawMessage(`{"id":"auto","name":"Auto","object":"model","owned_by":"github-copilot"}`))
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 	s.log(r.Context(), slog.LevelInfo, "Copilot 模型列表已返回", "visible_count", len(data))
 }

@@ -232,9 +232,6 @@ func (s *Service) doAPI(ctx context.Context, req *http.Request) (*http.Response,
 		return nil, safeErr
 	}
 	level := apiStatusLogLevel(res.StatusCode)
-	if res.StatusCode == http.StatusNotFound && isOptionalAutoEndpoint(req.URL.Path) {
-		level = slog.LevelInfo
-	}
 	s.log(ctx, level, "上游 API 响应已收到", "method", req.Method, "url", safeURL,
 		"status", res.StatusCode, "duration_ms", time.Since(started).Milliseconds())
 	if logger != nil && logger.Enabled(ctx, slog.LevelDebug) {
@@ -709,7 +706,7 @@ func (b *debugResponseBody) logChunks(chunks [][]byte) {
 func debugBodyBufferLimit(path string) int {
 	switch {
 	case path == "/copilot_internal/v2/token", path == "/copilot_internal/user",
-		path == "/models", path == "/auto", path == "/models/session",
+		path == "/models",
 		strings.HasSuffix(path, "/policy"):
 		return maxMetadataBody
 	default:
@@ -728,10 +725,6 @@ func apiStatusLogLevel(status int) slog.Level {
 	default:
 		return slog.LevelInfo
 	}
-}
-
-func isOptionalAutoEndpoint(path string) bool {
-	return path == "/auto" || path == "/models/session"
 }
 
 func (s *Service) redactHeaders(headers http.Header) map[string][]string {

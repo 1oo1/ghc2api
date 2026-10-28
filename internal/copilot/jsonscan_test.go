@@ -82,7 +82,7 @@ var scanFuncs = []scanFunc{
 	{"skipJSONSpace", func(in []byte) { skipJSONSpace(in, 0) }},
 	{"firstByte", func(in []byte) { firstByte(in) }},
 	{"onlyToolResults", func(in []byte) { onlyToolResults(in) }},
-	{"contentText", func(in []byte) { contentText(in, "\n") }},
+	{"contentText", func(in []byte) { contentText(in) }},
 	{"decodeASCIIString", func(in []byte) {
 		var buf [16]byte
 		if len(in) > 0 && in[0] == '"' {
@@ -97,7 +97,6 @@ var scanFuncs = []scanFunc{
 	{"hasVision", func(in []byte) { hasVision(in) }},
 	{"requestInputs", func(in []byte) { requestInputs(in) }},
 	{"initiator", func(in []byte) { initiator(in) }},
-	{"promptFrom", func(in []byte) { promptFrom(in) }},
 }
 
 // runScanOnce 在独立 goroutine 中执行 run(input)。返回空字符串表示按时返回且未 panic，否则返回失败原因。

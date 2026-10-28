@@ -319,30 +319,3 @@ func TestCooldownFailuresWhileCoolingDoNotExtendOrRepeat(t *testing.T) {
 		t.Fatalf("进入冷却的日志 %d 条, want 恰好 1 条", n)
 	}
 }
-
-// TestCooldownAutoFallbackSuccessIsNotAnError Auto 的 /auto 返回 429 但 /models/session 兜底成功时，请求最终为 200，
-// 不计为错误，账号也不冷却（即使多次发生）。
-func TestCooldownAutoFallbackSuccessIsNotAnError(t *testing.T) {
-	const autoBody = `{"model":"auto","messages":[{"role":"user","content":"hi"}]}`
-	upstream := newPoolUpstream(t)
-	// 只让 A 的 /auto 返回 429；/models/session 仍由测试上游正常处理。
-	client := testClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/auto" && r.Header.Get("Authorization") == "Bearer session-oauth-a" {
-			w.WriteHeader(http.StatusTooManyRequests)
-			return
-		}
-		upstream.serve(w, r)
-	})
-	p := testPool(t, poolUserConfigs(t, client, "a", "b"))
-	for i := range 6 {
-		if w := poolRequest(p, "POST", "/v1/chat/completions", autoBody); w.Code != http.StatusOK {
-			t.Fatalf("请求 %d status=%d body=%s, want 200（兜底成功）", i, w.Code, w.Body.String())
-		}
-	}
-	if upstream.autoCount("oauth-a") == 0 {
-		t.Fatal("前提不成立：A 应被 Auto 接口请求过")
-	}
-	if v := cooldownView(t, p, "a"); v.CooldownUntil != nil || v.Stats.Errors != 0 {
-		t.Fatalf("兜底成功的请求被计为错误: until=%v errors=%d", v.CooldownUntil, v.Stats.Errors)
-	}
-}

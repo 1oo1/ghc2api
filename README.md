@@ -32,6 +32,6 @@ make build
 | [`docs/quota-stats.md`](docs/quota-stats.md) | 额度解析与刷新、请求统计 |
 | [`docs/management.md`](docs/management.md) | 管理接口、导入与设备登录 |
 | [`docs/web-console.md`](docs/web-console.md) | Web 控制台与前端构建 |
-| [`docs/upstream.md`](docs/upstream.md) | 上游 session、模型、Auto 行为 |
+| [`docs/upstream.md`](docs/upstream.md) | 上游 session、模型行为 |
 | [`docs/development.md`](docs/development.md) | Makefile、测试、来源与服务条款 |
 | [`docs/magpie-copilot-sync.md`](docs/magpie-copilot-sync.md) | 与 magpie 上游同步（含 CLIProxyAPI 会话亲和键） |

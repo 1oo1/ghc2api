@@ -194,7 +194,7 @@ func (p *Pool) WaitCooldownEffectsTimeout(d time.Duration) bool {
 }
 
 // settleCooldown 执行进入冷却的异步副作用（由 enterCooldown 启动，并计入 poolAccount.effects），顺序固定：
-// 先写入 cooldown.json（崩溃时冷却不会丢失），再清空 session、模型列表与 Auto 会话（内存与磁盘），最后删除指向本账号的会话绑定。
+// 先写入 cooldown.json（崩溃时冷却不会丢失），再清空 session 与模型列表（内存与磁盘），最后删除指向本账号的会话绑定。
 // 破坏性步骤执行前（清缓存的步骤在取得缓存锁之后）都检查账号仍处于本次冷却（截止时间仍为 until）；已被解除则跳过（见 liftCooldown）。
 func (a *poolAccount) settleCooldown(ctx context.Context, until time.Time, reason string) {
 	a.writeRecord(ctx, until, reason)
@@ -202,7 +202,6 @@ func (a *poolAccount) settleCooldown(ctx context.Context, until time.Time, reaso
 	if err := errors.Join(a.service.forgetSession(still), a.service.forgetModels(still)); err != nil {
 		a.service.log(ctx, slog.LevelWarn, "清空冷却账号的缓存失败", "id", a.id, "error", a.service.redactString(err.Error()))
 	}
-	a.service.forgetAuto(still)
 	if a.affinity != nil && still() {
 		a.affinity.dropAccount(a.id)
 	}

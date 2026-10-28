@@ -22,7 +22,7 @@ import (
 const maxRequestBody = 16 << 20
 const maxMetadataBody = 4 << 20
 
-// Service 独立保存一个账号的 session、模型和 Auto 缓存。
+// Service 独立保存一个账号的 session 与模型缓存。
 type Service struct {
 	config Config
 	client *http.Client
@@ -46,9 +46,6 @@ type Service struct {
 	session   session
 	modelsMu  contextMutex
 	models    modelList
-	autoMu    contextMutex
-	autoState sync.Mutex
-	auto      autoSession
 	refusedMu sync.Mutex
 	refused   map[string]time.Time
 }
@@ -99,7 +96,7 @@ func New(config Config) (*Service, error) {
 		config: config, client: safeClient(config.Client), refused: make(map[string]time.Time),
 		logger: config.Logger, secrets: make(map[string]struct{}),
 		cacheDir: cacheDir, modelsCacheTTL: modelsCacheTTL, quotaRefreshInterval: quotaRefreshInterval,
-		sessionMu: make(contextMutex, 1), modelsMu: make(contextMutex, 1), autoMu: make(contextMutex, 1),
+		sessionMu: make(contextMutex, 1), modelsMu: make(contextMutex, 1),
 	}
 	service.addSecret(config.Token)
 	service.addSecret(config.APIKey)
@@ -342,129 +339,84 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 	// 这里的 w 已被 withRequestLog（Pool 另有 record）包装为 statusResponseWriter，不实现该方法，
 	// 因此 Service 与 Pool 两条路径下超限都只返回 413，不会由 MaxBytesReader 关闭连接。
 	w = newGenerationWriter(w)
-	isAuto := model == "auto"
-	// X-Initiator 与 Copilot-Vision-Request 只取决于客户端的原始请求体，与 Auto 重试无关，因此在循环外只计算一次。
+	// X-Initiator 与 Copilot-Vision-Request 只取决于客户端的原始请求体。
 	xInitiator := initiator(body)
 	vision := hasVision(body)
 	s.log(r.Context(), slog.LevelInfo, "开始处理生成请求", "model", model, "upstream_path", path, "request_bytes", len(body))
-	staleRetried := false // 失效输出项重试每个请求最多一次，见 retryStaleItems
-	for attempt := 0; attempt < 3; attempt++ {
-		current, err := s.getSession(r.Context())
-		if err != nil {
-			s.handleError(r.Context(), w, err)
-			return
-		}
-		// 手选模型在列表失败时由上游判断；Auto 会在解析后重试读取列表。
-		list, modelErr := s.getModels(r.Context(), current)
-		if modelErr != nil {
-			s.log(r.Context(), slog.LevelWarn, "读取模型列表失败", "error", s.redactString(modelErr.Error()))
-		}
-		outBody := body
-		var pick autoSession
-		if isAuto {
-			s.log(r.Context(), slog.LevelInfo, "开始解析 Auto 模型", "attempt", attempt+1)
-			pick, err = s.resolveAuto(r.Context(), current, promptFrom(body))
-			if err != nil {
-				s.handleError(r.Context(), w, err)
-				return
-			}
-			model = pick.Model
-			s.log(r.Context(), slog.LevelInfo, "Auto 模型已解析", "model", model)
-			request["model"], _ = json.Marshal(model)
-			outBody, _ = json.Marshal(request)
-		}
-		if isAuto && modelErr != nil {
-			// Auto 接口可能成功而模型列表失败；重试获取列表，无法校验时不转发。
-			list, modelErr = s.getModels(r.Context(), current)
-			if modelErr != nil {
-				s.log(r.Context(), slog.LevelWarn, "Auto 模型路径校验失败", "error", s.redactString(modelErr.Error()))
-				s.handleError(r.Context(), w, modelErr)
-				return
-			}
-		}
-		if modelErr == nil && !list.supportsEndpoint(model, path, pick) {
-			if isAuto {
-				s.dropAuto(pick)
-			}
-			s.log(r.Context(), slog.LevelWarn, "所选模型不支持当前 API 路径",
-				"model", model, "upstream_path", path)
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("模型 %q 不支持 API 路径 %s", model, path))
-			return
-		}
-		s.acceptTerms(r.Context(), current, model)
-		// send 向上游发送一次生成请求；同一账号、session 与模型的重发（见 retryStaleItems）只替换请求体。
-		send := func(payload []byte) (*http.Response, error) {
-			req, err := s.apiRequest(r.Context(), current, http.MethodPost, path, payload)
-			if err != nil {
-				return nil, err
-			}
-			req.URL.RawQuery = r.URL.RawQuery
-			copyRequestHeaders(req.Header, r.Header)
-			current.setHeaders(req.Header)
-			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("Openai-Intent", "conversation-panel")
-			req.Header.Set("X-Initiator", xInitiator)
-			if vision {
-				req.Header.Set("Copilot-Vision-Request", "true")
-			}
-			if pick.Token != "" {
-				req.Header.Set("Copilot-Session-Token", pick.Token)
-			}
-			res, err := s.doAPI(r.Context(), req)
-			if err != nil {
-				return nil, errors.New("Copilot 生成请求失败: " + err.Error())
-			}
-			return res, nil
-		}
-		res, err := send(outBody)
-		if err == nil && path == "/responses" {
-			// 输入项绑定在原连接上被上游拒绝：清理后重发一次，仍失败则返回上游响应（401 改为 500）且不惩罚账号。
-			var cleaned []byte
-			res, cleaned, err = s.retryStaleItems(r.Context(), w, res, outBody, model, !staleRetried, send)
-			if cleaned != nil {
-				// 清理后的输入沿用到后续 Auto 轮次：不再先发原始输入，也不会再次重试。
-				staleRetried = true
-				body = cleaned
-				request = nil
-				_ = json.Unmarshal(cleaned, &request)
-			}
-		}
-		if err != nil {
-			s.handleError(r.Context(), w, err)
-			return
-		}
-		// 只在任何响应尚未发给客户端时重试明确的 Auto 拒绝。
-		if res.StatusCode == http.StatusBadRequest {
-			data, readErr := readLimited(res.Body, maxMetadataBody)
-			_ = res.Body.Close()
-			if readErr != nil {
-				// 上游 400 的正文读不出来：无法判断是否为模型拒绝，按上游 400 原样返回；不是网络错误，也不计数（见 cooldown.go）。
-				s.log(r.Context(), slog.LevelWarn, "读取上游 400 响应正文失败", "error", s.redactString(readErr.Error()))
-				writeError(w, http.StatusBadRequest, "上游返回 400，且读取错误详情失败")
-				return
-			}
-			refusal := modelRefusal(data)
-			sessionGone := strings.Contains(strings.ToLower(string(data)), "not available for session") && pick.Token != ""
-			if refusal {
-				s.refuse(model)
-			}
-			if isAuto && (refusal || sessionGone) {
-				s.log(r.Context(), slog.LevelWarn, "Auto 上游拒绝当前模型", "model", model, "attempt", attempt+1, "retry", attempt < 2)
-				s.dropAuto(pick)
-				if attempt < 2 {
-					continue
-				}
-			}
-			copyResponseHeaders(w.Header(), res.Header)
-			w.WriteHeader(res.StatusCode)
-			_, _ = w.Write(data)
-			s.log(r.Context(), slog.LevelWarn, "生成请求返回客户端错误", "status", res.StatusCode, "model", model)
-			return
-		}
-		s.log(r.Context(), apiStatusLogLevel(res.StatusCode), "生成响应开始返回客户端",
-			"status", res.StatusCode, "model", model)
-		// 429 与其他错误的计数、冷却由 Pool 按写给客户端的状态码处理（见 cooldown.go）；这里原样流式透传。
-		streamResponse(w, res, path == "/responses")
+	current, err := s.getSession(r.Context())
+	if err != nil {
+		s.handleError(r.Context(), w, err)
 		return
 	}
+	// 模型列表失败时由上游判断手选模型是否可用。
+	list, modelErr := s.getModels(r.Context(), current)
+	if modelErr != nil {
+		s.log(r.Context(), slog.LevelWarn, "读取模型列表失败", "error", s.redactString(modelErr.Error()))
+	}
+	if modelErr == nil && !list.supportsEndpoint(model, path) {
+		s.log(r.Context(), slog.LevelWarn, "所选模型不支持当前 API 路径",
+			"model", model, "upstream_path", path)
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("模型 %q 不支持 API 路径 %s", model, path))
+		return
+	}
+	s.acceptTerms(r.Context(), current, model)
+	// send 向上游发送一次生成请求；同一账号、session 与模型的重发（见 retryStaleItems）只替换请求体。
+	send := func(payload []byte) (*http.Response, error) {
+		req, err := s.apiRequest(r.Context(), current, http.MethodPost, path, payload)
+		if err != nil {
+			return nil, err
+		}
+		req.URL.RawQuery = r.URL.RawQuery
+		copyRequestHeaders(req.Header, r.Header)
+		current.setHeaders(req.Header)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Openai-Intent", "conversation-panel")
+		req.Header.Set("X-Initiator", xInitiator)
+		if vision {
+			req.Header.Set("Copilot-Vision-Request", "true")
+		}
+		res, err := s.doAPI(r.Context(), req)
+		if err != nil {
+			return nil, errors.New("Copilot 生成请求失败: " + err.Error())
+		}
+		return res, nil
+	}
+	res, err := send(body)
+	if err == nil && path == "/responses" {
+		// 输入项绑定在原连接上被上游拒绝：清理后重发一次，仍失败则返回上游响应（401 改为 500）且不惩罚账号。
+		res, err = s.retryStaleItems(r.Context(), w, res, body, model, send)
+	}
+	if err != nil {
+		s.handleError(r.Context(), w, err)
+		return
+	}
+	if res.StatusCode == http.StatusBadRequest {
+		data, readErr := readLimited(res.Body, maxMetadataBody)
+		_ = res.Body.Close()
+		if readErr != nil {
+			// 上游 400 的正文读不出来：无法判断是否为模型拒绝，按上游 400 原样返回；不是网络错误，也不计数（见 cooldown.go）。
+			s.log(r.Context(), slog.LevelWarn, "读取上游 400 响应正文失败", "error", s.redactString(readErr.Error()))
+			writeError(w, http.StatusBadRequest, "上游返回 400，且读取错误详情失败")
+			return
+		}
+		if modelRefusal(data) {
+			s.refuse(model)
+		}
+		copyResponseHeaders(w.Header(), res.Header)
+		w.WriteHeader(res.StatusCode)
+		_, _ = w.Write(data)
+		s.log(r.Context(), slog.LevelWarn, "生成请求返回客户端错误", "status", res.StatusCode, "model", model)
+		return
+	}
+	s.log(r.Context(), apiStatusLogLevel(res.StatusCode), "生成响应开始返回客户端",
+		"status", res.StatusCode, "model", model)
+	// 429 与其他错误的计数、冷却由 Pool 按写给客户端的状态码处理（见 cooldown.go）；这里原样流式透传。
+	streamResponse(w, res, path == "/responses")
+}
+
+// modelRefusal 判断上游 400 正文是否为模型不可用的拒绝。
+func modelRefusal(body []byte) bool {
+	lower := bytes.ToLower(body)
+	return bytes.Contains(lower, []byte(`"model_not_supported"`)) ||
+		strings.Contains(string(lower), "requested model is not supported")
 }

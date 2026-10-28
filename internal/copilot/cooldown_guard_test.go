@@ -85,7 +85,7 @@ func TestNewCooldownSurvivesLiftThatWaitedOnRecordLock(t *testing.T) {
 	}
 }
 
-// TestForgetCachesRespectStillCheck 清空缓存的步骤（forgetSession、forgetModels、forgetAuto）在 still 返回 false（冷却已解除）时，
+// TestForgetCachesRespectStillCheck 清空缓存的步骤（forgetSession、forgetModels）在 still 返回 false（冷却已解除）时，
 // 不改动内存与磁盘上的缓存；still 返回 true 时才清空（对照）。
 func TestForgetCachesRespectStillCheck(t *testing.T) {
 	f := newCooldownFixture(t, "a")
@@ -102,7 +102,6 @@ func TestForgetCachesRespectStillCheck(t *testing.T) {
 	if err := s.writeCache("models", s.models); err != nil {
 		t.Fatal(err)
 	}
-	s.auto = autoSession{Token: "auto-token", Model: "gpt-4.1", ExpiresAt: time.Now().Add(time.Hour).Unix()}
 
 	never := func() bool { return false }
 	if err := s.forgetSession(never); err != nil {
@@ -111,15 +110,11 @@ func TestForgetCachesRespectStillCheck(t *testing.T) {
 	if err := s.forgetModels(never); err != nil {
 		t.Fatal(err)
 	}
-	s.forgetAuto(never)
 	if s.session.Token != "keep-token" {
 		t.Fatalf("still 为 false 时内存 session 被清空: %q", s.session.Token)
 	}
 	if len(s.models.Data) != 1 {
 		t.Fatalf("still 为 false 时内存模型列表被清空: 条数 %d", len(s.models.Data))
-	}
-	if s.auto.Model != "gpt-4.1" {
-		t.Fatalf("still 为 false 时内存 Auto 会话被清空: %q", s.auto.Model)
 	}
 	if !cooldownSessionFileHasToken(sessionPath) {
 		t.Fatal("still 为 false 时磁盘 session.json 被删除或清空")
@@ -135,9 +130,8 @@ func TestForgetCachesRespectStillCheck(t *testing.T) {
 	if err := s.forgetModels(always); err != nil {
 		t.Fatal(err)
 	}
-	s.forgetAuto(always)
-	if s.session.Token != "" || len(s.models.Data) != 0 || s.auto.Model != "" {
-		t.Fatalf("still 为 true 时应清空内存缓存：session=%q models=%d auto=%q", s.session.Token, len(s.models.Data), s.auto.Model)
+	if s.session.Token != "" || len(s.models.Data) != 0 {
+		t.Fatalf("still 为 true 时应清空内存缓存：session=%q models=%d", s.session.Token, len(s.models.Data))
 	}
 	if cooldownSessionFileHasToken(sessionPath) || cooldownModelsFileHasData(modelsPath) {
 		t.Fatal("still 为 true 时应清空磁盘缓存")

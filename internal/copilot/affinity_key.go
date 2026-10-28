@@ -250,7 +250,7 @@ func firstUserItemText(raw json.RawMessage) (string, bool) {
 		if m.Role != "user" {
 			return true
 		}
-		text, found = contentText(m.Content, ""), true
+		text, found = contentText(m.Content), true
 		return false
 	})
 	return text, found

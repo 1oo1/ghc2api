@@ -115,37 +115,31 @@ func rejectedStaleItems(res *http.Response) bool {
 }
 
 // retryStaleItems 处理上游 /responses 的首次响应 res：不是失效项错误时原样返回；
-// 是且 canRetry 时清理 outBody（Auto 下须是已改写 model 的请求体）并用 send 重发一次（同一账号、session 与模型，头部与首次一致），
-// 同时返回重发所用的请求体，调用方应以它替换后续轮次的请求体（Auto 重新解析后无需再次清理）；未重发时返回 nil。
-// 最终响应仍是失效项错误（不能重试、无法清理，或重试后仍是）时由 ignoreStaleItems 标记 failureIgnored 并把 401 改为 500：
+// 是则清理 outBody 并用 send 重发一次（同一账号、session 与模型，头部与首次一致），因此每个请求最多重试一次。
+// 最终响应仍是失效项错误（无法清理，或重试后仍是）时由 ignoreStaleItems 标记 failureIgnored 并把 401 改为 500：
 // 正文原样返回给客户端，但不计账号错误、不冷却、不写风控记录。
-// 调用方在整个请求内只在首次清理成功后把 canRetry 置 false，因此每个请求最多重试一次。
 func (s *Service) retryStaleItems(ctx context.Context, w http.ResponseWriter, res *http.Response, outBody []byte, model string,
-	canRetry bool, send func(body []byte) (*http.Response, error)) (*http.Response, []byte, error) {
+	send func(body []byte) (*http.Response, error)) (*http.Response, error) {
 	if !rejectedStaleItems(res) {
-		return res, nil, nil
+		return res, nil
 	}
-	var cleaned []byte
-	if canRetry {
-		cleaned, canRetry = withoutConnectionItems(outBody)
-	}
+	cleaned, canRetry := withoutConnectionItems(outBody)
 	// 日志不含请求正文。
 	s.log(ctx, slog.LevelWarn, "上游拒绝了与连接绑定的输入项", "status", res.StatusCode, "model", model, "retry", canRetry)
 	if !canRetry {
 		ignoreStaleItems(w, res)
-		return res, nil, nil
+		return res, nil
 	}
 	_ = res.Body.Close()
-	cleaned = withoutLoneToolChoice(cleaned)
-	retry, err := send(cleaned)
+	retry, err := send(withoutLoneToolChoice(cleaned))
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if rejectedStaleItems(retry) {
 		s.log(ctx, slog.LevelWarn, "清理输入项后上游仍拒绝", "status", retry.StatusCode, "model", model, "retry", false)
 		ignoreStaleItems(w, retry)
 	}
-	return retry, cleaned, nil
+	return retry, nil
 }
 
 // ignoreStaleItems 把最终仍是失效项错误的响应 res 标记为 failureIgnored，并把 401 改为 500（400 不变）：

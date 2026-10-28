@@ -11,7 +11,7 @@ package copilot
 //   - staleItemError(status, body) 识别上述两种响应（不区分大小写），其余（普通 401/400 等）不是。
 //   - withoutConnectionItems(body) 丢弃 reasoning 与 item_reference 项、删去其余对象项的顶层 id，
 //     没有可改内容或请求体不合法时返回原 body 与 false。
-//   - Service 在同一账号、同一 session、同一模型（Auto 不重新解析）上用清理后的请求体最多重发一次，仅限上游 /responses。
+//   - Service 在同一账号、同一 session、同一模型上用清理后的请求体最多重发一次，仅限上游 /responses。
 //   - 无法重试或重试后仍失败时，最终响应标记 failureIgnored：Pool 不计账号错误、不冷却、不写风控记录。
 //   - 最终响应是失效项 401 时不能把 401 返回客户端（入口按 401 频率封禁 IP）：状态改为 500，正文仍为上游正文；
 //     是否 stream 不影响该转换。失效项 400 的最终响应仍按 400 原样返回；重试后是其他错误也原样返回。
@@ -23,7 +23,6 @@ package copilot
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -282,16 +281,14 @@ type staleReply struct {
 
 // staleUpstream 记录上游收到的生成请求，并按序号返回应答：n 从 1 开始，按各上游路径分别计数。
 type staleUpstream struct {
-	mu          sync.Mutex
-	bodies      map[string][][]byte      // 每个路径收到的请求体，按到达顺序
-	headers     map[string][]http.Header // 每个路径收到的请求头，按到达顺序
-	autoCalls   int                      // /auto 调用次数
-	tokenCalls  int                      // session 交换次数
-	respond     func(path string, n int, body []byte) staleReply
-	autoSession string // 非空时 /auto 返回该 session token
+	mu         sync.Mutex
+	bodies     map[string][][]byte      // 每个路径收到的请求体，按到达顺序
+	headers    map[string][]http.Header // 每个路径收到的请求头，按到达顺序
+	tokenCalls int                      // session 交换次数
+	respond    func(path string, n int, body []byte) staleReply
 }
 
-// serve 是 testClient 使用的上游处理器；/auto 固定选择 gpt-4.1。
+// serve 是 testClient 使用的上游处理器。
 func (u *staleUpstream) serve(t *testing.T) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -302,15 +299,6 @@ func (u *staleUpstream) serve(t *testing.T) http.HandlerFunc {
 			testSession(w, "", time.Now().Add(time.Hour))
 		case "/models":
 			_, _ = io.WriteString(w, testModels)
-		case "/auto":
-			u.mu.Lock()
-			u.autoCalls++
-			token := u.autoSession
-			u.mu.Unlock()
-			if token == "" {
-				token = "auto-secret"
-			}
-			_, _ = fmt.Fprintf(w, `{"session_token":%q,"selected_model":"gpt-4.1","expires_at":%d}`, token, time.Now().Add(24*time.Hour).Unix())
 		case "/responses", "/chat/completions", "/v1/messages":
 			data, err := io.ReadAll(r.Body)
 			if err != nil {
@@ -362,12 +350,6 @@ func (u *staleUpstream) sentHeaders(path string) []http.Header {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return append([]http.Header(nil), u.headers[path]...)
-}
-
-func (u *staleUpstream) autoCount() int {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	return u.autoCalls
 }
 
 func (u *staleUpstream) sessionExchanges() int {
@@ -610,58 +592,6 @@ func TestStaleItemsOnlyRetriesResponsesPath(t *testing.T) {
 	}
 }
 
-// TestStaleItemsAutoRetryKeepsModelAndSession Auto 模型下重试使用同一模型与同一 Auto session：
-// /auto 只调用一次，两次上游请求体的 model 都是 gpt-4.1，Copilot-Session-Token 一致。
-func TestStaleItemsAutoRetryKeepsModelAndSession(t *testing.T) {
-	body := strings.Replace(staleRequestBody, `"model":"gpt-4.1"`, `"model":"auto"`, 1)
-	s, u := staleServiceWith(t, staleSequence(staleReply{status: 401, body: stale401Body}, staleOK))
-	w := testRequest(s, "POST", "/v1/responses", body)
-	if w.Code != 200 || w.Body.String() != staleOK.body {
-		t.Fatalf("status=%d body=%s, want 200 与第二次应答", w.Code, w.Body.String())
-	}
-	if n := u.autoCount(); n != 1 {
-		t.Fatalf("/auto 调用 %d 次, want 1（重试不得重新解析 Auto）", n)
-	}
-	got := u.sent("/responses")
-	if len(got) != 2 {
-		t.Fatalf("上游 /responses 收到 %d 次请求, want 2", len(got))
-	}
-	// 首次：model 被改写为解析出的模型，其余字段不变；重试：在此基础上清理。
-	wantFirst := decodeNumberMap(t, []byte(staleRequestBody))
-	if !reflect.DeepEqual(decodeNumberMap(t, got[0]), wantFirst) {
-		t.Fatalf("首次请求体应为 model 改写后的原始请求:\n got=%s", got[0])
-	}
-	if !reflect.DeepEqual(decodeNumberMap(t, got[1]), decodeNumberMap(t, []byte(staleCleanedBody))) {
-		t.Fatalf("重试请求体应为清理后的请求体且 model 仍为 gpt-4.1:\n got=%s", got[1])
-	}
-	headers := u.sentHeaders("/responses")
-	for i, h := range headers {
-		if h.Get("Copilot-Session-Token") != "auto-secret" {
-			t.Fatalf("第 %d 次请求 Copilot-Session-Token=%q, want auto-secret", i+1, h.Get("Copilot-Session-Token"))
-		}
-	}
-}
-
-// TestStaleItemsAutoRetryFailureReturns500WithoutReresolve Auto 重试后仍是失效项 401：客户端收到 500 与第二次正文，
-// /auto 仍只调用一次、上游只收到 2 次。
-func TestStaleItemsAutoRetryFailureReturns500WithoutReresolve(t *testing.T) {
-	body := strings.Replace(staleRequestBody, `"model":"gpt-4.1"`, `"model":"auto"`, 1)
-	s, u := staleServiceWith(t, staleSequence(
-		staleReply{status: 401, body: stale401Body},
-		staleReply{status: 401, body: stale401BodyB},
-	))
-	w := testRequest(s, "POST", "/v1/responses", body)
-	if w.Code != 500 || w.Body.String() != stale401BodyB {
-		t.Fatalf("status=%d body=%s, want 500 与第二次正文", w.Code, w.Body.String())
-	}
-	if n := u.autoCount(); n != 1 {
-		t.Fatalf("/auto 调用 %d 次, want 1", n)
-	}
-	if got := u.sent("/responses"); len(got) != 2 {
-		t.Fatalf("上游 /responses 收到 %d 次请求, want 2", len(got))
-	}
-}
-
 // ---- Pool 层：失效项错误不计账号错误、不冷却、不写风控记录 ----
 
 // stalePoolUpstream 记录 Pool 测试中上游 /responses 收到的请求体，并按序号给出应答（序号全局递增，从 1 开始）。
@@ -879,85 +809,5 @@ func TestStalePoolPlainUnauthorizedStillCoolsAndRecords(t *testing.T) {
 	riskMustHit(t, p.risk, staleSessionKey(t, "plain-401", staleRequestBody), time.Now(), http.StatusUnauthorized)
 	if file := riskReadFile(t, riskFilePath(f)); len(file.Blocks) != 1 {
 		t.Fatalf("风控记录文件条数 = %d, want 1", len(file.Blocks))
-	}
-}
-
-// TestStaleItemsAutoCleanedInputCarriesToNextAutoRound Auto 下第 1 轮 /responses 返回失效项 401，清理后的重试被模型拒绝（400），
-// Auto 重新解析进入第 2 轮：清理只需一次，第 2 轮直接使用清理后的输入，不再先发原始输入。
-// 期望上游 /responses 共 3 次：原始输入恰好 1 次（第 1 轮首发），其余两次（第 1 轮重试、第 2 轮）均已清理；第 2 轮 200 时客户端得 200。
-func TestStaleItemsAutoCleanedInputCarriesToNextAutoRound(t *testing.T) {
-	models := strings.TrimSuffix(testModels, "]}") + `,
-		{"id":"picked-1","model_picker_enabled":true,"capabilities":{"type":"chat"},"supported_endpoints":["/responses"]},
-		{"id":"picked-2","model_picker_enabled":true,"capabilities":{"type":"chat"},"supported_endpoints":["/responses"]}
-	]}`
-	var mu sync.Mutex
-	var autoCalls int
-	var bodies [][]byte
-	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/copilot_internal/v2/token":
-			testSession(w, "", time.Now().Add(time.Hour))
-		case "/models":
-			_, _ = io.WriteString(w, models)
-		case "/auto":
-			mu.Lock()
-			autoCalls++
-			n := autoCalls
-			mu.Unlock()
-			testJSON(w, map[string]any{"session_token": fmt.Sprint("auto-", n), "selected_model": fmt.Sprint("picked-", n), "expires_at": time.Now().Add(time.Hour).Unix()})
-		case "/responses":
-			data, err := io.ReadAll(r.Body)
-			if err != nil {
-				t.Errorf("读取上游请求体失败: %v", err)
-			}
-			mu.Lock()
-			bodies = append(bodies, data)
-			n := len(bodies)
-			mu.Unlock()
-			switch n {
-			case 1:
-				w.WriteHeader(401)
-				_, _ = io.WriteString(w, stale401Body)
-			case 2:
-				w.WriteHeader(400)
-				_, _ = io.WriteString(w, `{"error":{"code":"model_not_supported"}}`)
-			default:
-				testJSON(w, map[string]string{"id": "resp_new"})
-			}
-		default:
-			t.Errorf("unexpected endpoint %s", r.URL.Path)
-			w.WriteHeader(500)
-		}
-	})})
-	body := strings.Replace(staleRequestBody, `"model":"gpt-4.1"`, `"model":"auto"`, 1)
-	w := testRequest(s, "POST", "/v1/responses", body)
-	if w.Code != 200 {
-		t.Fatalf("status=%d body=%s, want 200", w.Code, w.Body.String())
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if autoCalls != 2 {
-		t.Fatalf("/auto 调用 %d 次, want 2（重试前不重新解析，模型拒绝后重新解析一次）", autoCalls)
-	}
-	if len(bodies) != 3 {
-		t.Fatalf("上游 /responses 收到 %d 次请求, want 3", len(bodies))
-	}
-	original := 0
-	for _, b := range bodies {
-		if bytes.Contains(b, []byte(`"reasoning"`)) || bytes.Contains(b, []byte(`"item_reference"`)) || bytes.Contains(b, []byte(`"id":`)) {
-			original++
-		}
-	}
-	if original != 1 {
-		t.Fatalf("携带原始输入的 /responses 请求 %d 次, want 恰好 1 次; bodies=%q", original, bodies)
-	}
-	// 第 2 次（第 1 轮重试）与第 3 次（第 2 轮）都应是清理后的输入，model 分别为各轮解析出的 picked-1、picked-2。
-	for i, model := range map[int]string{1: "picked-1", 2: "picked-2"} {
-		want := decodeNumberMap(t, []byte(staleCleanedBody))
-		want["model"] = model
-		if !reflect.DeepEqual(decodeNumberMap(t, bodies[i]), want) {
-			t.Fatalf("第 %d 次请求体应为清理后的输入且 model=%s:\n got=%s", i+1, model, bodies[i])
-		}
 	}
 }

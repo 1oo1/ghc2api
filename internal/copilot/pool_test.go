@@ -43,8 +43,6 @@ type poolUpstream struct {
 	sessionFailures   map[string]poolFailure // 指定账号的 session 交换直接返回该失败
 	generationResult  map[string]poolFailure // 指定账号的生成请求返回该状态与正文
 	sessionTTL        time.Duration          // 签发的 session 有效期；短于 2 分钟时客户端每次都会重新交换
-	autoCalls         map[string]int         // 每个账号访问 Auto 接口（/auto、/models/session）的次数
-	autoResult        map[string]poolFailure // 指定账号的 Auto 接口返回该失败
 	generationHeaders map[string]http.Header // 指定账号生成请求失败时额外返回的响应头
 }
 
@@ -55,8 +53,6 @@ func newPoolUpstream(t *testing.T) *poolUpstream {
 		sessionFailures:   map[string]poolFailure{},
 		generationResult:  map[string]poolFailure{},
 		sessionTTL:        time.Hour,
-		autoCalls:         map[string]int{},
-		autoResult:        map[string]poolFailure{},
 		generationHeaders: map[string]http.Header{},
 	}
 }
@@ -112,26 +108,6 @@ func (u *poolUpstream) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		testJSON(w, map[string]string{"served_by": account})
-	case "/auto", "/models/session":
-		account, ok := strings.CutPrefix(r.Header.Get("Authorization"), poolBearerPrefix)
-		if !ok {
-			u.t.Errorf("Auto 请求未使用账号 session 鉴权: %q", r.Header.Get("Authorization"))
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		u.mu.Lock()
-		u.autoCalls[account]++
-		failure, failing := u.autoResult[account]
-		u.mu.Unlock()
-		if failing {
-			w.WriteHeader(failure.status)
-			_, _ = io.WriteString(w, failure.body)
-			return
-		}
-		testJSON(w, map[string]any{
-			"session_token": "auto-" + account, "selected_model": "gpt-4.1",
-			"expires_at": time.Now().Add(24 * time.Hour).Unix(),
-		})
 	default:
 		u.t.Errorf("意外的上游路径 %s", r.URL.Path)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -162,18 +138,6 @@ func (u *poolUpstream) failGenerationWithHeader(account string, failure poolFail
 	defer u.mu.Unlock()
 	u.generationResult[account] = failure
 	u.generationHeaders[account] = header
-}
-
-func (u *poolUpstream) failAuto(account string, failure poolFailure) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	u.autoResult[account] = failure
-}
-
-func (u *poolUpstream) autoCount(account string) int {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	return u.autoCalls[account]
 }
 
 func (u *poolUpstream) sessionCount(account string) int {
@@ -844,40 +808,6 @@ func TestPoolGenerationLargeRateLimitBodyPassesThroughAndCoolsAccount(t *testing
 	}
 	if got := countAccount(upstream.generationOrder(), "oauth-a"); got != before {
 		t.Fatalf("冷却后 A 仍收到生成请求: %d -> %d", before, got)
-	}
-}
-
-// TestPoolAutoRateLimitPassesThroughAndCoolsAccount Auto 路径的 429 兜底也是 429 时原样透传；
-// 按连续错误计数，第 3 次才冷却。冷却后不再访问 A 的 Auto 接口。
-func TestPoolAutoRateLimitPassesThroughAndCoolsAccount(t *testing.T) {
-	const autoBody = `{"model":"auto","messages":[{"role":"user","content":"hi"}]}`
-	upstream := newPoolUpstream(t)
-	upstream.failAuto("oauth-a", poolFailure{http.StatusTooManyRequests, `{"error":"auto limited"}`})
-	p := testPool(t, poolUserConfigs(t, upstream.client(), "a", "b"))
-	w := poolRequest(p, "POST", "/v1/chat/completions", autoBody)
-	if w.Code != http.StatusTooManyRequests || w.Body.String() != `{"error":"auto limited"}` {
-		t.Fatalf("Auto 路径 429 未透传: status=%d body=%s", w.Code, w.Body.String())
-	}
-	if !p.findAccount("a").service.available(time.Now()) {
-		t.Fatal("第 1 次 Auto 限流不应冷却（连续第 3 次才冷却）")
-	}
-	for i := 0; p.findAccount("a").service.available(time.Now()); i++ {
-		if i == 10 {
-			t.Fatal("A 连续 Auto 限流后仍未冷却")
-		}
-		if w := poolRequest(p, "POST", "/v1/chat/completions", autoBody); w.Code != http.StatusTooManyRequests && w.Code != http.StatusOK {
-			t.Fatalf("请求 %d status=%d body=%s, want 429 或 200", i, w.Code, w.Body.String())
-		}
-	}
-	autoAfterCooled := upstream.autoCount("oauth-a")
-	for i := range 2 {
-		if w := poolRequest(p, "POST", "/v1/chat/completions", autoBody); w.Code != http.StatusOK {
-			t.Fatalf("冷却后请求 %d status=%d body=%s", i, w.Code, w.Body.String())
-		}
-	}
-	// A 已冷却，之后的请求全部由 B 处理，且不再访问 A 的 Auto 接口。
-	if got := upstream.autoCount("oauth-a"); got != autoAfterCooled {
-		t.Errorf("冷却期内仍访问 A 的 Auto 接口: 次数 %d, want %d", got, autoAfterCooled)
 	}
 }
 

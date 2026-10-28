@@ -1,8 +1,7 @@
 package copilot
 
-// 本文件覆盖冷却副作用的等待与 Auto 会话的清理：
-//   - WaitCooldownEffectsTimeout 的有界等待：副作用仍被阻塞时短超时返回 false，副作用结束后返回 true；
-//   - 进入冷却后，内存中的 Auto 会话在副作用完成后被清空。
+// 本文件覆盖冷却副作用的等待：
+//   - WaitCooldownEffectsTimeout 的有界等待：副作用仍被阻塞时短超时返回 false，副作用结束后返回 true。
 
 import (
 	"net/http"
@@ -41,36 +40,5 @@ func TestWaitCooldownEffectsTimeoutFollowsPendingEffects(t *testing.T) {
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("等待冷却副作用的 goroutine 未返回")
-	}
-}
-
-// cooldownAutoModel 在 Auto 锁内读取内存中的 Auto 会话所选模型。
-func cooldownAutoModel(s *Service) string {
-	s.autoState.Lock()
-	defer s.autoState.Unlock()
-	return s.auto.Model
-}
-
-// TestCooldownClearsInMemoryAutoSession 进入冷却后，内存中的 Auto 会话在副作用完成后被清空。
-func TestCooldownClearsInMemoryAutoSession(t *testing.T) {
-	const autoBody = `{"model":"auto","messages":[{"role":"user","content":"hi"}]}`
-	f := newCooldownFixture(t, "a")
-	p := f.start()
-	s := p.findAccount("a").service
-
-	if w := poolRequest(p, "POST", "/v1/chat/completions", autoBody); w.Code != http.StatusOK {
-		t.Fatalf("Auto 请求 status=%d body=%s, want 200", w.Code, w.Body.String())
-	}
-	if cooldownAutoModel(s) == "" {
-		t.Fatal("前提不成立：Auto 请求后内存中应有 Auto 会话")
-	}
-
-	f.up.pool.failGeneration("oauth-a", poolFailure{http.StatusUnauthorized, cooldownBody(401)})
-	if w := poolRequest(p, "POST", "/v1/chat/completions", autoBody); w.Code != http.StatusUnauthorized {
-		t.Fatalf("触发冷却的 Auto 请求 status=%d body=%s, want 401", w.Code, w.Body.String())
-	}
-	p.WaitCooldownEffects()
-	if m := cooldownAutoModel(s); m != "" {
-		t.Fatalf("进入冷却后内存中的 Auto 会话未清空（模型 %q）", m)
 	}
 }

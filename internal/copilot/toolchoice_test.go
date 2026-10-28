@@ -7,11 +7,9 @@ package copilot
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"reflect"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -115,7 +113,7 @@ func TestWithoutLoneToolChoiceKeeps(t *testing.T) {
 	})
 }
 
-// toolChoiceUpstream 构造一个服务，记录上游生成端点 upstream 收到的请求体；/auto 固定选择 gpt-4.1。
+// toolChoiceUpstream 构造一个服务，记录上游生成端点 upstream 收到的请求体。
 func toolChoiceUpstream(t *testing.T, upstream string) (*Service, func() []byte) {
 	t.Helper()
 	var mu sync.Mutex
@@ -127,8 +125,6 @@ func toolChoiceUpstream(t *testing.T, upstream string) (*Service, func() []byte)
 			testSession(w, "", time.Now().Add(time.Hour))
 		case "/models":
 			_, _ = io.WriteString(w, testModels)
-		case "/auto":
-			_, _ = fmt.Fprintf(w, `{"session_token":"auto-secret","selected_model":"gpt-4.1","expires_at":%d}`, time.Now().Add(24*time.Hour).Unix())
 		case upstream:
 			data, err := io.ReadAll(r.Body)
 			if err != nil {
@@ -204,28 +200,5 @@ func TestOtherProtocolsKeepLoneToolChoice(t *testing.T) {
 				t.Fatalf("上游请求体应逐字节一致:\n got=%s\nwant=%s", out, tc.body)
 			}
 		})
-	}
-}
-
-// TestAutoResponsesDropsLoneToolChoice Auto 改写 model 后，/responses 请求仍删去孤立的 tool_choice。
-func TestAutoResponsesDropsLoneToolChoice(t *testing.T) {
-	const body = `{"model":"auto","input":"hi","store":false,"tool_choice":"auto"}`
-	s, upstreamBody := toolChoiceUpstream(t, "/responses")
-	if w := testRequest(s, "POST", "/v1/responses", body); w.Code != 200 {
-		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
-	}
-	out := upstreamBody()
-	got := decodeNumberMap(t, out)
-	if _, ok := got["tool_choice"]; ok {
-		t.Fatalf("Auto 路径上游请求体仍含 tool_choice: %s", out)
-	}
-	want := decodeNumberMap(t, []byte(body))
-	delete(want, "tool_choice")
-	want["model"] = "gpt-4.1"
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("Auto 路径上游请求体字段变化:\n got=%v\nwant=%v", got, want)
-	}
-	if strings.Contains(string(out), `"auto"`) {
-		t.Fatalf("上游请求体不应再出现 \"auto\": %s", out)
 	}
 }

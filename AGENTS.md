@@ -22,6 +22,6 @@
 | `docs/quota-stats.md` | 修改额度解析、刷新节流、持久化、请求统计 | `internal/copilot/quota.go` |
 | `docs/management.md` | 修改管理接口、账号导入、设备登录 | `internal/copilot/management*.go`、`login.go` |
 | `docs/web-console.md` | 修改控制台前端或其构建 | `web/` |
-| `docs/upstream.md` | 修改 session 交换、模型列表、Auto、请求身份头 | `internal/copilot/session.go`、`models.go`、`auto.go`、`cache.go` |
+| `docs/upstream.md` | 修改 session 交换、模型列表、请求身份头 | `internal/copilot/session.go`、`models.go`、`cache.go` |
 | `docs/development.md` | 运行测试、构建，查看来源与许可 | `Makefile` |
 | `docs/magpie-copilot-sync.md` | 与 magpie 上游同步，同时核对 CLIProxyAPI 会话亲和键 | `internal/copilot/affinity_key.go`（cpa 部分） |

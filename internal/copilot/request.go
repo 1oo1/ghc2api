@@ -251,9 +251,9 @@ func onlyToolResults(content json.RawMessage) bool {
 	return count > 0 && onlyTools
 }
 
-// contentText 返回消息内容的文本：content 为字符串时直接返回；为数组时按顺序取 text 与 input_text 片段，以 sep 连接，忽略其他片段；
+// contentText 返回消息内容的文本：content 为字符串时直接返回；为数组时按顺序取 text 与 input_text 片段，直接拼接（不加分隔符），忽略其他片段；
 // 其他类型返回空字符串。字段类型错误的内容块（如 "text": 5 或 "type": 5）整项跳过，不计入文本。
-func contentText(content json.RawMessage, sep string) string {
+func contentText(content json.RawMessage) string {
 	if firstByte(content) == '"' {
 		var text string
 		_ = json.Unmarshal(content, &text)
@@ -270,30 +270,7 @@ func contentText(content json.RawMessage, sep string) string {
 		}
 		return true
 	})
-	return strings.Join(texts, sep)
-}
-
-// promptFrom 返回用于 Auto 模型选择的提示文本：input 为非空字符串时用它；否则取最后一条含非空文本的 user 消息的文本；都没有时为 "hi"。
-func promptFrom(body []byte) string {
-	messages, input := requestInputs(body)
-	var text string
-	if json.Unmarshal(input, &text) == nil && strings.TrimSpace(text) != "" {
-		return text
-	}
-	// 顺序遍历并记录最后一条非空文本，结果与从后往前查找第一条相同。
-	latest := ""
-	eachMessage(messages, func(m message) bool {
-		if m.Role == "user" {
-			if candidate := contentText(m.Content, "\n"); strings.TrimSpace(candidate) != "" {
-				latest = candidate
-			}
-		}
-		return true
-	})
-	if latest != "" {
-		return latest
-	}
-	return "hi"
+	return strings.Join(texts, "")
 }
 
 // hasVision 报告请求体是否含图片部件：有效 JSON 中任意深度的对象，其 "type" 键的值为 image、image_url 或 input_image。

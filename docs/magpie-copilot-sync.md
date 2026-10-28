@@ -10,6 +10,12 @@
 当前实现对照的上游基线：`466cafa0cf681de30ce4cc68616db55f5de10cd9`。
 完成后续同步并通过验证时，应将本文和 README 中记录的基线更新为实际核对的上游提交。
 
+## 已删除的 Auto
+
+本项目已有意删除 magpie 的 Auto 模型功能（本项目不使用）：`model` 必须是具体模型，不再有 `auto`
+条目、`/auto` 与 `/models/session` 请求、Auto 选择以及拒绝后的重选。同步时跳过上游的
+`copilot_auto.go`，以及其他文件中的 Auto 相关改动（选择、拒绝后重选、`/auto`、`/models/session`），不要移植回来。
+
 ## 获取或更新上游
 
 首次获取时，在项目根目录执行：
@@ -75,7 +81,7 @@ git -C .local/magpie log --oneline --all --regexp-ignore-case --grep='copilot'
 - `internal/provider/copilot_signin.go`、`internal/provider/copilot_accounts.go`：OAuth 登录与 magpie 的 Copilot 账号管理。
 - 编辑器凭证发现也需沿 `internal/provider/account.go` 查找；本项目仅同步 OAuth token 流程。
 - `internal/provider/copilot_ghe.go`：GitHub Enterprise Cloud 主机行为。
-- `internal/provider/copilot_auto.go`、`internal/provider/copilot_refused.go`、`internal/provider/copilot_lapsed.go`：Auto 选择、拒绝后的处理和失效状态。
+- `internal/provider/copilot_refused.go`、`internal/provider/copilot_lapsed.go`：拒绝后的处理和失效状态。`copilot_auto.go` 是 Auto 功能，本项目已有意删除，同步时跳过。
 - `internal/provider/copilot_*_test.go`、`internal/provider/account_test.go`、
   `internal/gateway/copilot_*_test.go`：预期行为、回归案例及 gateway 侧处理。
 - `internal/gateway/`、`internal/catalog/`：通用请求转发、协议/模型元数据路径；不一定有
@@ -90,7 +96,7 @@ git -C .local/magpie log --oneline --all --regexp-ignore-case --grep='copilot'
 | --- | --- |
 | `internal/copilot/login.go`、`credentials.go` | `internal/provider/copilot_signin.go`、`copilot_accounts.go`、`account.go` 中的 OAuth 登录和凭证行为 |
 | `internal/copilot/config.go`、`session.go` | `internal/provider/account.go`、`copilot_ghe.go` 中的主机、OAuth session 和身份头行为 |
-| `internal/copilot/models.go`、`auto.go` | `internal/provider/account.go`、`copilot_auto.go` 及相关模型数据和测试 |
+| `internal/copilot/models.go` | `internal/provider/account.go` 及相关模型数据和测试（不含 Auto 相关部分） |
 | `internal/copilot/service.go`、`request.go`、`itemids.go` | provider 请求签名与 `internal/gateway/` 的转发、协议和流式行为（含 `itemids.go` 的 Responses 项 id 统一） |
 
 只同步本服务已经支持的功能。magpie 的多账号管理、桌面 UI、agent 集成等不属于本项目的
@@ -170,7 +176,7 @@ cpa 新增或调整会话来源（请求头、请求体字段、优先级、规�
 - OAuth token 换取 session、有效期与刷新。
 - session 返回的 API 主机、企业域名校验和重定向/请求头安全边界。
 - 模型列表元数据、协议端点、模型条款和账号权限差异。
-- Auto/session 的 API 版本、模型选择、缓存、拒绝后的有限重试与手动 fallback。
+- 模型被上游拒绝（400 `model_not_supported`）后的处理；Auto 相关改动不同步（见上文「已删除的 Auto」）。
 - 请求身份头、用户/工具轮次、图片请求，以及 SSE 转发和请求取消。
 
 同步完成后运行：

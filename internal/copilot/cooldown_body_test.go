@@ -1,10 +1,10 @@
 package copilot
 
-// 本文件覆盖上游错误正文读取失败时的计数规则，以及 Auto 路径的网络错误识别。
+// 本文件覆盖上游错误正文读取失败时的计数规则。
 //   - 上游返回错误状态（≥400）时，读取其正文失败不计为网络错误，而按上游状态码的规则计数：
 //     401/403 一次冷却（原因为该状态码）；429/5xx 计入连续错误（原因为该状态码）；400 与其他 4xx 既不计数也不清零。
 //     只有上游状态 < 400 的流式成功响应在读取失败时才标记为网络错误。覆盖生成接口（流式与非流式）、session 交换与模型列表。
-//   - Auto 路径中的上游网络错误被识别为 network。生成接口的网络错误与写超时包装的覆盖见 cooldown_count_test.go 的
+//   - 生成接口的网络错误与写超时包装的覆盖见 cooldown_count_test.go 的
 //     TestCooldownGenerationNetworkErrorsCount：错误经 generationWriter 包装后仍能沿 Unwrap 找到统计用的 statusResponseWriter。
 
 import (
@@ -54,7 +54,7 @@ func TestCooldownStreamedErrorBodyFailureCountsByStatus(t *testing.T) {
 	})
 }
 
-// TestCooldownErrorBodyFailure400NeitherCountsNorResets 生成接口的上游 400 正文读取失败（非流式，Auto 分支读取正文）：
+// TestCooldownErrorBodyFailure400NeitherCountsNorResets 生成接口的上游 400 正文读取失败（非流式，400 时需读取正文以判断是否为模型拒绝）：
 // 不计数也不清零。序列 429、429、400（正文中断）、429 中，只有最后一次 429 触发冷却，原因为 429。
 func TestCooldownErrorBodyFailure400NeitherCountsNorResets(t *testing.T) {
 	t.Run("never-cools-alone", func(t *testing.T) {
@@ -149,34 +149,6 @@ func TestCooldownModelsErrorBodyFailureCountsByStatus(t *testing.T) {
 	}
 	if v := cooldownView(t, p, "a"); v.CooldownReason != "429" {
 		t.Fatalf("模型列表 429 正文中断的冷却原因 = %q, want 429（不是 network）", v.CooldownReason)
-	}
-}
-
-// TestCooldownAutoNetworkFailureCountsAsNetwork Auto 路径中上游网络错误（/auto 与 /models/session 均失败）：
-// 请求以 502 结束，连续第 3 次冷却，原因为 network。
-func TestCooldownAutoNetworkFailureCountsAsNetwork(t *testing.T) {
-	const autoBody = `{"model":"auto","messages":[{"role":"user","content":"hi"}]}`
-	f := newCooldownFixture(t, "a")
-	f.config.Client = cooldownWrap(f.up, func(r *http.Request) (*http.Response, bool, error) {
-		if (r.URL.Path == "/auto" || r.URL.Path == "/models/session") &&
-			r.Header.Get("Authorization") == "Bearer session-oauth-a" {
-			return nil, true, errors.New("test network failure")
-		}
-		return nil, false, nil
-	})
-	p := f.start()
-	for i := 1; i <= 3; i++ {
-		w := poolRequest(p, "POST", "/v1/chat/completions", autoBody)
-		if w.Code != http.StatusBadGateway {
-			t.Fatalf("第 %d 次 Auto 网络失败 status=%d body=%s, want 502", i, w.Code, w.Body.String())
-		}
-		cooled := cooldownView(t, p, "a").CooldownUntil != nil
-		if want := i == 3; cooled != want {
-			t.Fatalf("第 %d 次 Auto 网络失败后冷却 = %v, want %v", i, cooled, want)
-		}
-	}
-	if v := cooldownView(t, p, "a"); v.CooldownReason != "network" {
-		t.Fatalf("Auto 网络失败的冷却原因 = %q, want network", v.CooldownReason)
 	}
 }
 

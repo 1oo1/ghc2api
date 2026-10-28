@@ -262,7 +262,7 @@ func TestModelsFilterAndPreserveMetadata(t *testing.T) {
 				}
 			}
 		}
-		if !reflect.DeepEqual(ids, map[string]bool{"gpt-4.1": true, "terms-model": true, "auto": true}) {
+		if !reflect.DeepEqual(ids, map[string]bool{"gpt-4.1": true, "terms-model": true}) {
 			t.Fatalf("visible IDs = %v", ids)
 		}
 	}
@@ -478,18 +478,9 @@ func TestDebugLogsRequestStagesAndRedactsSecrets(t *testing.T) {
 				time.Now().Add(time.Hour).Unix())
 		case "/models":
 			_, _ = io.WriteString(w, testModels)
-		case "/auto":
-			testJSON(w, map[string]any{
-				"session_token":  "copilot-auto-session-secret",
-				"selected_model": "gpt-4.1",
-				"expires_at":     time.Now().Add(time.Hour).Unix(),
-			})
 		case "/chat/completions":
 			if r.Header.Get("Authorization") != "Bearer copilot-session-secret" {
 				t.Errorf("generation authorization = %q", r.Header.Get("Authorization"))
-			}
-			if r.Header.Get("Copilot-Session-Token") != "copilot-auto-session-secret" {
-				t.Errorf("Auto session header = %q", r.Header.Get("Copilot-Session-Token"))
 			}
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
@@ -510,7 +501,7 @@ func TestDebugLogsRequestStagesAndRedactsSecrets(t *testing.T) {
 		Client: client,
 	})
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
-		strings.NewReader(`{"model":"auto","messages":[{"role":"user","content":"upstream-request-marker"}]}`))
+		strings.NewReader(`{"model":"gpt-4.1","messages":[{"role":"user","content":"upstream-request-marker"}]}`))
 	request.Header.Set("Authorization", "Bearer service-api-key-secret")
 	w := httptest.NewRecorder()
 	withTestAPIKey(s.Handler()).ServeHTTP(w, request)
@@ -518,7 +509,7 @@ func TestDebugLogsRequestStagesAndRedactsSecrets(t *testing.T) {
 		t.Fatalf("generation response = %d %s", w.Code, w.Body.String())
 	}
 
-	wantEvents := []string{"/copilot_internal/v2/token", "/models", "/auto", "/chat/completions"}
+	wantEvents := []string{"/copilot_internal/v2/token", "/models", "/chat/completions"}
 	if !reflect.DeepEqual(events, wantEvents) {
 		t.Fatalf("upstream stages = %v, want %v", events, wantEvents)
 	}
@@ -527,7 +518,6 @@ func TestDebugLogsRequestStagesAndRedactsSecrets(t *testing.T) {
 		"/v1/chat/completions",
 		"/copilot_internal/v2/token",
 		"/models",
-		"/auto",
 		"/chat/completions",
 	} {
 		if !strings.Contains(logOutput, stage) {
@@ -542,7 +532,6 @@ func TestDebugLogsRequestStagesAndRedactsSecrets(t *testing.T) {
 	for _, secret := range []string{
 		"github-oauth-secret",
 		"copilot-session-secret",
-		"copilot-auto-session-secret",
 		"service-api-key-secret",
 	} {
 		if strings.Contains(logOutput, secret) {
@@ -1190,87 +1179,52 @@ func TestManualModelSurvivesModelListFailureAndDoesNotRetry(t *testing.T) {
 	}
 }
 
-func TestAutoRequiresModelListAfterInitialFetchFailure(t *testing.T) {
-	for _, tc := range []struct {
-		name            string
-		refreshedStatus int
-		refreshedBody   string
-		wantStatus      int
-	}{
-		{
-			name:            "reject model that does not support path",
-			refreshedStatus: http.StatusOK,
-			refreshedBody:   `{"data":[{"id":"gpt-4.1","model_picker_enabled":true,"capabilities":{"type":"chat"},"supported_endpoints":["/chat/completions"],"policy":{"state":"enabled"}}]}`,
-			wantStatus:      http.StatusBadRequest,
-		},
-		{
-			name:            "reject when model list refresh fails",
-			refreshedStatus: http.StatusServiceUnavailable,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var modelCalls, autoCalls, generationCalls atomic.Int32
-			s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
-				switch r.URL.Path {
-				case "/copilot_internal/v2/token":
-					testSession(w, "", time.Now().Add(time.Hour))
-				case "/models":
-					n := modelCalls.Add(1)
-					if n == 1 {
-						w.WriteHeader(http.StatusServiceUnavailable)
-						return
-					}
-					if n != 2 {
-						t.Errorf("model list request count exceeded 2: %d", n)
-						w.WriteHeader(http.StatusInternalServerError)
-						return
-					}
-					w.WriteHeader(tc.refreshedStatus)
-					if tc.refreshedBody != "" {
-						_, _ = io.WriteString(w, tc.refreshedBody)
-					}
-				case "/auto":
-					autoCalls.Add(1)
-					testJSON(w, map[string]any{
-						"session_token":  "auto-secret",
-						"selected_model": "gpt-4.1",
-						"expires_at":     time.Now().Add(time.Hour).Unix(),
-					})
-				case "/responses":
-					generationCalls.Add(1)
-					w.WriteHeader(http.StatusOK)
-				default:
-					t.Errorf("unexpected path %s", r.URL.Path)
-					w.WriteHeader(http.StatusInternalServerError)
-				}
-			})})
-
-			w := testRequest(s, "POST", "/v1/responses", `{"model":"auto","input":"hello"}`)
-			if tc.wantStatus != 0 && w.Code != tc.wantStatus {
-				t.Errorf("status=%d body=%s, want %d", w.Code, w.Body.String(), tc.wantStatus)
-			} else if tc.wantStatus == 0 && w.Code < http.StatusBadRequest {
-				t.Errorf("status=%d body=%s, want Auto request rejected before generation", w.Code, w.Body.String())
-			}
-			if got := modelCalls.Load(); got != 2 {
-				t.Errorf("model list calls=%d, want 2", got)
-			}
-			if got := autoCalls.Load(); got != 1 {
-				t.Errorf("Auto calls=%d, want 1", got)
-			}
-			if got := generationCalls.Load(); got != 0 {
-				t.Errorf("generation calls=%d, want 0", got)
-			}
-		})
+// 上游以 model_not_supported 拒绝手选模型后，客户端原样收到 400，且该模型从 /v1/models 中隐藏，其他模型仍可见。
+func TestRefusedModelIsHiddenFromModelList(t *testing.T) {
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/copilot_internal/v2/token":
+			testSession(w, "", time.Now().Add(time.Hour))
+		case "/models":
+			_, _ = io.WriteString(w, testModels)
+		case "/chat/completions":
+			w.WriteHeader(400)
+			_, _ = io.WriteString(w, `{"error":{"code":"model_not_supported"}}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(500)
+		}
+	})})
+	w := testRequest(s, "POST", "/v1/chat/completions", `{"model":"gpt-4.1","messages":[{"role":"user","content":"hello"}]}`)
+	if w.Code != 400 || w.Body.String() != `{"error":{"code":"model_not_supported"}}` {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	w = testRequest(s, "GET", "/v1/models", "")
+	if w.Code != 200 {
+		t.Fatalf("models status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var got struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]bool{}
+	for _, m := range got.Data {
+		ids[m.ID] = true
+	}
+	if !reflect.DeepEqual(ids, map[string]bool{"terms-model": true}) {
+		t.Fatalf("visible IDs = %v, want only terms-model", ids)
 	}
 }
 
 func TestGenerationRejectsModelsUnavailableForPath(t *testing.T) {
 	for _, tc := range []struct {
-		name          string
-		path          string
-		body          string
-		autoModel     string
-		wantAutoCalls int32
+		name string
+		path string
+		body string
 	}{
 		{
 			name: "manual model does not support path",
@@ -1288,16 +1242,9 @@ func TestGenerationRejectsModelsUnavailableForPath(t *testing.T) {
 			path: "/v1/chat/completions",
 			body: `{"model":"unknown-model","messages":[{"role":"user","content":"hello"}]}`,
 		},
-		{
-			name:          "auto selects model that does not support path",
-			path:          "/v1/responses",
-			body:          `{"model":"auto","input":"hello"}`,
-			autoModel:     "terms-model",
-			wantAutoCalls: 1,
-		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var modelCalls, autoCalls, generationCalls atomic.Int32
+			var modelCalls, generationCalls atomic.Int32
 			s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
 				case "/copilot_internal/v2/token":
@@ -1307,13 +1254,6 @@ func TestGenerationRejectsModelsUnavailableForPath(t *testing.T) {
 					_, _ = io.WriteString(w, testModels)
 				case "/models/terms-model/policy":
 					w.WriteHeader(http.StatusOK)
-				case "/auto":
-					autoCalls.Add(1)
-					testJSON(w, map[string]any{
-						"session_token":  "auto-secret",
-						"selected_model": tc.autoModel,
-						"expires_at":     time.Now().Add(time.Hour).Unix(),
-					})
 				case "/chat/completions", "/responses", "/v1/messages":
 					generationCalls.Add(1)
 					w.WriteHeader(http.StatusOK)
@@ -1330,76 +1270,10 @@ func TestGenerationRejectsModelsUnavailableForPath(t *testing.T) {
 			if got := modelCalls.Load(); got != 1 {
 				t.Errorf("model list calls=%d, want 1", got)
 			}
-			if got := autoCalls.Load(); got != tc.wantAutoCalls {
-				t.Errorf("auto calls=%d, want %d", got, tc.wantAutoCalls)
-			}
 			if got := generationCalls.Load(); got != 0 {
 				t.Errorf("generation calls=%d, want 0", got)
 			}
 		})
-	}
-}
-
-func TestAutoSelectionForUnsupportedPathIsNotCached(t *testing.T) {
-	var autoCalls, generationCalls atomic.Int32
-	var forwardedModel atomic.Value
-	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/copilot_internal/v2/token":
-			testSession(w, "", time.Now().Add(time.Hour))
-		case "/models":
-			_, _ = io.WriteString(w, testModels)
-		case "/auto":
-			n := autoCalls.Add(1)
-			selected := "terms-model"
-			if n == 2 {
-				selected = "gpt-4.1"
-			}
-			testJSON(w, map[string]any{
-				"session_token":  fmt.Sprintf("auto-%d", n),
-				"selected_model": selected,
-				"expires_at":     time.Now().Add(time.Hour).Unix(),
-			})
-		case "/responses":
-			generationCalls.Add(1)
-			var body struct {
-				Model string `json:"model"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				t.Errorf("decode generation request: %v", err)
-			}
-			forwardedModel.Store(body.Model)
-			_, _ = io.WriteString(w, `{}`)
-		default:
-			t.Errorf("unexpected path %s", r.URL.Path)
-			w.WriteHeader(http.StatusInternalServerError)
-		}
-	})})
-	const requestBody = `{"model":"auto","input":"hello"}`
-
-	first := testRequest(s, "POST", "/v1/responses", requestBody)
-	if first.Code != http.StatusBadRequest {
-		t.Fatalf("first status=%d body=%s, want 400", first.Code, first.Body.String())
-	}
-	if got := autoCalls.Load(); got != 1 {
-		t.Fatalf("Auto calls after first request=%d, want 1", got)
-	}
-	if got := generationCalls.Load(); got != 0 {
-		t.Fatalf("generation calls after first request=%d, want 0", got)
-	}
-
-	second := testRequest(s, "POST", "/v1/responses", requestBody)
-	if second.Code != http.StatusOK {
-		t.Fatalf("second status=%d body=%s, want 200", second.Code, second.Body.String())
-	}
-	if got := autoCalls.Load(); got != 2 {
-		t.Errorf("total Auto calls=%d, want 2", got)
-	}
-	if got := generationCalls.Load(); got != 1 {
-		t.Errorf("total generation calls=%d, want 1", got)
-	}
-	if got, _ := forwardedModel.Load().(string); got != "gpt-4.1" {
-		t.Errorf("forwarded model=%q, want gpt-4.1", got)
 	}
 }
 
@@ -1735,188 +1609,6 @@ func TestOversizedGenerationBodyDoesNotReachUpstream(t *testing.T) {
 	w := testRequest(s, "POST", "/v1/responses", body)
 	if w.Code != http.StatusRequestEntityTooLarge || calls.Load() != 0 {
 		t.Fatalf("oversized request = %d, upstream calls=%d", w.Code, calls.Load())
-	}
-}
-
-func TestExpiringAutoSessionIsRefreshed(t *testing.T) {
-	var picks atomic.Int32
-	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/copilot_internal/v2/token":
-			testSession(w, "", time.Now().Add(time.Hour))
-		case "/models":
-			_, _ = io.WriteString(w, testModels)
-		case "/auto":
-			n := picks.Add(1)
-			testJSON(w, map[string]any{"session_token": fmt.Sprint("auto-", n), "selected_model": "gpt-4.1", "expires_at": time.Now().Add(time.Minute).Unix()})
-		case "/chat/completions":
-			_, _ = io.WriteString(w, `{}`)
-		}
-	})})
-	for range 2 {
-		if w := testRequest(s, "POST", "/v1/chat/completions", `{"model":"auto","messages":[{"role":"user","content":"hello"}]}`); w.Code != 200 {
-			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
-		}
-	}
-	if picks.Load() != 2 {
-		t.Fatalf("expiring auto session reused, picks=%d", picks.Load())
-	}
-}
-
-func TestAutoSelectionPreservesProtocolAndCachesSession(t *testing.T) {
-	for _, selected := range []string{`"gpt-4.1"`, `{"id":"gpt-4.1","supported_endpoints":["/responses"]}`} {
-		for _, tc := range []struct{ path, upstream, body string }{
-			{"/v1/chat/completions", "/chat/completions", `{"model":"auto","messages":[{"role":"user","content":"pick me"}],"temperature":0.7,"stream":false,"custom":{"keep":"yes"}}`},
-			{"/v1/responses", "/responses", `{"model":"auto","input":"pick me","reasoning":{"effort":"high"},"store":false}`},
-			{"/v1/messages", "/v1/messages", `{"model":"auto","max_tokens":42,"messages":[{"role":"user","content":[{"type":"text","text":"pick me"}]}],"system":"keep me"}`},
-		} {
-			t.Run(tc.path+selected, func(t *testing.T) {
-				var autoCalls, generationCalls atomic.Int32
-				s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
-					switch r.URL.Path {
-					case "/copilot_internal/v2/token":
-						testSession(w, "", time.Now().Add(time.Hour))
-					case "/models":
-						_, _ = io.WriteString(w, testModels)
-					case "/auto":
-						autoCalls.Add(1)
-						var got map[string]any
-						_ = json.NewDecoder(r.Body).Decode(&got)
-						if got["prompt"] != "pick me" || got["tier"] != "balance" || r.Header.Get("X-GitHub-Api-Version") != "2026-08-01" {
-							t.Errorf("auto request body/headers = %v %v", got, r.Header)
-						}
-						_, _ = fmt.Fprintf(w, `{"session_token":"auto-secret","selected_model":%s,"expires_at":%d}`, selected, time.Now().Add(24*time.Hour).Unix())
-					case tc.upstream:
-						generationCalls.Add(1)
-						if r.Header.Get("Copilot-Session-Token") != "auto-secret" {
-							t.Errorf("auto session header = %q", r.Header.Get("Copilot-Session-Token"))
-						}
-						var before, after map[string]any
-						_ = json.Unmarshal([]byte(tc.body), &before)
-						_ = json.NewDecoder(r.Body).Decode(&after)
-						before["model"] = "gpt-4.1"
-						if !reflect.DeepEqual(before, after) {
-							t.Errorf("body fields lost: got=%v want=%v", after, before)
-						}
-						_, _ = io.WriteString(w, `{}`)
-					default:
-						t.Errorf("unexpected endpoint %s", r.URL.Path)
-						w.WriteHeader(500)
-					}
-				})})
-				for range 2 {
-					if w := testRequest(s, "POST", tc.path, tc.body); w.Code != 200 {
-						t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
-					}
-				}
-				if autoCalls.Load() != 1 || generationCalls.Load() != 2 {
-					t.Fatalf("auto=%d generation=%d", autoCalls.Load(), generationCalls.Load())
-				}
-			})
-		}
-	}
-}
-
-func TestAutoLegacyAndManualFallback(t *testing.T) {
-	for _, legacyAvailable := range []bool{true, false} {
-		t.Run(fmt.Sprint(legacyAvailable), func(t *testing.T) {
-			var legacyCalls atomic.Int32
-			s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
-				switch r.URL.Path {
-				case "/copilot_internal/v2/token":
-					testSession(w, "", time.Now().Add(time.Hour))
-				case "/models":
-					_, _ = io.WriteString(w, testModels)
-				case "/auto":
-					w.WriteHeader(404)
-				case "/models/session":
-					legacyCalls.Add(1)
-					if r.Header.Get("X-GitHub-Api-Version") != "2025-10-01" {
-						t.Errorf("legacy API version = %q", r.Header.Get("X-GitHub-Api-Version"))
-					}
-					var body map[string]any
-					_ = json.NewDecoder(r.Body).Decode(&body)
-					if !reflect.DeepEqual(body, map[string]any{"auto_mode": map[string]any{"model_hints": []any{"auto"}}}) {
-						t.Errorf("legacy body = %v", body)
-					}
-					if legacyAvailable {
-						testJSON(w, map[string]any{"session_token": "legacy-secret", "available_models": []string{"unknown", "gpt-4.1"}, "expires_at": time.Now().Add(time.Hour).Unix()})
-					} else {
-						w.WriteHeader(404)
-					}
-				case "/chat/completions":
-					var body map[string]any
-					_ = json.NewDecoder(r.Body).Decode(&body)
-					if body["model"] != "gpt-4.1" {
-						t.Errorf("fallback model = %v", body["model"])
-					}
-					wantToken := ""
-					if legacyAvailable {
-						wantToken = "legacy-secret"
-					}
-					if r.Header.Get("Copilot-Session-Token") != wantToken {
-						t.Errorf("fallback session header = %q", r.Header.Get("Copilot-Session-Token"))
-					}
-					_, _ = io.WriteString(w, `{}`)
-				default:
-					t.Errorf("unexpected endpoint %s", r.URL.Path)
-					w.WriteHeader(500)
-				}
-			})})
-			if w := testRequest(s, "POST", "/v1/chat/completions", `{"model":"auto","messages":[{"role":"user","content":"hello"}]}`); w.Code != 200 {
-				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
-			}
-			if legacyCalls.Load() != 1 {
-				t.Fatalf("legacy calls = %d", legacyCalls.Load())
-			}
-		})
-	}
-}
-
-func TestAutoRetryIsBounded(t *testing.T) {
-	retryModels := strings.TrimSuffix(testModels, "]}") + `,
-		{"id":"picked-1","model_picker_enabled":true,"capabilities":{"type":"chat"},"supported_endpoints":["/chat/completions"]},
-		{"id":"picked-2","model_picker_enabled":true,"capabilities":{"type":"chat"},"supported_endpoints":["/chat/completions"]},
-		{"id":"picked-3","model_picker_enabled":true,"capabilities":{"type":"chat"},"supported_endpoints":["/chat/completions"]}
-	]}`
-	for _, rejection := range []string{`{"error":{"code":"model_not_supported"}}`, `{"error":{"message":"not available for session"}}`} {
-		for _, succeeds := range []bool{true, false} {
-			t.Run(rejection+fmt.Sprint(succeeds), func(t *testing.T) {
-				var generationCalls, autoCalls atomic.Int32
-				s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
-					switch r.URL.Path {
-					case "/copilot_internal/v2/token":
-						testSession(w, "", time.Now().Add(time.Hour))
-					case "/models":
-						_, _ = io.WriteString(w, retryModels)
-					case "/auto":
-						n := autoCalls.Add(1)
-						testJSON(w, map[string]any{"session_token": fmt.Sprint("auto-", n), "selected_model": fmt.Sprint("picked-", n), "expires_at": time.Now().Add(time.Hour).Unix()})
-					case "/chat/completions":
-						n := generationCalls.Add(1)
-						if succeeds && n == 2 {
-							_, _ = io.WriteString(w, `{"ok":true}`)
-						} else {
-							w.WriteHeader(400)
-							_, _ = io.WriteString(w, rejection)
-						}
-					default:
-						t.Errorf("unexpected endpoint %s", r.URL.Path)
-						w.WriteHeader(500)
-					}
-				})})
-				w := testRequest(s, "POST", "/v1/chat/completions", `{"model":"auto","messages":[{"role":"user","content":"hello"}]}`)
-				if succeeds && (w.Code != 200 || generationCalls.Load() != 2) {
-					t.Fatalf("retry status=%d calls=%d body=%s", w.Code, generationCalls.Load(), w.Body.String())
-				}
-				if !succeeds && (w.Code != 400 || generationCalls.Load() < 2 || generationCalls.Load() > 3) {
-					t.Fatalf("bounded retry status=%d calls=%d", w.Code, generationCalls.Load())
-				}
-				if autoCalls.Load() != generationCalls.Load() {
-					t.Fatalf("auto selections=%d generation attempts=%d", autoCalls.Load(), generationCalls.Load())
-				}
-			})
-		}
 	}
 }
 
