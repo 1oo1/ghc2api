@@ -5,7 +5,8 @@
 
 每次同步 magpie 时，还要按下文「同步 CLIProxyAPI 会话亲和键」核对
 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)（下称 cpa）的会话 ID 提取写法，
-两者的基线分别记录。
+并按「同步 VS Code 的 Credits 与 Additional Budget」核对 [VS Code](https://github.com/microsoft/vscode)
+的额度解析与展示，三者的基线分别记录。
 
 当前实现对照的上游基线：`65bd4e4f724121bc66800d5cb431dc9ce7c046f2`。
 完成后续同步并通过验证时，应将本文和 README 中记录的基线更新为实际核对的上游提交。
@@ -167,6 +168,79 @@ cpa 新增或调整会话来源（请求头、请求体字段、优先级、规�
 补测试，再修改来源表，并同步 `session-affinity.md`「会话键」。会话键变化会使已持久化的绑定失效，
 属可接受的缓存语义（旧绑定按 TTL 过期）。
 
+## 同步 VS Code 的 Credits 与 Additional Budget
+
+本项目额度（`quota-stats.md`）的主额度窗口（Credits / Premium requests / Chat messages）、
+Additional Budget 窗口，以及生成响应头的额度快照合并，语义参照 VS Code（Copilot 扩展已并入
+`microsoft/vscode` 仓库的 `extensions/copilot/`）。对应的初次同步是本项目提交 `571ca90`。VS Code 的
+基线：`b6bfa95ebee8b183d65dee4997c0527eadfe5384`（2026-10-29）。
+
+VS Code 仓库很大，用浅克隆放到 `.local/vscode-src`：
+
+```sh
+git clone --depth=1 https://github.com/microsoft/vscode.git .local/vscode-src
+git -C .local/vscode-src status --short --branch
+git -C .local/vscode-src remote get-url origin
+git -C .local/vscode-src fetch --depth=1 origin main &&
+git -C .local/vscode-src switch --detach FETCH_HEAD &&
+git -C .local/vscode-src log -1 --format='%H %cs %s'
+```
+
+浅克隆没有提交历史，`log` 不能列出区间内的提交；把基线也按提交号浅取下来，再比较两棵树：
+
+```sh
+VSCODE_BASE=b6bfa95ebee8b183d65dee4997c0527eadfe5384
+git -C .local/vscode-src fetch --depth=1 origin "${VSCODE_BASE}"
+git -C .local/vscode-src diff "${VSCODE_BASE}" HEAD -- \
+  extensions/copilot/src/platform/chat/common/chatQuotaServiceImpl.ts \
+  extensions/copilot/src/platform/chat/common/chatQuotaService.ts \
+  extensions/copilot/src/extension/prompt/node/chatMLFetcher.ts \
+  src/vs/workbench/services/chat/common/chatEntitlementService.ts \
+  src/vs/workbench/contrib/chat/browser/chatStatus/chatStatusDashboard.ts
+git -C .local/vscode-src grep -n -E \
+  'x-quota-snapshot|premium_models|premium_interactions|overage_entitlement|overage_count|token_based_billing|credits_used' \
+  HEAD -- '*.ts'
+```
+
+重点位置（文件名以检索结果为准）：
+
+- `src/vs/workbench/services/chat/common/chatEntitlementService.ts`：解析 `/copilot_internal/user`
+  （`quota_snapshots` 的 `chat`、`completions`、`premium_interactions`，以及
+  `overage_count`/`overage_entitlement`/`overage_permitted`、`credits_used`、`token_based_billing`），
+  未分配额度（非 unlimited 且 `entitlement` 为 0）的快照跳过；`getQuotaUsage` 区分按比例与只有
+  `creditsUsed` 的情形，并识别组织共享额度用完。
+- `src/vs/workbench/contrib/chat/browser/chatStatus/chatStatusDashboard.ts`：状态面板。
+  `token_based_billing` 时主额度标为「Credits」，否则为「Premium requests」；`overage_entitlement > 0`
+  时显示「Additional Budget」条，剩余比例为 `(entitlement - count) / entitlement`（夹在 0–100），
+  重置时间取主额度的；unlimited 但有 `credits_used` 时显示「Credits Used」。
+- `extensions/copilot/src/platform/chat/common/chatQuotaServiceImpl.ts`：`processQuotaHeaders`
+  （响应头选择：Free 用 `x-quota-snapshot-chat`，其余用 `x-quota-snapshot-premium_models`，再回退
+  `x-quota-snapshot-premium_interactions`）、`_processHeaderValue`（`ent`/`ov`/`ovPerm`/`rem`/`rst`，
+  `ent === -1` 为 unlimited）、`processQuotaSnapshots`（优先 `premium_models`）、
+  `_processUserInfoQuotaSnapshot`（`/copilot_internal/user`，只用 `premium_interactions`）。
+- `extensions/copilot/src/extension/prompt/node/chatMLFetcher.ts`：哪些生成响应会调用
+  `processQuotaHeaders`（含失败路径）。
+
+本项目对应实现：`internal/copilot/quota.go`（`parseQuota`、`QuotaBucket.Entitlement`）、
+`quota_header.go`（`parseQuotaHeader`、`quotaHeaderSnapshot`、`applyQuotaHeaders`）、`service.go`
+（`onResponseHeaders` 钩子）、`weight.go`（权重与耗尽判断）、`web/src/quota.ts`（控制台展示）；测试在
+`quota*_test.go`（响应头合并见 `quota_header_test.go`、`quota_header_hook_test.go`，`premium_models` 回退见
+`quota_alias_test.go`）。同步内容与刻意不同步的部分：
+
+| VS Code 行为 | 本项目 |
+| --- | --- |
+| `token_based_billing` 时主额度为 Credits，否则为 Premium requests；Free 用 `chat` 快照 | 同步：主额度窗口 `credits`/`Credits` 或 `premium_requests`/`Premium requests`，Free 为 `Chat messages`（`token_based_billing` 时仍为 `credits`） |
+| `overage_entitlement > 0` 时显示 Additional Budget，剩余 `(entitlement - count) / entitlement`，重置时间同主额度 | 同步：`additional_budget` 窗口，分母存入 `QuotaBucket.Entitlement` 并落盘，供响应头 `ov` 重算 |
+| unlimited 但 `has_quota=false` 视为组织共享额度用完 | 同步：输出剩余 0 的主额度窗口（例外规则见 `quota-stats.md`） |
+| `credits_used` 显示为 Credits Used | 同步：输出到 Summary 的 `credits_used` |
+| 响应头：Free 只认 `chat`，其余 `premium_models` 再回退 `premium_interactions`；`rem`/`ov`/`rst`/`ent` | 同步，差异：按头是否存在（`header.Values`）回退，空值不再回退（VS Code 用 `||`，空串会回退） |
+| 响应头覆盖整个额度信息（缺字段按默认值，`rst` 缺失时为一个月后） | 不同步：只合并合法字段到已有窗口，不新建窗口、不用默认值；`unlimited` 头不合并 `rem`，以免把组织额度用完的 0 改回有额度 |
+| `/copilot_internal/user` 的 Premium 快照只取 `premium_interactions`（工作台与扩展都是），`premium_models` 只出现在响应头和 agent 会话快照中 | 差异：`parseQuota` 优先 `premium_models`，缺失时整体回退 `premium_interactions`（`571ca90`）。两者同时存在且内容不同时，结果与 VS Code 不同 |
+| `x-usage-ratelimit-session`/`weekly` 响应头、每轮 `copilot_usage` credits、`completions` 快照 | 不同步，本项目不展示这些信息 |
+
+VS Code 调整额度来源、字段、Credits/Additional Budget 的计算或展示时，先在对应测试中补用例，再改
+`quota.go`/`quota_header.go`，并同步 `quota-stats.md`；影响权重或耗尽判断时同步 `pool.md`。
+
 ## 修改与验证
 
 先把上游差异归纳为具体行为及对应测试，再决定是否影响本项目。按本项目的开发约束先补充或
@@ -185,10 +259,11 @@ cpa 新增或调整会话来源（请求头、请求体字段、优先级、规�
 go test -race ./...
 go vet ./...
 go build -o .local/ghc2api-verify ./cmd/ghc2api
-git check-ignore .local/magpie .local/cpa
+git check-ignore .local/magpie .local/cpa .local/vscode-src
 ```
 
 检查 diff，确认未带入无关 provider 行为或凭证数据。所有验证通过后，将本文开头的基线、
 上方核对命令中的 `BASE` 和 README 中的短提交号更新为本次实际核对的上游提交；cpa 同理更新
-「同步 CLIProxyAPI 会话亲和键」中的基线、`CPA_BASE` 和 README 中的短提交号；保留本项目
+「同步 CLIProxyAPI 会话亲和键」中的基线、`CPA_BASE` 和 README 中的短提交号；VS Code 同理更新
+「同步 VS Code 的 Credits 与 Additional Budget」中的基线、`VSCODE_BASE` 和 README 中的短提交号；保留本项目
 独立实现，不在 `.local/` 中直接修改或提交上游代码。

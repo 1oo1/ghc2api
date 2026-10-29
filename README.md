@@ -2,7 +2,7 @@
 
 从 magpie 的 GitHub Copilot provider 提取的独立 Go HTTP 服务：把一个或多个 GitHub Copilot 账号暴露为
 OpenAI Chat Completions / Responses 与 Anthropic Messages 兼容的接口，支持多账号选择、会话亲和、额度统计和 Web 控制台。
-当前实现以 magpie 上游提交 `65bd4e4f` 为对照基线，会话亲和键对照 CLIProxyAPI 提交 `90c447d3`，同步流程见 [`docs/magpie-copilot-sync.md`](docs/magpie-copilot-sync.md)。
+当前实现以 magpie 上游提交 `65bd4e4f` 为对照基线，会话亲和键对照 CLIProxyAPI 提交 `90c447d3`，额度（Credits、Additional Budget）对照 VS Code 提交 `b6bfa95e`，同步流程见 [`docs/magpie-copilot-sync.md`](docs/magpie-copilot-sync.md)。
 
 ## 快速开始
 
@@ -34,4 +34,4 @@ make build
 | [`docs/web-console.md`](docs/web-console.md) | Web 控制台与前端构建 |
 | [`docs/upstream.md`](docs/upstream.md) | 上游 session、模型行为 |
 | [`docs/development.md`](docs/development.md) | Makefile、测试、来源与服务条款 |
-| [`docs/magpie-copilot-sync.md`](docs/magpie-copilot-sync.md) | 与 magpie 上游同步（含 CLIProxyAPI 会话亲和键） |
+| [`docs/magpie-copilot-sync.md`](docs/magpie-copilot-sync.md) | 与 magpie 上游同步（含 CLIProxyAPI 会话亲和键、VS Code 额度） |
