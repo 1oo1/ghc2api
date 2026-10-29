@@ -469,6 +469,28 @@ func TestStaleItemsRetryAlsoDropsLoneToolChoice(t *testing.T) {
 	}
 }
 
+// TestStaleItemsRetryAlsoDropsOutputReplay 请求带 output token replay 内容时，首次与重试的请求体都已去掉
+// include 中的 output.encrypted_content 与 message 项的 encrypted_content。
+func TestStaleItemsRetryAlsoDropsOutputReplay(t *testing.T) {
+	const body = `{"model":"gpt-4.1","include":["reasoning.encrypted_content","output.encrypted_content"],"input":[{"type":"reasoning","id":"rs_1","encrypted_content":"abc"},{"type":"message","id":"msg_1","role":"assistant","content":"hi","encrypted_content":"sealed"}]}`
+	s, u := staleServiceWith(t, staleSequence(staleReply{status: 401, body: stale401Body}, staleOK))
+	if w := testRequest(s, "POST", "/v1/responses", body); w.Code != 200 {
+		t.Fatalf("status=%d body=%s, want 200", w.Code, w.Body.String())
+	}
+	got := u.sent("/responses")
+	if len(got) != 2 {
+		t.Fatalf("上游 /responses 收到 %d 次请求, want 2", len(got))
+	}
+	first := decodeNumberMap(t, []byte(`{"model":"gpt-4.1","include":["reasoning.encrypted_content"],"input":[{"type":"reasoning","id":"rs_1","encrypted_content":"abc"},{"type":"message","id":"msg_1","role":"assistant","content":"hi"}]}`))
+	if !reflect.DeepEqual(decodeNumberMap(t, got[0]), first) {
+		t.Fatalf("首次请求体不符:\n got=%s", got[0])
+	}
+	retry := decodeNumberMap(t, []byte(`{"model":"gpt-4.1","include":["reasoning.encrypted_content"],"input":[{"type":"message","role":"assistant","content":"hi"}]}`))
+	if !reflect.DeepEqual(decodeNumberMap(t, got[1]), retry) {
+		t.Fatalf("重试请求体不符:\n got=%s", got[1])
+	}
+}
+
 // TestStaleItemsKeepsToolChoiceWhenToolsDeclared 声明了 tools 时 tool_choice 在重试中保留。
 func TestStaleItemsKeepsToolChoiceWhenToolsDeclared(t *testing.T) {
 	const body = `{"model":"gpt-4.1","tools":[{"type":"function","name":"f"}],"tool_choice":"auto","input":[{"type":"message","id":"msg_1","role":"user","content":"hi"}]}`

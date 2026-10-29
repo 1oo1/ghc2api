@@ -333,6 +333,7 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 	}
 	if path == "/responses" {
 		body = withoutLoneToolChoice(body)
+		body = withoutOutputReplay(body)
 	}
 	// 请求体不是对象、model 缺失/为 null/非字符串/空白时都视为无效（null 能成功解码为空结构体，故还要检查 Model 是否为 nil）。
 	var request struct {
@@ -349,7 +350,7 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 	// 这里的 w 已被 withRequestLog（Pool 另有 record）包装为 statusResponseWriter，不实现该方法，
 	// 因此 Service 与 Pool 两条路径下超限都只返回 413，不会由 MaxBytesReader 关闭连接。
 	w = newGenerationWriter(w)
-	// X-Initiator 与 Copilot-Vision-Request 只取决于客户端的原始请求体。
+	// X-Initiator 与 Copilot-Vision-Request 取决于（/responses 改写后的）请求体；改写删去的字段不影响这两项判断。
 	xInitiator := initiator(body)
 	vision := hasVision(body)
 	s.log(r.Context(), slog.LevelInfo, "开始处理生成请求", "model", model, "upstream_path", path, "request_bytes", len(body))

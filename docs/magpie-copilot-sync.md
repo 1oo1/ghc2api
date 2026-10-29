@@ -7,7 +7,7 @@
 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)（下称 cpa）的会话 ID 提取写法，
 两者的基线分别记录。
 
-当前实现对照的上游基线：`466cafa0cf681de30ce4cc68616db55f5de10cd9`。
+当前实现对照的上游基线：`65bd4e4f724121bc66800d5cb431dc9ce7c046f2`。
 完成后续同步并通过验证时，应将本文和 README 中记录的基线更新为实际核对的上游提交。
 
 ## 已删除的 Auto
@@ -54,7 +54,7 @@ git -C .local/magpie log -1 --format='%H %cs %s'
 从上次同步记录的提交开始查看相关差异。首次核对可用本文开头的基线：
 
 ```sh
-BASE=466cafa0cf681de30ce4cc68616db55f5de10cd9
+BASE=65bd4e4f724121bc66800d5cb431dc9ce7c046f2
 git -C .local/magpie diff --name-status "${BASE}..HEAD"
 git -C .local/magpie diff "${BASE}..HEAD" -- \
   internal/provider/account.go \
@@ -97,7 +97,7 @@ git -C .local/magpie log --oneline --all --regexp-ignore-case --grep='copilot'
 | `internal/copilot/login.go`、`credentials.go` | `internal/provider/copilot_signin.go`、`copilot_accounts.go`、`account.go` 中的 OAuth 登录和凭证行为 |
 | `internal/copilot/config.go`、`session.go` | `internal/provider/account.go`、`copilot_ghe.go` 中的主机、OAuth session 和身份头行为 |
 | `internal/copilot/models.go` | `internal/provider/account.go` 及相关模型数据和测试（不含 Auto 相关部分） |
-| `internal/copilot/service.go`、`request.go`、`itemids.go` | provider 请求签名与 `internal/gateway/` 的转发、协议和流式行为（含 `itemids.go` 的 Responses 项 id 统一） |
+| `internal/copilot/service.go`、`request.go`、`itemids.go`、`outputreplay.go` | provider 请求签名与 `internal/gateway/` 的转发、协议和流式行为（含 `itemids.go` 的 Responses 项 id 统一、`outputreplay.go` 对应 `codex_backend.go` 的 `forVendor` 中去掉 output token replay 的部分） |
 
 只同步本服务已经支持的功能。magpie 的多账号管理、桌面 UI、agent 集成等不属于本项目的
 provider 代理范围；不要整文件复制，也不要为追求代码结构一致而引入这些依赖。
@@ -105,7 +105,7 @@ provider 代理范围；不要整文件复制，也不要为追求代码结构�
 ## 同步 CLIProxyAPI 会话亲和键
 
 本项目会话键（`sessionKey`，见 `session-affinity.md`）的会话 ID 来源与优先级参照 cpa。cpa 的
-基线：`307803510bce87f986fcf7b1a84190f105c7b4aa`（2026-10-25）。
+基线：`90c447d3a8727d115aa7552ec93ce023736ed492`（2026-10-29）。
 
 首次获取与更新方式同 magpie，克隆到 `.local/cpa`：
 
@@ -122,7 +122,7 @@ git -C .local/cpa log -1 --format='%H %cs %s'
 核对差异：
 
 ```sh
-CPA_BASE=307803510bce87f986fcf7b1a84190f105c7b4aa
+CPA_BASE=90c447d3a8727d115aa7552ec93ce023736ed492
 git -C .local/cpa diff "${CPA_BASE}..HEAD" -- \
   sdk/cliproxy/session/info.go \
   sdk/cliproxy/session/identity.go \
