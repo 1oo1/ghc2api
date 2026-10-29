@@ -51,6 +51,11 @@ type Service struct {
 	refused   map[string]refusedModel
 	// refusalSeq 在锁内递增，删除记录后也不重置，避免不同拒绝的版本相同。
 	refusalSeq uint64
+
+	// onResponseHeaders 是可选钩子：生成请求拿到上游响应后（400 分支与流式透传之前）以响应头调用，
+	// 由 newPoolAccount 装配为账号的额度头合并（applyQuotaHeaders）；为 nil 时跳过。创建后只读，无需加锁。
+	// 任何状态码的生成响应（含走 streamResponse 透传的 4xx/5xx）都会经过它；handleError 路径没有生成响应头，不调用。
+	onResponseHeaders func(http.Header)
 }
 
 // New 不发网络请求；凭证的有效性在首次访问上游时检查。
@@ -403,6 +408,10 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 	if err != nil {
 		s.handleError(r.Context(), w, err)
 		return
+	}
+	// 两个出口（上游 400 的原样返回与流式透传）共用同一次调用，放在分支之前。
+	if s.onResponseHeaders != nil {
+		s.onResponseHeaders(res.Header)
 	}
 	if res.StatusCode == http.StatusBadRequest {
 		data, readErr := readLimited(res.Body, maxMetadataBody)

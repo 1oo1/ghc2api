@@ -1,13 +1,13 @@
 # 额度与请求统计
 
-代码：`internal/copilot/quota.go`（解析、获取、缓存、持久化）、`weight.go`（权重与耗尽判断）、`pool.go`（统计）。
+代码：`internal/copilot/quota.go`（解析、获取、缓存、持久化）、`quota_header.go`（响应头额度快照合并）、`weight.go`（权重与耗尽判断）、`pool.go`（统计）。
 
 ## 额度数据结构与解析
 
 ```go
 type Quota struct { Subscription *QuotaSubscription; Groups []QuotaGroup; Summary []QuotaMetric; Stale bool; ObservedAt time.Time }
 type QuotaGroup struct { DisplayName string; Buckets []QuotaBucket }
-type QuotaBucket struct { Window, Description string; RemainingFraction float64; ResetTime string }
+type QuotaBucket struct { Window, Description string; RemainingFraction float64; ResetTime string; Entitlement float64 /* 仅 additional_budget 桶 */ }
 type QuotaMetric struct { Key, Label string; Value float64; Format string }
 parseQuota(raw []byte) (Quota, error)
 ```
@@ -16,10 +16,23 @@ JSON 名为小驼峰（如 `remainingFraction`、`observedAt`），完整定义�
 
 - 计划名由 `access_type_sku`/`copilot_plan` 映射。`token_based_billing=true` 时主额度为 `credits`/`Credits`，否则 `premium_requests`/`Premium requests`；Copilot Free 用 `chat` 快照（`Chat messages`，`token_based_billing=true` 时仍为 `credits`），无该快照时由 `monthly_quotas.chat` 与 `limited_user_quotas.chat` 计算。
 - `unlimited=true` 不产生 bucket（例外见下条）；`credits_used`（`has_quota` 缺失或为 true）输出到 Summary（`Key=credits_used`、`Label=Credits Used`、`Format=number`）。
-- 组织共享 Premium 额度用完：非 Copilot Free 账号的 `premium_interactions` 为 `unlimited=true` 且 `has_quota` 明确为 `false` 时，视为组织共享额度已用完（VS Code 会暂停该席位，见 magpie #1063），输出剩余比例为 0 的主额度 bucket（窗口与名称同上，重置时间按下述规则），因此账号进入"无 Credits"档，重置时间可解析时按耗尽跳过（见 `pool.md`）。例外：该快照 `overage_permitted=true` 且 `copilot_plan` 不是 `business`/`enterprise`（不区分大小写）时仍不产生 bucket。
-- Additional Budget：`premium_interactions.overage_count`、`overage_entitlement` 均为合法非负数且 entitlement>0 时输出 `additional_budget` 桶，`RemainingFraction=max(0, 1-count/entitlement)`；非法或 entitlement 为 0 时不输出，不影响主额度。
+- Premium 快照取 `quota_snapshots.premium_models`，缺失（或不是对象）时整体回退 `premium_interactions`；回退是对象级的，`premium_models` 存在但字段缺失时不借用 `premium_interactions` 的字段。下文的 Premium 主额度、组织共享额度与 Additional Budget 都使用选中的快照。
+- 组织共享 Premium 额度用完：非 Copilot Free 账号的 Premium 快照为 `unlimited=true` 且 `has_quota` 明确为 `false` 时，视为组织共享额度已用完（VS Code 会暂停该席位，见 magpie #1063），输出剩余比例为 0 的主额度 bucket（窗口与名称同上，重置时间按下述规则），因此账号进入"无 Credits"档，重置时间可解析时按耗尽跳过（见 `pool.md`）。例外：该快照 `overage_permitted=true` 且 `copilot_plan` 不是 `business`/`enterprise`（不区分大小写）时仍不产生 bucket。
+- Additional Budget：Premium 快照的 `overage_count`、`overage_entitlement` 均为合法非负数且 entitlement>0 时输出 `additional_budget` 桶，`RemainingFraction=max(0, 1-count/entitlement)`，并把分母留存在桶的 `Entitlement` 字段（JSON 键 `entitlement`，`omitempty`，只出现在 `additional_budget` 桶；随 `quota.json` 落盘，重启后响应头合并仍能重算）；非法或 entitlement 为 0 时不输出，不影响主额度。
 - 重置时间：`quota_reset_at`（Unix 秒）优先，其次 `quota_reset_date_utc`/`quota_reset_date`/`limited_user_reset_date`（RFC3339 转 UTC，或保留 `YYYY-MM-DD`；无法解析的跳过）。
 - 字段逐个容错；顶层不是 JSON 对象（含 `null`）返回错误。
+
+## 响应头额度快照合并
+
+生成请求的上游响应携带额度快照头，`poolAccount.applyQuotaHeaders(header)`（`quota_header.go`）把它合并进缓存额度，使额度在两次轮询之间也能更新（语义参照 VS Code）。接线：`Service.onResponseHeaders` 钩子由 `newPoolAccount` 装配为 `applyQuotaHeaders`，`handleGeneration` 拿到上游响应后（400 分支与流式透传之前，一次调用覆盖两个出口）调用。所有状态码的生成响应（含 4xx/5xx，它们走 `streamResponse` 原样透传而非 `handleError`）都会合并额度头，与 VS Code 失败路径也解析的行为一致；`handleError` 只处理网络错误与 session 交换失败，没有生成响应头可解析（`retryStaleItems` 中被丢弃的第一次响应不合并，无影响）。
+
+- 头名：Copilot Free（缓存额度 `Subscription.Plan == "Copilot Free"`）只认 `x-quota-snapshot-chat`；其余账号（含计划未知）优先 `x-quota-snapshot-premium_models`，该头缺失时回退 `x-quota-snapshot-premium_interactions`（头存在但值为空串或非法时不再回退，按 `header.Values` 判断存在性）。
+- 头值是 URL 编码键值对（`parseQuotaHeader` → `quotaHeaderSnapshot`）：`rem`（剩余百分比）、`ov`（overage_count）、`rst`（RFC3339 重置时间）、`ent`（`strconv.Atoi` 解析为 `-1` 时标记 `unlimited`，对应 VS Code 的 `unlimited: entitlement === -1`；缺失、非法或其他值为 false）；`ovPerm` 等其他键忽略。`url.ParseQuery` 的错误被忽略，坏键值对只丢弃自身，其余部分照常使用；`rem`/`ov` 非数字、NaN、Inf、负数或 `rst` 非 RFC3339 时只丢弃该字段。
+- 合并规则：主额度窗口 `rem` 合法且头不是 `unlimited` 时 `RemainingFraction=min(100, rem)/100`，`rst` 合法时更新 `ResetTime`（UTC 的 RFC3339）；`unlimited` 头不合并 `rem`（`parseQuota` 对组织共享额度耗尽的 unlimited 快照造了 `RemainingFraction=0` 的主窗口，不限量头的 `rem` 会把它错误地改回有额度；代价是组织额度恢复后要等下一次轮询才解除耗尽），`rst`、`ov` 照常；`additional_budget` 窗口在 `ov` 合法且已记录分母（`entitlement>0`）时 `RemainingFraction=max(0, 1-ov/entitlement)`，其 `ResetTime` 不变。窗口不存在时不新建，对应字段不合并。
+- no-op 条件：缓存没有额度数据（不会由头创建额度）、头缺失，或没有任何字段被合并（如头值无可用字段、窗口都不存在、旧版本写入的 `quota.json` 恢复后缺分母且只有 `ov`）。no-op 时 `ObservedAt` 也不变。
+- 至少合并一个字段后 `ObservedAt=time.Now()`；**不改** `Stale` 与 `checkedAt`（不影响轮询节流）。头合并本身不触发写盘；之后任何一次刷新落盘（限流或错误路径的 `saveQuotaLocked`）会把合并结果（含分母 `Entitlement`）写入 `quota.json`。合并后的额度立即参与权重与耗尽判断（见 `pool.md`）。
+- 已知边缘：Copilot Free 走 `x-quota-snapshot-chat` 头时，`ov` 会合并进来自 `premium_models` 快照的 `additional_budget` 桶（两者来源的快照不同；Free 账号极少有该桶，概率低，行为保持现状）。
+- 写时复制：`quotaCache.snapshot()` 是浅拷贝，管理接口可能正在序列化共享的 `Groups`/`Buckets`，因此合并先复制 `Groups` 与 `Buckets` 再改，最后在 `quotaCache.mu` 内替换缓存指针，不原地修改。
 
 ## 获取与节流
 

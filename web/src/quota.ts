@@ -9,6 +9,8 @@ export type Bucket = {
   remainingFraction: number;
   /** 重置时间：RFC3339 时间或 YYYY-MM-DD。 */
   resetTime?: string;
+  /** Additional Budget 的分母（overage_entitlement），仅 additional_budget 窗口有值。 */
+  entitlement?: number;
 };
 export type Quota = {
   subscription?: { plan?: string; tierName?: string };

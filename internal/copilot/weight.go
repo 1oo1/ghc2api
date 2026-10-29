@@ -7,7 +7,7 @@ import (
 
 // 本文件基于账号缓存的额度，提供两个判断：额度权重（档位与剩余比例），用于同一档内的平滑加权轮询，SWRR 权重由 swrrWeight 换算（见 Pool.pickLocked）；
 // 额度耗尽判断，耗尽的账号暂不参与选择，直到主额度的重置时刻（见 poolAccount.exhausted）。
-// 两者都只读取缓存的额度，不访问上游；额度刷新后才会变化，耗尽判断还取决于当前时间。
+// 两者都只读取缓存的额度，不访问上游；缓存额度在刷新或合并生成响应头额度快照（见 applyQuotaHeaders）后变化，耗尽判断还取决于当前时间。
 
 // additionalBudgetWindow 是 Additional Budget 额度窗口的 window 字段值，它不属于主额度。
 const additionalBudgetWindow = "additional_budget"

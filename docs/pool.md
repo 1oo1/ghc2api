@@ -1,6 +1,6 @@
 # 账号池：选择、故障切换与冷却
 
-代码：`internal/copilot/pool.go`（`forward`、`pickSession`、`record`、`choose`）、`cooldown.go`（错误计数、冷却与持久化，`setCooldown`/`available`）、`affinity_gate.go`（会话门）、`weight.go`、`service.go`。
+代码：`internal/copilot/pool.go`（`forward`、`pickSession`、`record`、`choose`）、`cooldown.go`（错误计数、冷却与持久化，`setCooldown`/`available`）、`affinity_gate.go`（会话门）、`weight.go`（读取额度，不访问上游）、`quota_header.go`（`parseQuotaHeader`、`quotaHeaderSnapshot`、`applyQuotaHeaders`：生成响应头额度快照合并，见 `quota-stats.md`）、`service.go`。额度桶 `QuotaBucket` 在 `quota.go`，其字段 `Entitlement` 仅 `additional_budget` 桶使用。
 
 ## 结构与构造
 
@@ -113,7 +113,7 @@ flowchart TD
 
 其他说明：
 
-- 权重与耗尽判断只读账号的额度缓存，不访问上游，额度只在刷新后变化（见 `quota-stats.md`）。额度由后台定时刷新保持新鲜（无需打开控制台，与是否配置 `management_key` 无关），账号请求失败（非 429）时还会异步刷新该账号的额度；因此一次失败后，该账号的额度可能立即变为耗尽并被跳过。启用 `management_key` 后仍可在控制台强制刷新额度。
+- 权重与耗尽判断只读账号的额度缓存，不访问上游。缓存额度在两种时机变化：刷新，以及生成请求的上游响应头额度快照合并（`applyQuotaHeaders`，见 `quota-stats.md`「响应头额度快照合并」）；后者在两次轮询之间也会生效，因此账号可能不经刷新就被判为耗尽并被跳过。额度由后台定时刷新保持新鲜（无需打开控制台，与是否配置 `management_key` 无关），账号请求失败（非 429）时还会异步刷新该账号的额度；因此一次失败后，该账号的额度可能立即变为耗尽并被跳过。启用 `management_key` 后仍可在控制台强制刷新额度。
 - 无可选账号（0 个、全部禁用、全部冷却，或全部耗尽未到重置时刻）时，需要账号的请求直接返回 503（`没有可用的 GitHub Copilot 账号`），不访问上游。
 - `/healthz`、404、405、重定向不访问上游，由池直接处理，0 账号也能工作。
 - 模型列表是各账号独立获取的；订阅不同时某模型可能只在部分账号可用，被分到不支持的账号会返回 400。

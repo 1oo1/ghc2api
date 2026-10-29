@@ -56,6 +56,10 @@ type QuotaBucket struct {
 	Description       string  `json:"description"` // Credits | Premium requests | Chat messages | Additional Budget
 	RemainingFraction float64 `json:"remainingFraction"`
 	ResetTime         string  `json:"resetTime,omitempty"`
+	// Entitlement 是 Additional Budget 的分母 overage_entitlement，只在 additional_budget 窗口上有值（由 parseQuota 填写）。
+	// 随 quota.json 落盘，重启后响应头合并 ov（已用量）时仍能重算 RemainingFraction（见 applyQuotaHeaders）；
+	// 旧版本写入的 quota.json 没有该键（零值），此时响应头无法更新 Additional Budget，直到下一次刷新。
+	Entitlement float64 `json:"entitlement,omitempty"`
 }
 
 // QuotaMetric 是不属于额度窗口的汇总指标。
@@ -93,7 +97,12 @@ func parseQuota(raw []byte) (Quota, error) {
 	}
 
 	snapshots := account.object("quota_snapshots")
-	premium := snapshots.object("premium_interactions")
+	// 新后端把 premium_interactions 改发为 premium_models：优先取 premium_models，缺失（或不是对象）时整体回退到 premium_interactions。
+	// 回退是对象级的：premium_models 存在但字段缺失时不会借用 premium_interactions 的字段。
+	premium := snapshots.object("premium_models")
+	if premium == nil {
+		premium = snapshots.object("premium_interactions")
+	}
 	tokenBilling := account.isTrue("token_based_billing")
 	selected := premium
 	window, label := "premium_requests", "Premium requests"
@@ -147,7 +156,8 @@ func parseQuota(raw []byte) (Quota, error) {
 	entitlement, validEntitlement := premium.number("overage_entitlement")
 	if validCount && validEntitlement && entitlement > 0 {
 		buckets = append(buckets, QuotaBucket{Window: "additional_budget", Description: "Additional Budget",
-			RemainingFraction: max(0, 1-count/entitlement), ResetTime: quotaReset(premium, account)})
+			RemainingFraction: max(0, 1-count/entitlement), ResetTime: quotaReset(premium, account),
+			Entitlement: entitlement})
 	}
 	if len(buckets) > 0 {
 		q.Groups = []QuotaGroup{{DisplayName: "GitHub Copilot", Buckets: buckets}}

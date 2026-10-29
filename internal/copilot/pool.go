@@ -77,6 +77,8 @@ func newPoolAccount(service *Service, id string) *poolAccount {
 	account := &poolAccount{id: id, service: service, routes: service.routes(), cooldown: DefaultAccountCooldown, effects: new(cooldownEffects)}
 	account.restoreQuota()
 	account.restoreCooldown(time.Now())
+	// 生成请求拿到上游响应头后据此合并额度快照（见 Service.handleGeneration）；Service 与账号一一对应，创建时装配即可。
+	service.onResponseHeaders = account.applyQuotaHeaders
 	return account
 }
 
