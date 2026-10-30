@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -46,6 +47,8 @@ type AccountView struct {
 	} `json:"stats"`
 	Quota      *Quota `json:"quota,omitempty"`
 	QuotaError string `json:"quota_error,omitempty"`
+	// Proxy 是账号的 SOCKS5 代理信息（不含密码），直连时省略，见 docs/proxy.md。
+	Proxy *ProxyView `json:"proxy,omitempty"`
 }
 
 // managementAPIPrefix 是需要管理密钥的接口路径前缀；控制台页面 /management 不需要鉴权。
@@ -124,8 +127,17 @@ func serveConsole(w http.ResponseWriter, _ *http.Request) {
 
 // decodeManagementJSON 解码管理接口的 JSON 请求体（上限 1 MiB）。失败时已写入错误响应并返回 false。
 func decodeManagementJSON(w http.ResponseWriter, r *http.Request, value any) bool {
+	return decodeJSONBody(w, r, value, false)
+}
+
+// decodeOptionalManagementJSON 与 decodeManagementJSON 相同，但允许请求体为空（此时 value 保持不变）。
+func decodeOptionalManagementJSON(w http.ResponseWriter, r *http.Request, value any) bool {
+	return decodeJSONBody(w, r, value, true)
+}
+
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, value any, allowEmpty bool) bool {
 	err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxManagementBody)).Decode(value)
-	if err == nil {
+	if err == nil || (allowEmpty && errors.Is(err, io.EOF)) {
 		return true
 	}
 	var tooLarge *http.MaxBytesError
@@ -181,9 +193,20 @@ func (p *Pool) handleImportAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	proxy, err := normalizeProxy(req.Credential.Proxy)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	client, err := p.clientFor(proxy)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
-	login, err := verifyGitHubAccount(ctx, p.client, host, token)
+	login, err := verifyGitHubAccount(ctx, client, host, token)
 	cancel()
+	closeProxyClient(client, proxy)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -196,7 +219,7 @@ func (p *Pool) handleImportAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "GitHub 登录名不是合法的用户名，不能用作凭证文件名")
 		return
 	}
-	account, err := p.addVerifiedAccount(token, host, login)
+	account, err := p.addVerifiedAccount(token, host, login, proxy)
 	if errors.Is(err, errAccountExists) {
 		writeError(w, http.StatusConflict, err.Error())
 		return
@@ -209,27 +232,39 @@ func (p *Pool) handleImportAccount(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, p.accountView(account))
 }
 
-// handlePatchAccount 更新账号的 disabled、priority 与 clear_cooldown，三者至少提供一个，未提供的字段保持不变。
-// 顺序：disabled 或 priority 有变化时先重写凭证文件；写入失败返回 500，冷却、disabled、priority 全部不变。
-// 写入成功后同步内存中的 disabled 与 priority，再在 clear_cooldown 为 true 时解除冷却（见 poolAccount.liftCooldown）；
-// 解除失败返回 500，错误信息说明凭证已更新、账号仍冷却，此时 disabled 与 priority 已生效，冷却不变。
-// clear_cooldown 为 false 视为未提供。
+// handlePatchAccount 更新账号的 disabled、priority、proxy 与 clear_cooldown，至少提供一个，未提供的字段保持不变。
+// proxy 为字符串：非空且与当前值不同时先通过新代理用账号 token 请求 GitHub /user 验证（失败 502，登录名与账号不一致 400），
+// 空串表示删除代理（不验证）；proxy_keep_password 为 true 且新 URL 不含密码时沿用当前代理的密码（见 mergeProxyPassword）。
+// 顺序：disabled、priority 或 proxy 有变化时先重写凭证文件；写入失败返回 500，冷却、disabled、priority、代理全部不变。
+// 写入成功后同步内存中的 disabled、priority 与代理（替换 HTTP 客户端），再在 clear_cooldown 为 true 时解除冷却（见 poolAccount.liftCooldown）；
+// 解除失败返回 500，错误信息说明凭证已更新、账号仍冷却，此时其余修改已生效，冷却不变。修改代理不会自动解除冷却。
+// clear_cooldown 为 false 视为未提供。验证期间持有 adminMu，最长约 30 秒。
 func (p *Pool) handlePatchAccount(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ID            string `json:"id"`
-		Disabled      *bool  `json:"disabled"`
-		Priority      *int   `json:"priority"`
-		ClearCooldown bool   `json:"clear_cooldown"`
+		ID                string  `json:"id"`
+		Disabled          *bool   `json:"disabled"`
+		Priority          *int    `json:"priority"`
+		Proxy             *string `json:"proxy"`
+		ProxyKeepPassword bool    `json:"proxy_keep_password"`
+		ClearCooldown     bool    `json:"clear_cooldown"`
 	}
 	if !decodeManagementJSON(w, r, &req) {
 		return
 	}
-	if req.ID == "" || (req.Disabled == nil && req.Priority == nil && !req.ClearCooldown) {
-		writeError(w, http.StatusBadRequest, "请求必须包含 id，且 disabled、priority 与 clear_cooldown 至少提供一个")
+	if req.ID == "" || (req.Disabled == nil && req.Priority == nil && req.Proxy == nil && !req.ClearCooldown) {
+		writeError(w, http.StatusBadRequest, "请求必须包含 id，且 disabled、priority、proxy 与 clear_cooldown 至少提供一个")
 		return
 	}
 	if req.Priority != nil {
 		if err := checkPriority(*req.Priority); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	requestedProxy := ""
+	if req.Proxy != nil {
+		var err error
+		if requestedProxy, err = normalizeProxy(*req.Proxy); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -241,10 +276,11 @@ func (p *Pool) handlePatchAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "账号不存在")
 		return
 	}
-	// adminMu 串行化了所有修改，此处读到的 disabled 与 priority 在写入期间不会被其他请求改变。
+	// adminMu 串行化了所有修改，此处读到的 disabled、priority 与代理在写入期间不会被其他请求改变。
 	p.mu.Lock()
 	disabled, priority := account.disabled, account.priority
 	p.mu.Unlock()
+	proxy := account.service.currentProxy()
 	credentialChanged := false
 	if req.Disabled != nil && *req.Disabled != disabled {
 		disabled, credentialChanged = *req.Disabled, true
@@ -252,8 +288,23 @@ func (p *Pool) handlePatchAccount(w http.ResponseWriter, r *http.Request) {
 	if req.Priority != nil && *req.Priority != priority {
 		priority, credentialChanged = *req.Priority, true
 	}
+	var newClient *http.Client // 代理有变化时的新客户端，写入成功后替换到账号上
+	if req.Proxy != nil {
+		next := requestedProxy
+		if req.ProxyKeepPassword {
+			next = mergeProxyPassword(next, proxy)
+		}
+		if !sameProxy(next, proxy) {
+			client, status, err := p.verifyProxy(r.Context(), account, next)
+			if err != nil {
+				writeError(w, status, err.Error())
+				return
+			}
+			proxy, newClient, credentialChanged = next, client, true
+		}
+	}
 	if credentialChanged {
-		if err := setCredentialState(p.credentialPath(account), disabled, priority); err != nil {
+		if err := setCredentialState(p.credentialPath(account), disabled, priority, proxy); err != nil {
 			writeError(w, http.StatusInternalServerError, "写入凭证失败: "+err.Error())
 			return
 		}
@@ -261,6 +312,9 @@ func (p *Pool) handlePatchAccount(w http.ResponseWriter, r *http.Request) {
 	p.mu.Lock()
 	account.disabled, account.priority = disabled, priority
 	p.mu.Unlock()
+	if newClient != nil {
+		account.service.useProxyClient(newClient, proxy)
+	}
 	if req.ClearCooldown {
 		if err := account.liftCooldown(); err != nil {
 			p.log(r.Context(), slog.LevelWarn, "管理接口：解除冷却失败，账号仍处于冷却中", "id", account.id, "error", err.Error())
@@ -273,8 +327,32 @@ func (p *Pool) handlePatchAccount(w http.ResponseWriter, r *http.Request) {
 		}
 		p.log(r.Context(), slog.LevelInfo, "管理接口：账号已解除冷却", "id", account.id)
 	}
-	p.log(r.Context(), slog.LevelInfo, "管理接口：账号已更新", "id", account.id, "disabled", disabled, "priority", priority)
+	p.log(r.Context(), slog.LevelInfo, "管理接口：账号已更新", "id", account.id, "disabled", disabled, "priority", priority, "proxy", proxyView(proxy) != nil)
 	writeJSON(w, http.StatusOK, p.accountView(account))
+}
+
+// verifyProxy 构造账号使用 proxy 的客户端；proxy 非空时先通过它用账号 token 请求 /user，确认连通且登录名与账号一致。
+// 失败时返回应写给客户端的状态码：客户端构造失败或登录名不一致为 400，请求失败为 502。
+func (p *Pool) verifyProxy(ctx context.Context, account *poolAccount, proxy string) (*http.Client, int, error) {
+	client, err := proxyClient(account.service.config.Client, proxy)
+	if err != nil {
+		return nil, http.StatusBadRequest, err
+	}
+	if proxy == "" {
+		return client, 0, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	login, err := fetchGitHubLogin(ctx, client, account.service.config.Host, account.service.config.Token)
+	if err != nil {
+		client.CloseIdleConnections()
+		return nil, http.StatusBadGateway, err
+	}
+	if !strings.EqualFold(login, account.id) {
+		client.CloseIdleConnections()
+		return nil, http.StatusBadRequest, errors.New("通过该代理得到的 GitHub 登录名与账号不一致")
+	}
+	return client, 0, nil
 }
 
 // handleDeleteAccount 删除账号：先删除凭证文件（文件已不存在也视为成功），再从池中移除。
@@ -336,8 +414,8 @@ func (p *Pool) handleRefreshQuota(w http.ResponseWriter, r *http.Request) {
 // addVerifiedAccount 保存已通过 GitHub 校验的凭证，并把账号追加到池末尾。新账号的优先级为 0。
 // 入池后立即在后台强制刷新一次额度（不阻塞调用方，失败只记入额度缓存），因此响应中的账号视图可能尚无额度。
 // 登录名（忽略大小写）或 Host+Token 已存在、凭证目录中已有同名文件时返回 errAccountExists，且不写入凭证。
-// 登录名须通过 ValidGitHubUserName，因为它会用作凭证文件名。
-func (p *Pool) addVerifiedAccount(token, host, login string) (*poolAccount, error) {
+// 登录名须通过 ValidGitHubUserName，因为它会用作凭证文件名。proxy 是已校验的代理 URL，空表示直连。
+func (p *Pool) addVerifiedAccount(token, host, login, proxy string) (*poolAccount, error) {
 	if !ValidGitHubUserName(login) {
 		return nil, errors.New("GitHub 登录名不是合法的用户名，不能用作凭证文件名")
 	}
@@ -346,7 +424,7 @@ func (p *Pool) addVerifiedAccount(token, host, login string) (*poolAccount, erro
 	service, err := New(Config{
 		Token: token, Host: host, User: login, APIKey: p.apiKey, CacheDir: p.config.CacheDir,
 		ModelsCacheTTL: p.config.ModelsCacheTTL, QuotaRefreshInterval: p.config.QuotaRefreshInterval,
-		Client: p.config.Client, Logger: p.logger,
+		Client: p.config.Client, Logger: p.logger, Proxy: proxy,
 	})
 	if err != nil {
 		return nil, err
@@ -366,7 +444,7 @@ func (p *Pool) addVerifiedAccount(token, host, login string) (*poolAccount, erro
 	if exists {
 		return nil, fmt.Errorf("%w：凭证目录中已存在同名文件", errAccountExists)
 	}
-	credential := Credential{Token: token, Host: service.config.Host, User: login}
+	credential := Credential{Token: token, Host: service.config.Host, User: login, Proxy: service.config.Proxy}
 	if err := SaveCredential(p.credentialPathFor(login), credential); err != nil {
 		return nil, err
 	}
@@ -377,6 +455,15 @@ func (p *Pool) addVerifiedAccount(token, host, login string) (*poolAccount, erro
 	// 账号可能从缓存恢复了较新的 checked_at，因此不节流，入池后立即强制刷新。
 	account.refreshAsync(0)
 	return account, nil
+}
+
+// clientFor 返回访问 GitHub 的客户端：proxy 为空时是池共用的直连客户端，否则是经该代理的新客户端
+// （调用方用完后应关闭其空闲连接）。proxy 须已通过 normalizeProxy。
+func (p *Pool) clientFor(proxy string) (*http.Client, error) {
+	if proxy == "" {
+		return p.client, nil
+	}
+	return proxyClient(p.config.Client, proxy)
 }
 
 // credentialFileExists 扫描凭证目录，报告是否已有同名（忽略大小写）的凭证文件。
@@ -406,14 +493,16 @@ func (p *Pool) credentialPathFor(login string) string {
 	return filepath.Join(p.config.CredentialsDir, login+".json")
 }
 
-// setCredentialState 重写凭证文件中的 disabled 与 priority 字段，其他字段保持不变；disabled 为 false 时该字段被省略，priority 为 0 时同样省略。
-func setCredentialState(path string, disabled bool, priority int) error {
+// setCredentialState 重写凭证文件中的 disabled、priority 与 proxy 字段，其他字段保持不变；
+// disabled 为 false、priority 为 0、proxy 为空时对应字段被省略。
+func setCredentialState(path string, disabled bool, priority int, proxy string) error {
 	credential, err := LoadCredential(path)
 	if err != nil {
 		return err
 	}
 	credential.Disabled = disabled
 	credential.Priority = priority
+	credential.Proxy = proxy
 	return SaveCredential(path, credential)
 }
 
@@ -453,5 +542,6 @@ func (a *poolAccount) view(now time.Time) AccountView {
 		view.Stats.LastUsedAt = &used
 	}
 	view.Quota, view.QuotaError = a.quota.snapshot()
+	view.Proxy = proxyView(a.service.currentProxy())
 	return view
 }

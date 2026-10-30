@@ -14,7 +14,9 @@ import {
   parsePriority,
 } from "../account";
 import { buckets, resetLabel, usedPercent, type Bucket, type Quota } from "../quota";
+import { buildProxyPatch, proxyLabel } from "../proxy";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { ProxyDialog } from "./ProxyDialog";
 
 /** 需在对话框中确认后才执行的操作。 */
 type PendingAction = { message: string; task: () => Promise<string> };
@@ -36,6 +38,13 @@ export function AccountCard({
   const { busy, client, run } = actions;
   // 禁用、删除需二次确认：点击按钮只记录待执行操作，在对话框中确认后才执行。
   const [pending, setPending] = useState<PendingAction | null>(null);
+  const [editingProxy, setEditingProxy] = useState(false);
+  /** 在代理弹窗中提交：成功时关闭弹窗，失败时返回错误文案由弹窗显示。 */
+  const submitProxy = async (task: () => Promise<string>) => {
+    const failure = await actions.submit(task);
+    if (failure === null) setEditingProxy(false);
+    return failure;
+  };
   const toggleDisabled = async () => {
     await client.setDisabled(account.id, !account.disabled);
     return `${account.user} 已${account.disabled ? "启用" : "禁用"}`;
@@ -60,6 +69,16 @@ export function AccountCard({
       {cooling && status === "disabled" && (
         <p className="hint">{coolingLabel(account.cooldown_reason)}</p>
       )}
+      <p className="proxy-line">
+        <button
+          className="link"
+          disabled={busy}
+          title="点击修改代理"
+          onClick={() => setEditingProxy(true)}
+        >
+          代理：{proxyLabel(account.proxy)}
+        </button>
+      </p>
       {/* 以服务端的优先级为 key：优先级变化后重新挂载，输入框随之显示新值。 */}
       <PriorityEditor key={account.priority} account={account} actions={actions} />
       <footer>
@@ -118,6 +137,28 @@ export function AccountCard({
           删除
         </button>
       </footer>
+      {editingProxy && (
+        <ProxyDialog
+          title={`账号 ${account.user} 的代理`}
+          hint="账号的所有请求都经由该 SOCKS5 代理，不会回退直连。保存前会通过新代理验证连通性。"
+          current={account.proxy}
+          confirmLabel="保存"
+          requireChange
+          onCancel={() => setEditingProxy(false)}
+          onConfirm={(form) =>
+            submitProxy(async () => {
+              await client.setProxy(account.id, buildProxyPatch(form, account.proxy));
+              return `${account.user} 代理已更新`;
+            })
+          }
+          onDelete={() =>
+            submitProxy(async () => {
+              await client.setProxy(account.id, { proxy: "" });
+              return `${account.user} 代理已删除`;
+            })
+          }
+        />
+      )}
       {pending && (
         <ConfirmDialog
           message={pending.message}

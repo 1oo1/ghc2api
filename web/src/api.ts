@@ -23,6 +23,24 @@ export type AccountView = {
   quota?: Quota;
   /** 最近一次额度刷新失败的原因；旧数据仍可用时出现。 */
   quota_error?: string;
+  /** 账号的 SOCKS5 代理（不含密码）；直连时不存在。 */
+  proxy?: ProxyView;
+};
+
+/** 账号代理信息，与服务端 ProxyView 一致。 */
+export type ProxyView = {
+  scheme: string;
+  /** IPv6 主机不带方括号。 */
+  host: string;
+  port: number;
+  username?: string;
+  has_password: boolean;
+};
+
+/** PATCH 账号时的代理部分：proxy 为空串表示删除代理；proxy_keep_password 为 true 时沿用当前密码。 */
+export type ProxyPatch = {
+  proxy: string;
+  proxy_keep_password?: boolean;
 };
 
 /** 发起设备登录后的返回值。 */
@@ -107,8 +125,14 @@ export function createManagementClient(credential: string) {
     /** 服务端程序版本，例如 v0.0.1。 */
     getVersion: () => request<{ version: string }>("version"),
     listAccounts: () => request<AccountView[]>("accounts"),
-    importAccount: (credential: unknown) =>
-      request<AccountView>("accounts", "POST", { credential }),
+    /** proxy 非空时写入 credential.proxy，覆盖凭证中原有的 proxy。 */
+    importAccount: (credential: unknown, proxy?: string) =>
+      request<AccountView>("accounts", "POST", {
+        credential:
+          proxy && typeof credential === "object" && credential !== null && !Array.isArray(credential)
+            ? { ...credential, proxy }
+            : credential,
+      }),
     setDisabled: (id: string, disabled: boolean) =>
       request<AccountView>("accounts", "PATCH", { id, disabled }),
     setPriority: (id: string, priority: number) =>
@@ -121,9 +145,14 @@ export function createManagementClient(credential: string) {
         `accounts?id=${encodeURIComponent(id)}`,
         "DELETE",
       ),
+    /** 设置、修改或删除（proxy 为空串）账号代理；设置时服务端会先通过新代理验证。 */
+    setProxy: (id: string, patch: ProxyPatch) =>
+      request<AccountView>("accounts", "PATCH", { id, ...patch }),
     refreshQuota: (id: string) =>
       request<AccountView>("quota/refresh", "POST", { id }),
-    startLogin: () => request<LoginStart>("login", "POST"),
+    /** proxy 非空时设备登录全程经该代理，并保存到新账号的凭证中。 */
+    startLogin: (proxy?: string) =>
+      request<LoginStart>("login", "POST", proxy ? { proxy } : undefined),
     loginStatus: (state: string) =>
       request<LoginStatus>(
         `login/status?state=${encodeURIComponent(state)}`,

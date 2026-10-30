@@ -27,6 +27,9 @@ type Config struct {
 	QuotaRefreshInterval time.Duration // 非正值使用 DefaultQuotaRefreshInterval，见 quota.go。
 	Client               *http.Client
 	Logger               *slog.Logger
+	// Proxy 是账号的 SOCKS5 代理 URL，空表示直连，见 proxy.go。New 校验并去除首尾空白；
+	// 之后的修改通过 Service.useProxyClient 进行，Service.config.Proxy 只是初始值。
+	Proxy string
 }
 
 var enterpriseLabel = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)

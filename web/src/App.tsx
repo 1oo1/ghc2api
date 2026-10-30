@@ -133,9 +133,9 @@ function Console({
     }
   }, [client, onExpire]);
 
-  /** 执行一次变更操作：期间禁用按钮，完成后刷新账号列表。 */
-  const run = useCallback(
-    async (task: () => Promise<string | void>) => {
+  /** 执行一次变更操作：期间禁用按钮，完成后刷新账号列表；失败时调用 onFailure（登录失效除外）。 */
+  const execute = useCallback(
+    async (task: () => Promise<string | void>, onFailure: (message: string) => void) => {
       setBusy(true);
       setError("");
       setNotice("");
@@ -147,13 +147,24 @@ function Console({
           onExpire(EXPIRED_MESSAGE);
           return;
         }
-        setError(errorMessage(e));
+        onFailure(errorMessage(e));
       } finally {
         setBusy(false);
       }
       await reload();
     },
     [reload, onExpire],
+  );
+  const run = useCallback((task: () => Promise<string | void>) => execute(task, setError), [execute]);
+  const submit = useCallback(
+    async (task: () => Promise<string | void>) => {
+      let failure: string | null = null;
+      await execute(task, (message) => {
+        failure = message;
+      });
+      return failure;
+    },
+    [execute],
   );
 
   const fail = useCallback((message: string) => setError(message), []);
@@ -165,12 +176,13 @@ function Console({
     return () => window.clearInterval(timer);
   }, [reload]);
 
-  const startLogin = () =>
+  /** proxy 为空串表示不使用代理。 */
+  const startLogin = (proxy: string) =>
     void run(async () => {
-      setLogin(await client.startLogin());
+      setLogin(await client.startLogin(proxy));
     });
 
-  const actions: Actions = { client, busy, run, fail };
+  const actions: Actions = { client, busy, run, submit, fail };
   const title = pages.find((p) => p.id === page)?.label ?? "";
 
   return (

@@ -10,6 +10,11 @@ export type Actions = {
    * 无论成功与否都会刷新账号列表。
    */
   run: (task: () => Promise<string | void>) => Promise<void>;
+  /**
+   * 与 run 相同，但失败时不显示全局错误条，而是返回错误文案（成功返回 null），供弹窗在内部显示。
+   * 登录失效时同样回到登录页，并返回 null。
+   */
+  submit: (task: () => Promise<string | void>) => Promise<string | null>;
   /** 直接显示错误（用于后台流程，如设备登录失败）。 */
   fail: (message: string) => void;
 };

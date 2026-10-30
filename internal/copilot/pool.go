@@ -47,7 +47,8 @@ type PoolAccount struct {
 	Host     string
 	User     string // GitHub 用户名，必填（为空返回错误）
 	Disabled bool
-	Priority int // 优先级，取值 MinPriority 到 MaxPriority；数值越大越优先被选择
+	Priority int    // 优先级，取值 MinPriority 到 MaxPriority；数值越大越优先被选择
+	Proxy    string // SOCKS5 代理 URL，空表示直连，见 proxy.go
 }
 
 // poolAccount 是池内一个账号的运行时状态。id、service、routes、cooldown 与 affinity 创建后不再变化；disabled、priority 与 swrrCurrent 由 Pool.mu 保护。
@@ -104,7 +105,7 @@ type Pool struct {
 	apiKey     string // 所有账号共用的服务访问密钥
 	logger     *slog.Logger
 	config     PoolConfig     // 服务级配置，新增账号与设备登录时使用
-	client     *http.Client   // 新增账号与设备登录访问 GitHub 的客户端
+	client     *http.Client   // 新增账号与设备登录访问 GitHub 的直连客户端；带代理时改用 clientFor 构造的客户端
 	idle       serviceRoutes  // 不访问上游的路由（健康检查、重定向、404/405），不依赖任何账号
 	affinity   *affinityTable // 会话绑定表；关闭时为 nil
 	risk       *riskTable     // 风控记录表（见 riskblock.go），随会话亲和开启；关闭时为 nil
@@ -184,6 +185,7 @@ func NewManagedPool(config PoolConfig, accounts []PoolAccount) (*Pool, error) {
 			Token: account.Token, Host: account.Host, User: user, APIKey: p.apiKey,
 			CacheDir: config.CacheDir, ModelsCacheTTL: config.ModelsCacheTTL,
 			QuotaRefreshInterval: config.QuotaRefreshInterval, Client: config.Client, Logger: p.logger,
+			Proxy: account.Proxy,
 		}, account.Disabled, account.Priority)
 		if err != nil {
 			return nil, err

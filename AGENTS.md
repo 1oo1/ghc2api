@@ -24,4 +24,5 @@
 | `docs/web-console.md` | 修改控制台前端或其构建 | `web/` |
 | `docs/upstream.md` | 修改 session 交换、模型列表、请求身份头 | `internal/copilot/session.go`、`models.go`、`cache.go` |
 | `docs/development.md` | 运行测试、构建，查看来源与许可 | `Makefile` |
+| `docs/proxy.md` | 修改账号 SOCKS5 代理（解析、出站客户端、管理接口与控制台中的代理） | `internal/copilot/proxy.go` |
 | `docs/magpie-copilot-sync.md` | 与 magpie 上游同步，同时核对 CLIProxyAPI 会话亲和键、VS Code 额度 | `internal/copilot/affinity_key.go`（cpa 部分）、`quota.go`、`quota_header.go`（VS Code 部分） |

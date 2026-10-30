@@ -27,17 +27,36 @@ type deviceLogin struct {
 }
 
 // handleStartLogin 发起 GitHub 设备登录：返回 state、验证页地址与验证码，之后由后台轮询直到授权完成。
-// 设备登录使用顶层 host（未配置时为 github.com）。
+// 设备登录使用顶层 host（未配置时为 github.com）。请求体可选：空体或 {"proxy": "socks5://..."}，
+// 非空代理先校验格式（400）；申请 device code、后台轮询、查询 /user 都走该代理，成功保存的凭证包含 proxy。
 func (p *Pool) handleStartLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Proxy string `json:"proxy"`
+	}
+	if !decodeOptionalManagementJSON(w, r, &req) {
+		return
+	}
+	proxy, err := normalizeProxy(req.Proxy)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	client, err := p.clientFor(proxy)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	device, page, err := startDeviceFlow(ctx, p.client, p.config.Host)
+	device, page, err := startDeviceFlow(ctx, client, p.config.Host)
 	cancel()
 	if err != nil {
+		closeProxyClient(client, proxy)
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	state, err := newLoginState()
 	if err != nil {
+		closeProxyClient(client, proxy)
 		writeError(w, http.StatusInternalServerError, "无法生成登录状态")
 		return
 	}
@@ -46,7 +65,7 @@ func (p *Pool) handleStartLogin(w http.ResponseWriter, r *http.Request) {
 	p.pruneLoginsLocked(time.Now())
 	p.logins[state] = login
 	p.loginMu.Unlock()
-	go p.completeDeviceLogin(login, device)
+	go p.completeDeviceLogin(login, device, client, proxy)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"state": state, "url": page, "user_code": device.UserCode,
 		"interval": max(device.Interval, 1), "expires_in": device.ExpiresIn,
@@ -78,8 +97,9 @@ func (p *Pool) handleLoginStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // completeDeviceLogin 在后台完成设备登录，并把结果写入登录状态。
-func (p *Pool) completeDeviceLogin(login *deviceLogin, device deviceCode) {
-	account, err := p.finishDeviceLogin(device)
+func (p *Pool) completeDeviceLogin(login *deviceLogin, device deviceCode, client *http.Client, proxy string) {
+	account, err := p.finishDeviceLogin(device, client, proxy)
+	closeProxyClient(client, proxy)
 	p.loginMu.Lock()
 	defer p.loginMu.Unlock()
 	login.doneAt = time.Now()
@@ -92,19 +112,27 @@ func (p *Pool) completeDeviceLogin(login *deviceLogin, device deviceCode) {
 	login.id = account.id
 }
 
-// finishDeviceLogin 等待用户授权，校验账号并按导入账号的规则保存、加入池。返回的错误信息不含 token。
-func (p *Pool) finishDeviceLogin(device deviceCode) (*poolAccount, error) {
-	token, err := pollDeviceToken(context.Background(), p.client, p.config.Host, device)
+// closeProxyClient 关闭经代理的临时客户端的空闲连接；proxy 为空时 client 是池共用的直连客户端，不关闭。
+func closeProxyClient(client *http.Client, proxy string) {
+	if proxy != "" {
+		client.CloseIdleConnections()
+	}
+}
+
+// finishDeviceLogin 等待用户授权，校验账号并按导入账号的规则保存、加入池。client 与 proxy 同申请 device code 时一致。
+// 返回的错误信息不含 token。
+func (p *Pool) finishDeviceLogin(device deviceCode, client *http.Client, proxy string) (*poolAccount, error) {
+	token, err := pollDeviceToken(context.Background(), client, p.config.Host, device)
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	user, err := verifyGitHubAccount(ctx, p.client, p.config.Host, token)
+	user, err := verifyGitHubAccount(ctx, client, p.config.Host, token)
 	if err != nil {
 		return nil, err
 	}
-	return p.addVerifiedAccount(token, p.config.Host, user)
+	return p.addVerifiedAccount(token, p.config.Host, user, proxy)
 }
 
 // pruneLoginsLocked 删除已结束超过 deviceLoginTTL 的登录状态。调用方须持有 p.loginMu。

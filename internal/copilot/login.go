@@ -171,6 +171,22 @@ func pollDeviceToken(ctx context.Context, client *http.Client, host string, devi
 // verifyGitHubAccount 用 token 查询 GitHub 登录名，并确认 Copilot 订阅信息可以读取；返回登录名。
 // 错误信息不包含 token。
 func verifyGitHubAccount(ctx context.Context, client *http.Client, host, token string) (string, error) {
+	login, err := fetchGitHubLogin(ctx, client, host, token)
+	if err != nil {
+		return "", err
+	}
+	var subscription map[string]json.RawMessage
+	if err := oauthJSON(ctx, client, http.MethodGet, githubBase(host)+"/copilot_internal/user", token, nil, &subscription); err != nil {
+		return "", fmt.Errorf("Copilot 订阅检查失败: %w", err)
+	}
+	if subscription == nil {
+		return "", errors.New("GitHub 未返回 Copilot 订阅信息")
+	}
+	return login, nil
+}
+
+// fetchGitHubLogin 用 token 请求 GitHub /user，返回登录名；不检查 Copilot 订阅（用于连通性验证）。
+func fetchGitHubLogin(ctx context.Context, client *http.Client, host, token string) (string, error) {
 	var user struct {
 		Login string `json:"login"`
 	}
@@ -179,13 +195,6 @@ func verifyGitHubAccount(ctx context.Context, client *http.Client, host, token s
 	}
 	if user.Login == "" {
 		return "", errors.New("GitHub 未返回账号名称")
-	}
-	var subscription map[string]json.RawMessage
-	if err := oauthJSON(ctx, client, http.MethodGet, githubBase(host)+"/copilot_internal/user", token, nil, &subscription); err != nil {
-		return "", fmt.Errorf("Copilot 订阅检查失败: %w", err)
-	}
-	if subscription == nil {
-		return "", errors.New("GitHub 未返回 Copilot 订阅信息")
 	}
 	return user.Login, nil
 }

@@ -19,11 +19,11 @@
 | `POST /v0/management/session` | — | `{"token":"v1.…","expires_at":"RFC3339"}`，签发新的控制台令牌（用管理密钥即登录，用令牌即续期） |
 | `GET /v0/management/version` | — | `{"version":"v0.0.1"}`，程序版本号（`copilot.Version`），控制台侧边栏显示 |
 | `GET /v0/management/accounts` | — | `[]AccountView`，顺带刷新过期额度（见 `quota-stats.md`） |
-| `POST /v0/management/accounts` | `{"credential":{"oauth_token":"...","host":"","user":""}}` | `200 AccountView` |
-| `PATCH /v0/management/accounts` | `{"id":"alice","disabled":true,"priority":50}`；或 `{"id":"alice","clear_cooldown":true}` | `200 AccountView` |
+| `POST /v0/management/accounts` | `{"credential":{"oauth_token":"...","host":"","user":"","proxy":""}}`（`proxy` 可选） | `200 AccountView` |
+| `PATCH /v0/management/accounts` | `{"id":"alice","disabled":true,"priority":50}`；或 `{"id":"alice","clear_cooldown":true}`；或 `{"id":"alice","proxy":"socks5://…","proxy_keep_password":true}` | `200 AccountView` |
 | `DELETE /v0/management/accounts?id=alice` | — | `200 {"ok":true}` |
 | `POST /v0/management/quota/refresh` | `{"id":"alice"}` | `200 AccountView`（强制刷新） |
-| `POST /v0/management/login` | — | `200 {"state","url","user_code","interval","expires_in"}` |
+| `POST /v0/management/login` | 可选：空体或 `{"proxy":"socks5://…"}` | `200 {"state","url","user_code","interval","expires_in"}` |
 | `GET /v0/management/login/status?state=...` | — | `{"status":"pending"\|"success"\|"error","id"?,"error"?}`；未知 state 404 |
 
 ```go
@@ -36,10 +36,18 @@ type AccountView struct {
     Stats          struct{ Requests, Errors uint64; LastUsedAt *time.Time }
     Quota          *Quota
     QuotaError     string
+    Proxy          *ProxyView    // 无代理时省略
+}
+
+type ProxyView struct {
+    Scheme, Host string          // Host 为 IPv6 时不带方括号
+    Port         int
+    Username     string          // 为空时省略
+    HasPassword  bool            // 始终输出
 }
 ```
 
-JSON 字段名为 `id`、`user`、`host`、`disabled`、`priority`、`cooldown_until`、`cooldown_reason`、`stats{requests,errors,last_used_at}`、`quota`、`quota_error`。`cooldown_until` 与 `cooldown_reason` 仅在冷却中输出。不含 OAuth token。
+JSON 字段名为 `id`、`user`、`host`、`disabled`、`priority`、`cooldown_until`、`cooldown_reason`、`stats{requests,errors,last_used_at}`、`quota`、`quota_error`、`proxy{scheme,host,port,username,has_password}`。`cooldown_until` 与 `cooldown_reason` 仅在冷却中输出。不含 OAuth token 与代理密码。账号代理的规则（校验、`proxy_keep_password`、PATCH 时的连通性验证）见 `proxy.md`；其中 `proxy_keep_password` 仅在新 URL 的主机（忽略大小写）、端口、用户名都与当前代理相同时才沿用当前密码，避免把密码发给另一台代理。
 
 ## 控制台令牌
 
@@ -55,16 +63,16 @@ JSON 字段名为 `id`、`user`、`host`、`disabled`、`priority`、`cooldown_u
 
 - 列表按账号池顺序（启动为凭证文件名顺序，新增追加末尾）。
 - 新增、删除、禁用、改优先级、解除冷却立即生效，无需重启；删除不影响进行中的请求。
-- PATCH 的 `disabled`、`priority`、`clear_cooldown` 可单独或组合提供，未提供的字段保持不变。顺序：`disabled` 或 `priority` 有变化时先重写凭证文件；写入失败返回 500，冷却、`disabled`、`priority` 全部不变。写入成功后同步内存中的 `disabled` 与 `priority`，再处理 `clear_cooldown`。
+- PATCH 的 `disabled`、`priority`、`proxy`、`clear_cooldown` 可单独或组合提供，未提供的字段保持不变。顺序：`proxy` 有变化且非空时先通过新代理验证（见 `proxy.md`，验证期间持有账号管理锁，最长约 30 秒）；`disabled`、`priority` 或 `proxy` 有变化时重写一次凭证文件；写入失败返回 500，冷却、`disabled`、`priority`、代理全部不变。写入成功后同步内存中的 `disabled`、`priority` 与代理（替换 HTTP 客户端），再处理 `clear_cooldown`；修改代理不自动解除冷却。
 - `clear_cooldown` 为 `true` 时立即解除冷却：先删除账号缓存目录中的 `cooldown.json`，删除成功后清空截止时间与原因、连续错误计数清零，解除后账号立即参与选择。`clear_cooldown` 为 `false` 视为未提供。禁用、启用与改优先级本身不影响冷却状态。
 - 解除失败（删除 `cooldown.json` 出错）时返回 500，错误信息以“凭证已更新，账号仍冷却”开头（若凭证未变化则不含该前缀）。此时 `disabled` 与 `priority` 已生效，冷却不变，修复文件问题后可再次解除。
 - 解除冷却与错误计数规则见 `pool.md`「限流、错误计数与冷却」。解除后，之前进入冷却时尚未完成的异步副作用不会把冷却记录写回磁盘。
-- 400：请求体非法 JSON；PATCH 缺 `id`，或 `disabled`、`priority`、`clear_cooldown`（为 `true`）都未提供，或 `priority` 超出 [-1,100] 或非整数（均不写文件、不改状态）；DELETE/refresh 缺 `id`。404：`id` 不存在。凭证写入失败 500（此时冷却、`disabled`、`priority` 全部不变）。解除冷却失败 500（见上文）。
+- 400：请求体非法 JSON；PATCH 缺 `id`，或 `disabled`、`priority`、`proxy`、`clear_cooldown`（为 `true`）都未提供，或 `priority` 超出 [-1,100] 或非整数，或 `proxy` 格式非法、新代理返回的登录名与账号不一致（均不写文件、不改状态）；PATCH 设置代理时验证失败 502；DELETE/refresh 缺 `id`。404：`id` 不存在。凭证写入失败 500（此时冷却、`disabled`、`priority` 全部不变）。解除冷却失败 500（见上文）。
 - 凭证写入、同名冲突与登录名规则见 `credentials.md`。
 
 ## 导入账号
 
-校验 token 与 host（顶层 Host 非空时覆盖），用 token 请求 GitHub `/user` 得登录名，再请求 `/copilot_internal/user` 确认订阅（复用 `finishLogin`）。
+校验 token 与 host（顶层 Host 非空时覆盖），用 token 请求 GitHub `/user` 得登录名，再请求 `/copilot_internal/user` 确认订阅（复用 `finishLogin`）。`credential.proxy` 非空时先校验格式（400），校验请求经该代理发出（代理不可达同样 400），成功后凭证文件含 `proxy`，新账号使用该代理。
 
 - 400：`user` 非空且与登录名不一致（忽略大小写）、登录名不合规、上游校验失败（消息不含 token）。
 - 409：登录名或 Host+Token 已在池中，或凭证目录已有同名文件。
@@ -72,7 +80,7 @@ JSON 字段名为 `id`、`user`、`host`、`disabled`、`priority`、`cooldown_u
 
 ## 设备登录
 
-`POST login` 发起 GitHub Device Flow（用顶层 Host），返回 32 字符十六进制 `state`、验证页 URL、`user_code`；后台 goroutine 按 `login.go` 的轮询规则（slow_down、过期、连续 5 次失败）等待授权，成功后按导入规则保存并加入池。
+`POST login` 发起 GitHub Device Flow（用顶层 Host；请求体可选，`{"proxy":"..."}` 时申请 device code、后台轮询、查询 `/user` 都走该代理，格式非法 400，代理不可达 502，成功保存的凭证含 `proxy`），返回 32 字符十六进制 `state`、验证页 URL、`user_code`；后台 goroutine 按 `login.go` 的轮询规则（slow_down、过期、连续 5 次失败）等待授权，成功后按导入规则保存并加入池。
 
 - 成功 `status=success` 带新账号 `id`；失败 `status=error` 带不含 token 的 `error`（同名冲突亦如此）。
 - 入池后与导入相同，立即异步刷新一次额度；`status=success` 返回时该刷新可能尚未完成。

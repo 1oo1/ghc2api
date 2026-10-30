@@ -479,6 +479,63 @@ tr:last-child td {
   gap: 8px;
 }
 
+/* 账号卡片的代理行：文字按钮，点击打开代理弹窗 */
+.proxy-line {
+  margin: 0;
+}
+button.link {
+  padding: 0;
+  border: 0;
+  background: none;
+  font-size: 12px;
+  color: #85947f;
+}
+button.link:hover {
+  background: none;
+  color: #1d6551;
+  text-decoration: underline;
+}
+
+/* 代理弹窗 */
+.proxy-dialog {
+  border: 1px solid #dfe5dc;
+  border-radius: 12px;
+  padding: 22px;
+  width: min(420px, calc(100vw - 32px));
+  background: #fcfdf9;
+  color: inherit;
+  box-shadow: 0 12px 32px #17432f26;
+}
+.proxy-dialog::backdrop {
+  background: #22312c4d;
+}
+.proxy-dialog h2 {
+  font-size: 17px;
+  margin-bottom: 8px;
+}
+.proxy-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.proxy-fields label {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+  color: #5a6c57;
+}
+.proxy-clear {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 12px;
+  font-size: 12px;
+}
+.proxy-delete {
+  margin-right: auto;
+}
+
 /* 顶部提示条 */
 .banner {
   background: #e1efdf;

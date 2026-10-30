@@ -6,6 +6,9 @@
 - 页面：
   - 「概览」：可用账号数（未禁用且未冷却）、累计请求、错误数、各账号请求统计表（状态列与账号卡片相同）。
   - 「账号与额度」：账号卡片显示状态、Credits/Premium/Additional Budget 进度条与重置时间、请求统计；可刷新额度、启用/禁用、改优先级（数字框+保存）、删除；禁用与删除会先弹出确认对话框（`web/src/components/ConfirmDialog.tsx`，「取消」/「确认」，默认聚焦「取消」，Esc 取消），确认后才执行，启用无需确认；工具栏可导入凭证 JSON、GitHub 设备登录。
+  - 账号卡片显示「代理：无代理」或「代理：host:port」（IPv6 加方括号），点击打开代理弹窗（`web/src/components/ProxyDialog.tsx`）：预填主机、端口、用户名，密码框留空（有密码时占位「留空保持原密码」，主机、端口、用户名任一修改后改为「地址或用户名已修改，需重新填写密码」，见 `passwordPlaceholder`；`proxy_keep_password` 只在这三项都未改变时提交，服务端同样只在此时沿用密码）；当前有代理时主机不能清空（校验失败，提示使用「删除」按钮）；「保存」在表单无变化（`proxyFormChanged`）或校验失败时置灰，保存中显示「处理中…」，失败时错误显示在弹窗内且弹窗保持打开（服务端会先通过新代理验证，最长约 30 秒）；有代理时提供「清除密码」勾选与「删除」（经 `ConfirmDialog` 二次确认后提交 `proxy: ""`）。
+  - 工具栏「导入凭证 JSON」「GitHub 登录」点击后先弹出同一个代理弹窗（可留空跳过；未填主机却填了用户名或密码时校验失败）；导入时代理写入 `credential.proxy`（覆盖 JSON 中的 `proxy`），留空则使用凭证 JSON 中的 proxy（若有），否则直连，登录时作为 `POST login` 的 `proxy`（留空则直连），弹窗提示文案按此区分。
+  - 代理 URL 由前端拼装，表单逻辑为纯函数（`web/src/proxy.ts`：`buildProxyUrl`、`validateProxyForm`、`proxyFormChanged`、`proxyLabel`、`buildProxyPatch`），规则见 `proxy.md`「控制台」。弹窗内的请求经 `Actions.submit` 执行：失败返回错误文案（不进全局错误条），登录失效仍回到登录页。
 - 账号状态徽标（`web/src/account.ts`）：「启用中」（绿色）、「禁用中」（灰色）、「冷却中」（黄色）。徽标优先级为禁用 > 冷却 > 启用。冷却中的徽标附带触发原因，如「冷却中 · 403」，网络错误显示为「冷却中 · 网络错误」，没有原因时只显示「冷却中」。
 - 冷却与禁用相互独立：账号既禁用又冷却中时，徽标仍为「禁用中」，但卡片同样显示冷却原因（一行提示）与冷却截止时间，并显示「解除冷却」按钮。是否显示冷却信息与「解除冷却」按钮由 `isCooling(account, now)` 判断，即冷却截止时间晚于当前时间，与是否禁用无关。
 - 冷却中（无论是否禁用）的账号卡片显示「解除冷却」按钮，调用 `PATCH /v0/management/accounts` 的 `clear_cooldown`（`ManagementClient.clearCooldown(id)`，`web/src/api.ts`），成功后提示并刷新列表。

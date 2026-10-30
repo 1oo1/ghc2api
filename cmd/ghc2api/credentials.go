@@ -100,6 +100,7 @@ func loadAccount(path, fileName, topHost string) (accountConfig, error) {
 	}
 	account := accountConfig{
 		Token: credential.Token, Host: host, User: user, Disabled: credential.Disabled, Priority: credential.Priority,
+		Proxy:          credential.Proxy,
 		credentialFile: path,
 	}
 	if runtime.GOOS != "windows" {

@@ -13,8 +13,9 @@
 | `user` | 可省略；非空时须与文件名用户名一致（忽略大小写） |
 | `disabled` | `true` 表示启动后不参与选择，仍在管理接口中可见 |
 | `priority` | -1 到 100 的整数，省略为 0，越大越优先；超范围报 `priority 必须在 -1 到 100 之间`，非整数解码时即拒绝 |
+| `proxy` | 可选，该账号的 SOCKS5 代理 URL（如 `socks5://user:pass@127.0.0.1:1080`），省略表示直连；`LoadCredential`、`SaveCredential` 校验，非法时报 `代理地址无效: …`（不含密码），启动失败的错误同时指出文件名。格式与行为见 `proxy.md` |
 
-`disabled` 与 `priority` 通常由管理接口写入，`omitempty`（false/0 时省略）。`MinPriority`/`MaxPriority` 定义于 `credentials.go`；`LoadCredential`、`SaveCredential` 都校验范围。
+`disabled`、`priority` 与 `proxy` 通常由管理接口写入，`omitempty`（false/0/空时省略）。`proxy` 含密码，因此凭证文件权限要求同 token。`MinPriority`/`MaxPriority` 定义于 `credentials.go`；`LoadCredential`、`SaveCredential` 都校验范围。
 
 ## 目录扫描规则
 
@@ -38,5 +39,5 @@
 
 - 保存路径 `<CredentialsDir>/<GitHub 登录名>.json`（保留 GitHub 返回的大小写，`0600`，复用 `SaveCredential` 原子写入）。
 - 写入前扫描目录，忽略大小写确认无同名文件（含运行期间放入、尚未加载的）；有则 409，原文件不变。
-- PATCH：一次重写文件的 `disabled` 与 `priority`（未提供的取当前值），再更新内存；写入失败则内存不变、返回 500。
+- PATCH：一次重写文件的 `disabled`、`priority` 与 `proxy`（未提供的取当前值），再更新内存；写入失败则内存不变、返回 500。
 - 删除：先删凭证文件，再从池中移除（文件不存在也视为成功），并清理该账号缓存目录。进行中的请求不得重建已删除账号的缓存目录（`writeCache` 的已删除标记保证）。

@@ -26,8 +26,9 @@ const maxMetadataBody = 4 << 20
 // Service 独立保存一个账号的 session 与模型缓存。
 type Service struct {
 	config Config
-	client *http.Client
-	logger *slog.Logger
+	// upstream 保存出站 HTTP 客户端及其代理，可原子替换（见 useProxyClient）；读取一律经 httpClient、currentProxy。
+	upstream atomic.Pointer[upstreamClient]
+	logger   *slog.Logger
 
 	cacheDir       string
 	modelsCacheTTL time.Duration
@@ -73,6 +74,13 @@ func New(config Config) (*Service, error) {
 		return nil, err
 	}
 	config.Host = host
+	if config.Proxy, err = normalizeProxy(config.Proxy); err != nil {
+		return nil, err
+	}
+	client, err := proxyClient(config.Client, config.Proxy)
+	if err != nil {
+		return nil, err
+	}
 	if config.Logger == nil {
 		config.Logger = slog.Default()
 	}
@@ -101,14 +109,42 @@ func New(config Config) (*Service, error) {
 		quotaRefreshInterval = DefaultQuotaRefreshInterval
 	}
 	service := &Service{
-		config: config, client: safeClient(config.Client), refused: make(map[string]refusedModel),
+		config: config, refused: make(map[string]refusedModel),
 		logger: config.Logger, secrets: make(map[string]struct{}),
 		cacheDir: cacheDir, modelsCacheTTL: modelsCacheTTL, quotaRefreshInterval: quotaRefreshInterval,
 		sessionMu: make(contextMutex, 1), modelsMu: make(contextMutex, 1),
 	}
+	service.upstream.Store(&upstreamClient{client: client, proxy: config.Proxy})
 	service.addSecret(config.Token)
 	service.addSecret(config.APIKey)
+	for _, secret := range proxySecrets(config.Proxy) {
+		service.addSecret(secret)
+	}
 	return service, nil
+}
+
+// upstreamClient 是账号当前的出站 HTTP 客户端及其代理，整体替换以保持二者一致。
+type upstreamClient struct {
+	client *http.Client
+	proxy  string // 已规范化的代理 URL，空表示直连
+}
+
+// httpClient 返回账号当前的出站 HTTP 客户端。
+func (s *Service) httpClient() *http.Client { return s.upstream.Load().client }
+
+// currentProxy 返回账号当前的代理 URL，空表示直连。
+func (s *Service) currentProxy() string { return s.upstream.Load().proxy }
+
+// useProxyClient 把出站客户端替换为 client（须由 proxyClient(s.config.Client, proxy) 构造）。
+// 新发起的请求立即使用新客户端，进行中的请求继续在旧连接上完成；旧客户端的空闲连接被关闭。session 缓存不清除。
+func (s *Service) useProxyClient(client *http.Client, proxy string) {
+	for _, secret := range proxySecrets(proxy) {
+		s.addSecret(secret)
+	}
+	old := s.upstream.Swap(&upstreamClient{client: client, proxy: proxy})
+	if old != nil {
+		old.client.CloseIdleConnections()
+	}
 }
 
 // Handler 返回原协议 HTTP 接口，不在三种生成协议之间转换。鉴权在请求日志之外：未通过鉴权的请求不输出请求日志。

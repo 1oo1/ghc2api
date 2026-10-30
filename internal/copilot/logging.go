@@ -223,7 +223,7 @@ func (s *Service) doAPI(ctx context.Context, req *http.Request) (*http.Response,
 	}
 
 	started := time.Now()
-	res, err := s.client.Do(req)
+	res, err := s.httpClient().Do(req)
 	if err != nil {
 		safeErr := s.redactAPIError(err, rawURL, safeURL)
 		s.log(ctx, slog.LevelError, "上游 API 请求失败", "method", req.Method,

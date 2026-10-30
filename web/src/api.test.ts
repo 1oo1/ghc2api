@@ -1,6 +1,11 @@
 // 管理接口客户端的补充测试。覆盖的方法：
 //   - ManagementClient.clearCooldown(id: string)：发送 PATCH /v0/management/accounts，请求体为 {"id": id, "clear_cooldown": true}，
 //     返回服务端的账号视图。
+//   - ManagementClient.setProxy(id: string, patch: ProxyPatch)：发送 PATCH /v0/management/accounts，请求体为 { id, ...patch }，
+//     ProxyPatch = { proxy: string; proxy_keep_password?: boolean }（见 docs/proxy.md）；proxy 为空串表示删除代理。
+//   - ManagementClient.importAccount(credential: unknown, proxy?: string)：proxy 非空时写入请求体的 credential.proxy（覆盖凭证中原有的 proxy），
+//     未提供或为空串时凭证原样发送。
+//   - ManagementClient.startLogin(proxy?: string)：proxy 非空时请求体为 { proxy }，否则不带请求体。
 //   - ManagementClient.createSession()：发送 POST /v0/management/session，携带管理凭证或控制台令牌，
 //     返回 { token, expires_at }（ConsoleSession）。
 import { afterEach, expect, test, vi } from "vitest";
@@ -98,4 +103,120 @@ test("createSession 的错误保留服务端消息与状态码", async () => {
   expect(error).toBeInstanceOf(ApiError);
   expect((error as ApiError).status).toBe(401);
   expect((error as ApiError).message).toBe("管理密钥无效或缺失");
+});
+
+test("setProxy 发送 PATCH，请求体为 id 加 proxy，不带 proxy_keep_password", async () => {
+  const fetchMock = stubFetch(200, { id: "alice" });
+
+  await createManagementClient("mgmt-key").setProxy("alice", { proxy: "socks5://127.0.0.1:1080" });
+
+  const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+  expect(url).toBe("/v0/management/accounts");
+  expect(init.method).toBe("PATCH");
+  expect((init.headers as Record<string, string>).Authorization).toBe("Bearer mgmt-key");
+  expect(JSON.parse(init.body as string)).toEqual({ id: "alice", proxy: "socks5://127.0.0.1:1080" });
+});
+
+test("setProxy 带 proxy_keep_password 时原样放入请求体", async () => {
+  const fetchMock = stubFetch(200, { id: "alice" });
+
+  await createManagementClient("mgmt-key").setProxy("alice", {
+    proxy: "socks5://user@127.0.0.1:1080",
+    proxy_keep_password: true,
+  });
+
+  const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+  expect(JSON.parse(init.body as string)).toEqual({
+    id: "alice",
+    proxy: "socks5://user@127.0.0.1:1080",
+    proxy_keep_password: true,
+  });
+});
+
+test("setProxy 用空串删除代理，请求体保留 proxy: \"\"", async () => {
+  const fetchMock = stubFetch(200, { id: "alice" });
+
+  await createManagementClient("mgmt-key").setProxy("alice", { proxy: "" });
+
+  const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+  expect(JSON.parse(init.body as string)).toEqual({ id: "alice", proxy: "" });
+});
+
+test("setProxy 返回服务端的账号视图", async () => {
+  const view = {
+    id: "alice",
+    user: "alice",
+    host: "",
+    disabled: false,
+    priority: 0,
+    stats: { requests: 0, errors: 0 },
+    proxy: { scheme: "socks5", host: "127.0.0.1", port: 1080, has_password: false },
+  };
+  stubFetch(200, view);
+  await expect(
+    createManagementClient("mgmt-key").setProxy("alice", { proxy: "socks5://127.0.0.1:1080" }),
+  ).resolves.toEqual(view);
+});
+
+test("setProxy 的错误保留服务端消息与状态码（验证失败为 502）", async () => {
+  stubFetch(502, { error: { message: "代理 127.0.0.1:1080 连接失败: connection refused" } });
+  const error = await createManagementClient("mgmt-key")
+    .setProxy("alice", { proxy: "socks5://127.0.0.1:1080" })
+    .catch((e: unknown) => e);
+  expect(error).toBeInstanceOf(ApiError);
+  expect((error as ApiError).status).toBe(502);
+  expect((error as ApiError).message).toBe("代理 127.0.0.1:1080 连接失败: connection refused");
+});
+
+test("importAccount 带代理时写入 credential.proxy，覆盖凭证中原有的 proxy", async () => {
+  const fetchMock = stubFetch(200, { id: "alice" });
+
+  await createManagementClient("mgmt-key").importAccount(
+    { oauth_token: "gho_x", user: "alice", proxy: "socks5://old.example.com:1" },
+    "socks5://new.example.com:2",
+  );
+
+  const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+  expect(url).toBe("/v0/management/accounts");
+  expect(init.method).toBe("POST");
+  expect(JSON.parse(init.body as string)).toEqual({
+    credential: { oauth_token: "gho_x", user: "alice", proxy: "socks5://new.example.com:2" },
+  });
+});
+
+test("importAccount 没有提供代理（或为空串）时凭证原样发送", async () => {
+  const fetchMock = stubFetch(200, { id: "alice" });
+  const credential = { oauth_token: "gho_x", proxy: "socks5://pasted.example.com:1" };
+
+  await createManagementClient("mgmt-key").importAccount(credential);
+  await createManagementClient("mgmt-key").importAccount(credential, "");
+
+  for (const call of fetchMock.mock.calls) {
+    const [, init] = call as unknown as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({ credential });
+  }
+});
+
+test("startLogin 带代理时请求体为 { proxy }", async () => {
+  const fetchMock = stubFetch(200, { state: "s", url: "u", user_code: "c", interval: 5, expires_in: 900 });
+
+  await createManagementClient("mgmt-key").startLogin("socks5://u:p@127.0.0.1:1080");
+
+  const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+  expect(url).toBe("/v0/management/login");
+  expect(init.method).toBe("POST");
+  expect(JSON.parse(init.body as string)).toEqual({ proxy: "socks5://u:p@127.0.0.1:1080" });
+});
+
+test("startLogin 没有代理时不带请求体", async () => {
+  const fetchMock = stubFetch(200, { state: "s", url: "u", user_code: "c", interval: 5, expires_in: 900 });
+
+  await createManagementClient("mgmt-key").startLogin();
+  await createManagementClient("mgmt-key").startLogin("");
+
+  for (const call of fetchMock.mock.calls) {
+    const [, init] = call as unknown as [string, RequestInit];
+    expect(init.method).toBe("POST");
+    expect(init.body).toBeUndefined();
+  }
 });

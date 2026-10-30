@@ -26,6 +26,8 @@ type Credential struct {
 	Disabled bool `json:"disabled,omitempty"`
 	// Priority 是账号的优先级，取值 MinPriority 到 MaxPriority；省略时为 0，由管理接口写入。
 	Priority int `json:"priority,omitempty"`
+	// Proxy 是账号的 SOCKS5 代理 URL（见 docs/proxy.md），省略表示直连。
+	Proxy string `json:"proxy,omitempty"`
 }
 
 // checkPriority 报告优先级是否在 MinPriority 到 MaxPriority 之间。
@@ -36,7 +38,7 @@ func checkPriority(priority int) error {
 	return nil
 }
 
-// validateCredential 校验优先级范围、token 与 host，并返回规范化后的凭证。
+// validateCredential 校验优先级范围、token、host 与代理地址，并返回规范化后的凭证。
 func validateCredential(c Credential) (Credential, error) {
 	if err := checkPriority(c.Priority); err != nil {
 		return Credential{}, err
@@ -49,7 +51,11 @@ func validateCredential(c Credential) (Credential, error) {
 	if err != nil {
 		return Credential{}, err
 	}
-	c.Token, c.Host = token, host
+	proxy, err := normalizeProxy(c.Proxy)
+	if err != nil {
+		return Credential{}, err
+	}
+	c.Token, c.Host, c.Proxy = token, host, proxy
 	return c, nil
 }
 
