@@ -39,7 +39,7 @@ flowchart TD
     C2 -- "等待中客户端取消" --> C3["直接返回<br/>不选账号、不推进轮询、不计数、不写响应"]
     C2 -- 获得门 --> D
     D --> E["choose(key, tried)"]
-    E --> F{"key 非空、开启亲和且已绑定，<br/>绑定账号存在、未禁用、未冷却、<br/>未耗尽、本请求未尝试？"}
+    E --> F{"key 非空、开启亲和且已绑定，<br/>绑定账号存在、未禁用、未冷却、<br/>未耗尽、本请求未尝试，<br/>且（有 Credits 或最优档也无 Credits）？"}
     F -- 是 --> G["使用绑定账号<br/>（不受上限限制，不推进轮询）"]
     F -- 否 --> F1{"key 非空且开启亲和？"}
     F1 -- 否 --> H["pickLocked(now, tried)<br/>先分档，再档内 SWRR（见下图）"]
@@ -81,6 +81,8 @@ flowchart TD
     E -- 是 --> X3["不计数，不延长、不重复触发"]
     E -- 否 --> C{"错误类别"}
     C -- "400 与其他 4xx" --> X2["既不加也不清零，不冷却"]
+    C -- "402（额外预算用尽）" --> D2["立即触发冷却<br/>截止时间 = 主额度重置时刻<br/>（不可用时为 now + account_cooldown）"]
+    D2 --> H
     C -- "401 / 403" --> C1{"/responses 的失效输出项错误？"}
     C1 -- 是 --> X5["忽略：不计数、不冷却、不写风控记录；401 改为 500 返回"]
     C1 -- 否 --> D["立即触发冷却"]
@@ -88,7 +90,7 @@ flowchart TD
     F --> G{"计数 ≥ 3？"}
     G -- 否 --> X4["等待下一次错误"]
     G -- 是 --> D
-    D --> H["同步完成：截止时间 = now + account_cooldown，计数清零，原因 = 状态码或 network<br/>同步输出 Warn 日志；触发冷却的响应立即返回"]
+    D --> H["同步完成：截止时间 = now + account_cooldown（402 见上），计数清零，原因 = 状态码或 network<br/>同步输出 Warn 日志；触发冷却的响应立即返回"]
     H --> I["异步完成（后台执行，不阻塞请求）：先写 cooldown.json（仅当仍为本次冷却）<br/>再清空 session、模型列表（内存与磁盘），最后删除亲和表中指向该账号的绑定"]
 ```
 
@@ -108,7 +110,8 @@ flowchart TD
 - 权重 `swrrWeight()` 为 `max(1, round(剩余比例 * 100))`，剩余比例即 `weigh` 得到的比例；无额度数据、比例为 0 或取整后不足 1 时权重为 1。
 - 每次选择时，组内每个账号的 `swrrCurrent` 加上自己的权重；选 `swrrCurrent` 最大者，并列时取凭证文件名（`User+".json"`，无用户名用 ID）字节序最小者；被选中者的 `swrrCurrent` 再减去组内总权重。
 - 只修改组内成员的 `swrrCurrent`，因此最优档之外的账号状态不变。
-- 命中会话绑定时直接使用绑定账号，不推进轮询，也不受每账号绑定上限限制（见 `session-affinity.md`）。绑定账号冷却中时视为不可用，改为无可用绑定的选择。
+- 命中会话绑定时直接使用绑定账号（受下条 Credits 让位约束），不推进轮询，也不受每账号绑定上限限制（见 `session-affinity.md`）。绑定账号冷却中时视为不可用，改为无可用绑定的选择。
+- Credits 让位：绑定账号无 Credits（主额度剩余不大于 0，含无额度数据），而当前最优档（排除禁用、冷却、耗尽、本请求已尝试后的最优档）有 Credits 时，绑定视为不可用，改为无可用绑定的选择，之后改绑到新账号；最优档也无 Credits（例如更高优先级的账号同样无 Credits）时继续使用绑定账号。绑定账号自身有 Credits 时，即使存在更高优先级的账号也继续使用。注意 `unlimited` 账号与尚无额度数据的账号都按无 Credits 计，池中有其他有 Credits 的账号时，绑在它们上的会话会让位。
 - 无可用绑定的会话（新会话或故障切换）且键非空、开启亲和时，先取最优档，再在最优档内排除有效绑定数已达 `SessionAffinityMaxPerAccount` 的账号，对剩余账号做 SWRR。最优档全满时忽略上限，对整个最优档做 SWRR，因此上限绝不会把新会话降到低优先级或无 Credits 档，也不会因此返回 503；冷却账号本来就不是候选，因此上限也不会把会话推向冷却账号。`SessionAffinityMaxPerAccount <= 0` 时不排除；键为空或关闭亲和时上限无效。细则见 `session-affinity.md` 的「绑定上限」。
 
 其他说明：
@@ -135,7 +138,7 @@ flowchart TD
 
 ## 故障切换
 
-- 会话已绑定账号时优先使用；该账号禁用、冷却、耗尽或本请求已尝试过时，改为无可用绑定的选择（先取最优档，在档内排除已达上限的账号，再 SWRR，见 `session-affinity.md`）。
+- 会话已绑定账号时优先使用；该账号禁用、冷却、耗尽、本请求已尝试过，或无 Credits 而最优档有 Credits 时，改为无可用绑定的选择（先取最优档，在档内排除已达上限的账号，再 SWRR，见 `session-affinity.md`）。
 - 取得 session 之后账号可能已因另一个请求的错误进入冷却：此时不绑定会话键，本次请求仍由该账号处理（它在冷却前已被选中，属于在途请求），之后的请求不会再选中它。
 - 仅模型列表与生成请求（chat completions、responses、`/v1/messages`）在 session 获取失败（网络错误、上游错误响应、无效 session）时切换：该次失败计入账号的连续错误（按状态码规则，见下文），同请求改用未尝试过的账号（冷却中与耗尽的账号不参与），每个账号每请求最多尝试一次，全部失败返回最后一个账号的错误。session 失败不再造成 1 分钟的短冷却。
 - 生成请求失败后不会在其他账号重发。
@@ -144,8 +147,8 @@ flowchart TD
 
 错误计数的判定规则（代码见 `cooldown.go`）：
 
-- 计入的错误：写给客户端的响应状态 401、403、429、≥500，以及网络错误与 session 获取失败。生成接口的网络错误（请求上游时的非上游错误）写给客户端为 502，但冷却原因记为 `network`，不是 `502`；上游真实返回的 502 仍按 `502` 计入。session 获取阶段的非上游错误按网络错误计入。
-- 错误状态（>= 400）的正文读取失败按上游状态码计数，不计为网络错误：上游 401/403 的正文读不完整时仍一次冷却（原因 `401`/`403`）；429 与 5xx 仍按连续错误计数（原因为该状态码）；400 与其他 4xx 既不计数也不清零。适用于生成接口（流式与非流式）、session 交换与模型列表的错误响应。生成接口的上游 400 正文读取失败时写给客户端 400（不是 502），同样不计数。
+- 计入的错误：写给客户端的响应状态 401、402、403、429、≥500，以及网络错误与 session 获取失败。生成接口的网络错误（请求上游时的非上游错误）写给客户端为 502，但冷却原因记为 `network`，不是 `502`；上游真实返回的 502 仍按 `502` 计入。session 获取阶段的非上游错误按网络错误计入。
+- 错误状态（>= 400）的正文读取失败按上游状态码计数，不计为网络错误：上游 401/402/403 的正文读不完整时仍一次冷却（原因 `401`/`402`/`403`）；429 与 5xx 仍按连续错误计数（原因为该状态码）；400 与其他 4xx 既不计数也不清零。适用于生成接口（流式与非流式）、session 交换与模型列表的错误响应。生成接口的上游 400 正文读取失败时写给客户端 400（不是 502），同样不计数。
 - 上游错误响应的转发：原样返回上游的状态码与正文，不转发 `Content-Length`（正文可能读取不完整，声明的长度会让客户端读取出错）。正文为空或读取失败时写出 JSON 错误体（格式与其他错误响应一致，说明上游返回该状态但正文读取失败）。正文读取中途失败时，原正文丢失，客户端收到的是保留上游状态码、格式完整的 JSON 错误体，而不是截断的正文。
 - 上游的非错误状态（3xx，例如模型列表接口返回重定向）：既不计数也不清零，也不计为网络错误。它仍以 502 写给客户端（这是既有的写出方式），但计数规则为忽略。
 - 流中途失败：上游已返回成功状态（< 400）之后读取上游流出错（非客户端取消）计为网络错误（原因 `network`），计数不清零。
@@ -154,15 +157,16 @@ flowchart TD
 - 成功（状态 < 300）清零连续错误计数。
 - 例外：上游 `/responses` 因输出项绑定在原连接上而拒绝回放（401 `does not belong to this connection`，或 400 `encrypted content … could not be verified`，见 `http-api.md`）是请求内容问题，不是账号凭证问题。`Service` 清理后重试一次；无法重试或重试后仍失败时，返回上游响应（401 改为 500，正文不变，避免服务前端因过多 401 封禁客户端 IP；400 不变），并在响应写入器上标记 `failureIgnored`（经 `generationWriter` 的 `Unwrap` 传到 `statusResponseWriter`），因此既不计入账号的 `errors`，也不计入连续错误（不加也不清零），401 也不冷却、不写风控记录（`recordRisk` 因未进入冷却而不触发）。重试成功得到的响应按其状态码照常处理。
 - 401 或 403 一次即冷却（账号已在冷却中则不计，见下；上一条的失效输出项错误除外）。其他计入的错误（429、5xx、网络错误、session 获取失败）连续第 3 次触发冷却。
+- 402（额外预算用尽，例如 `You've reached your additional usage limit for your plan`）一次即冷却，原因 `402`，截止时间为缓存额度中主额度的重置时刻（`untilResetDeadline`，解析规则同 `parseResetTime`）；没有额度数据、没有主额度、重置时间不可解析或不晚于当前时间时退回 `account_cooldown`。额外预算用尽不会自行恢复，冷却到重置时刻避免反复试探；在 GitHub 付款后用 `clear_cooldown` 手动解除；若缓存额度仍显示耗尽（主额度与 Additional Budget 都为 0，见「账号选择」），账号仍会被跳过，需再强制刷新额度（`POST /v0/management/quota/refresh`，或等待后台刷新）。截止时间不封顶（重置时刻按月，实际不会过远）。402 不写风控记录。生成响应与 session 交换返回的 402 都适用。
 - 触发冷却后计数清零；账号已在冷却中时再出错不延长冷却、不重复触发、不计数。
 - 同一请求只计一次：session 获取失败在 `pickSession` 中计入；若该账号是最后一个尝试的账号并经 `handleError` 写出错误，`forward` 只更新统计，不再计数。
 - 错误响应原样返回客户端，包括触发冷却的那次请求（429 原样流式透传，不在本请求内换号）。
 
 冷却：
 
-- 时长由 `account_cooldown` 配置（缺省 `2h`，见 `config.md`），库层 `PoolConfig.AccountCooldown <= 0` 时使用 `DefaultAccountCooldown`。原来的 1 分钟短冷却已取消。
+- 时长由 `account_cooldown` 配置（缺省 `2h`，见 `config.md`；402 例外，见上），库层 `PoolConfig.AccountCooldown <= 0` 时使用 `DefaultAccountCooldown`。原来的 1 分钟短冷却已取消。
 - 冷却期间账号完全不参与选择（与额度耗尽一样跳过），会话绑定指向冷却账号时视为不可用；全部账号不可用时返回 503。
-- 冷却原因 `reason`：触发那次错误的状态码字符串（如 `401`、`403`、`429`，上游真实返回的 `502`），网络错误等无状态码时为 `network`。
+- 冷却原因 `reason`：触发那次错误的状态码字符串（如 `401`、`402`、`403`、`429`，上游真实返回的 `502`），网络错误等无状态码时为 `network`。
 - 进入冷却时，截止时间与原因的设置、计数清零同步完成，并同步输出一条 Warn 日志（含账号、原因与截止时间（RFC3339），不含 token），触发冷却的响应立即返回。随后的副作用在后台异步执行，不阻塞请求，也不随请求取消，顺序固定：
   1. 先写入 `cooldown.json`（在 `fileMu` 内，且仅当冷却仍有效时写入），使崩溃时冷却不丢失；
   2. 清空该账号的 session（内存与磁盘）与模型列表（内存与磁盘）：先取得对应的缓存锁（等待在途请求结束），再检查冷却仍有效；
@@ -188,4 +192,4 @@ flowchart TD
 
 ## 测试依赖的内部名字
 
-`riskTable`（`newRiskTable`、`add`、`lookup`、`save`、`load`）、`riskBlockTTL`、`riskBlockMessage`、`riskBlockFileName`、`Pool.risk`、`(*Pool).gate`、`keyGate`（字段 `mu`、`m`）、`gateEntry.waiters`、`Pool.accounts`、`pickLocked(now, tried map[*poolAccount]bool)`、`(*Pool).choose(key string, tried map[*poolAccount]bool)`、`(quotaWeight).swrrWeight() int`、`DefaultSessionAffinityMaxPerAccount`、`PoolConfig.SessionAffinityMaxPerAccount`、`(*affinityTable).activeCounts(time.Time) map[string]int`、`MinPriority`/`MaxPriority`、`quotaWeight`/`weigh(*Quota)`、`exhaustedUntil(*Quota)`、`(*poolAccount).exhausted(time.Time) bool`、`DefaultAccountCooldown`、`PoolConfig.AccountCooldown`、`(*Service).setCooldown(time.Time)`/`available(time.Time) bool`（`cooldown.go`）、`(*poolAccount).record`、`(*Pool).findAccount(id)`（忽略大小写）、`(*Service).cacheDir`、`(*Pool).Handler()`、`generationWriteTimeout`；额度刷新相关的 `DefaultQuotaRefreshInterval`、`(*Service).quotaRefreshInterval`、`quotaRefreshTick`、`quotaErrorRefreshInterval`、`quotaRefreshTimeout`、`(*Pool).RunQuotaRefresh(ctx)`、`(*poolAccount).refreshAfterError()`、`quotaCache.refreshing`；测试辅助 `testClient`、`testJSON`、`testService`、`testDevice`（login_test.go）、`poolUpstream`（pool_test.go）、`quotaTimeoutMessage`（management_review_test.go）。其余名字见 `session-affinity.md`、`quota-stats.md`、`management.md`。
+`riskTable`（`newRiskTable`、`add`、`lookup`、`save`、`load`）、`riskBlockTTL`、`riskBlockMessage`、`riskBlockFileName`、`Pool.risk`、`(*Pool).gate`、`keyGate`（字段 `mu`、`m`）、`gateEntry.waiters`、`Pool.accounts`、`pickLocked(now, tried map[*poolAccount]bool)`、`(*Pool).choose(key string, tried map[*poolAccount]bool)`、`(quotaWeight).swrrWeight() int`、`DefaultSessionAffinityMaxPerAccount`、`PoolConfig.SessionAffinityMaxPerAccount`、`(*affinityTable).activeCounts(time.Time) map[string]int`、`MinPriority`/`MaxPriority`、`quotaWeight`/`weigh(*Quota)`、`exhaustedUntil(*Quota)`、`(*poolAccount).exhausted(time.Time) bool`、`DefaultAccountCooldown`、`PoolConfig.AccountCooldown`、`(*Service).setCooldown(time.Time)`/`available(time.Time) bool`、`ruleOf`/`ruleUntilReset`（`cooldown.go`）、`(*poolAccount).record`、`(*Pool).findAccount(id)`（忽略大小写）、`(*Service).cacheDir`、`(*Pool).Handler()`、`generationWriteTimeout`；额度刷新相关的 `DefaultQuotaRefreshInterval`、`(*Service).quotaRefreshInterval`、`quotaRefreshTick`、`quotaErrorRefreshInterval`、`quotaRefreshTimeout`、`(*Pool).RunQuotaRefresh(ctx)`、`(*poolAccount).refreshAfterError()`、`quotaCache.refreshing`；测试辅助 `testClient`、`testJSON`、`testService`、`testDevice`（login_test.go）、`poolUpstream`（pool_test.go）、`quotaTimeoutMessage`（management_review_test.go）。其余名字见 `session-affinity.md`、`quota-stats.md`、`management.md`。

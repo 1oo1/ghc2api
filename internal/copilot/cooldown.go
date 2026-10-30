@@ -40,9 +40,10 @@ type cooldownRecord struct {
 type failureRule int
 
 const (
-	ruleIgnore    failureRule = iota // 其他 4xx（400、404、413、422 等）：既不计数也不清零
-	ruleImmediate                    // 401、403：一次即冷却
-	ruleCounted                      // 429、5xx、网络错误与 session 获取失败：连续 cooldownStreakLimit 次后冷却
+	ruleIgnore     failureRule = iota // 其他 4xx（400、404、413、422 等）：既不计数也不清零
+	ruleImmediate                     // 401、403：一次即冷却
+	ruleCounted                       // 429、5xx、网络错误与 session 获取失败：连续 cooldownStreakLimit 次后冷却
+	ruleUntilReset                    // 402（额外预算用尽）：一次即冷却，截止到主额度重置时刻（见 untilResetDeadline）
 )
 
 // ruleOf 按状态码决定错误的处理方式，只对状态码 >= 400 调用（2xx 清零与 3xx 忽略由调用方处理）。
@@ -50,6 +51,8 @@ func ruleOf(status int) failureRule {
 	switch {
 	case status == http.StatusUnauthorized || status == http.StatusForbidden:
 		return ruleImmediate
+	case status == http.StatusPaymentRequired:
+		return ruleUntilReset
 	case status == http.StatusTooManyRequests || status >= http.StatusInternalServerError:
 		return ruleCounted
 	default:
@@ -75,6 +78,10 @@ func (a *poolAccount) countFailure(ctx context.Context, rule failureRule, reason
 		return false
 	}
 	now := time.Now()
+	until := now.Add(a.cooldown)
+	if rule == ruleUntilReset {
+		until = a.untilResetDeadline(now) // 在 errs.mu 之外读取额度缓存，避免嵌套加锁
+	}
 	a.errs.mu.Lock()
 	if !a.service.available(now) {
 		a.errs.mu.Unlock()
@@ -87,13 +94,25 @@ func (a *poolAccount) countFailure(ctx context.Context, rule failureRule, reason
 			return false
 		}
 	}
-	until := now.Add(a.cooldown)
 	a.errs.streak = 0
 	a.errs.reason = reason
 	a.service.setCooldown(until)
 	a.errs.mu.Unlock()
 	a.enterCooldown(ctx, until, reason)
 	return true
+}
+
+// untilResetDeadline 返回 402 冷却的截止时间：缓存额度中主额度的重置时刻；
+// 没有额度数据、没有主额度、重置时间不可解析或不晚于 now 时退回 now + a.cooldown。
+// 额外预算用尽不会自行恢复，冷却到重置时刻可避免反复试探；付款后可手动解除冷却（clear_cooldown）。
+func (a *poolAccount) untilResetDeadline(now time.Time) time.Time {
+	quota, _ := a.quota.snapshot()
+	if main, _ := quotaBuckets(quota); main != nil {
+		if reset, ok := parseResetTime(main.ResetTime); ok && reset.After(now) {
+			return reset
+		}
+	}
+	return now.Add(a.cooldown)
 }
 
 // countSessionFailure 计入一次 session 获取失败：上游错误按其状态码计入；其他错误（网络等）按网络错误计入。

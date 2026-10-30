@@ -32,7 +32,7 @@ type AccountView struct {
     Disabled       bool
     Priority       int           // -1..100，始终输出
     CooldownUntil  *time.Time    // 仅冷却中输出
-    CooldownReason string        // 仅冷却中输出：触发冷却的状态码（如 "403"），网络错误为 "network"
+    CooldownReason string        // 仅冷却中输出：触发冷却的状态码（如 "403"、"402"），网络错误为 "network"
     Stats          struct{ Requests, Errors uint64; LastUsedAt *time.Time }
     Quota          *Quota
     QuotaError     string

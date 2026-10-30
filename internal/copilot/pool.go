@@ -545,7 +545,8 @@ func (p *Pool) services() []*Service {
 	return services
 }
 
-// choose 选择处理本次请求的账号。键非空且开启亲和时：会话已绑定且该账号仍可用（未禁用、未冷却、未耗尽、本请求未尝试过）则直接使用它，且不推进轮询；
+// choose 选择处理本次请求的账号。键非空且开启亲和时：会话已绑定且该账号仍可用（未禁用、未冷却、未耗尽、本请求未尝试过），
+// 且它有 Credits 或最优档也没有 Credits，则直接使用它，且不推进轮询；
 // 否则为无可用绑定的会话（新会话或故障切换）选择：先取最优档，在档内排除有效绑定数已达上限的账号后轮询；最优档全满则忽略上限，不降档。
 // 键为空或未开启亲和时按 pickLocked 选择。没有候选（包括全部冷却）时返回 nil。
 func (p *Pool) choose(key string, tried map[*poolAccount]bool) *poolAccount {
@@ -555,14 +556,22 @@ func (p *Pool) choose(key string, tried map[*poolAccount]bool) *poolAccount {
 	if key == "" || p.affinity == nil {
 		return p.pickLocked(now, tried)
 	}
+	group := p.topGroupLocked(now, tried)
 	if id, ok := p.affinity.lookup(key, now); ok {
 		if account := p.findLocked(id); account != nil && !account.disabled &&
-			!tried[account] && account.service.available(now) && !account.exhausted(now) {
+			!tried[account] && account.service.available(now) && !account.exhausted(now) &&
+			!creditsElsewhere(account, group, now) {
 			return account
 		}
 	}
 	// 上限只在最优档内生效：先取最优档，再排除其中已满的账号；最优档全满时忽略上限，仍对整个最优档轮询，绝不因上限降档。
-	return swrrPickLocked(p.withinCapLocked(p.topGroupLocked(now, tried), now))
+	return swrrPickLocked(p.withinCapLocked(group, now))
+}
+
+// creditsElsewhere 报告绑定账号是否应让位给有 Credits 的账号：它自身无 Credits，而最优档 group 有 Credits。
+// 最优档无 Credits（例如更高优先级的账号也无 Credits）时保留绑定，因为重新选择也只会选到无 Credits 的账号。调用方须持有 p.mu。
+func creditsElsewhere(bound *poolAccount, group []candidate, now time.Time) bool {
+	return len(group) > 0 && group[0].key.weight.hasCredits && !keyOf(bound, now).weight.hasCredits
 }
 
 // selectKey 是账号参与选择时的排序信息：priority 与 weight.hasCredits 决定档位（见 tierBefore）；
