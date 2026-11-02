@@ -17,7 +17,7 @@
 | --- | --- | --- |
 | `GET /management` | — | 控制台 HTML（`web.Index()`） |
 | `POST /v0/management/session` | — | `{"token":"v1.…","expires_at":"RFC3339"}`，签发新的控制台令牌（用管理密钥即登录，用令牌即续期） |
-| `GET /v0/management/version` | — | `{"version":"v0.0.1"}`，程序版本号（`copilot.Version`），控制台侧边栏显示 |
+| `GET /v0/management/version` | — | `{"version":"v0.0.1"}`，程序版本号（`copilot.Version`），控制台顶栏显示 |
 | `GET /v0/management/accounts` | — | `[]AccountView`，顺带刷新过期额度（见 `quota-stats.md`） |
 | `POST /v0/management/accounts` | `{"credential":{"oauth_token":"...","host":"","user":"","proxy":""}}`（`proxy` 可选） | `200 AccountView` |
 | `PATCH /v0/management/accounts` | `{"id":"alice","disabled":true,"priority":50}`；或 `{"id":"alice","clear_cooldown":true}`；或 `{"id":"alice","proxy":"socks5://…","proxy_keep_password":true}` | `200 AccountView` |

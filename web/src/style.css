@@ -105,21 +105,22 @@ label {
   color: #6c8064;
 }
 
-/* 外层布局：左侧导航 + 右侧内容 */
-.shell {
-  display: grid;
-  grid-template-columns: 224px 1fr;
-  min-height: 100vh;
-}
-.shell > aside {
+/* 外层布局：顶栏 + 内容 */
+.topbar {
   position: sticky;
   top: 0;
-  height: 100vh;
-  background: #fbfcf8;
-  border-right: 1px solid #dfe6dc;
-  padding: 30px 20px;
+  z-index: 1;
   display: flex;
-  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: #fbfcf8;
+  border-bottom: 1px solid #dfe6dc;
+  padding: 14px 42px;
+}
+.topbar-actions {
+  display: flex;
+  gap: 8px;
 }
 .brand {
   display: flex;
@@ -136,6 +137,10 @@ label {
   font-weight: 500;
 }
 .brand .version {
+  margin: 0;
+  padding: 1px 8px;
+  border: 1px solid #dce2dc;
+  border-radius: 30px;
   letter-spacing: 0.3px;
   font-size: 11px;
 }
@@ -151,50 +156,14 @@ label {
   font-weight: 700;
   box-shadow: 0 3px 8px #17432f1a;
 }
-.shell nav {
-  display: grid;
-  gap: 7px;
-  margin-top: 48px;
-}
-.shell nav button {
-  justify-content: flex-start;
-  border: 0;
-  background: none;
-  padding: 12px;
-  color: #78887c;
-  gap: 13px;
-  font-weight: 550;
-}
-.shell nav button span {
-  font-size: 18px;
-  width: 20px;
-  text-align: center;
-}
-.shell nav button.selected {
-  color: #215d48;
-  background: #e8efe5;
-}
-.sidebar-foot {
-  margin-top: auto;
-}
-.sidebar-foot button {
-  width: 100%;
-  background: none;
-}
 .shell > main {
-  padding: 34px 42px;
+  padding: 30px 42px;
   max-width: 1420px;
   width: 100%;
   margin: auto;
 }
-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 28px;
-}
 
-/* 概览指标 */
+/* 汇总指标 */
 .metrics {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -255,7 +224,91 @@ tr:last-child td {
   border-bottom: 0;
 }
 
-/* 账号页工具栏与卡片 */
+/* 账号列表：整行可点击，打开账号卡片 */
+.account-table td {
+  vertical-align: top;
+}
+.account-table tbody tr {
+  cursor: pointer;
+}
+.account-table tbody tr:hover,
+.account-table tbody tr:focus-within {
+  background: #f1f6f2;
+}
+/* 可排序表头：文字按钮，箭头表示当前方向，未排序时为淡色 ↕ */
+.sort-header {
+  padding: 0;
+  gap: 4px;
+  border: 0;
+  background: none;
+  font-size: 11px;
+  font-weight: 500;
+  color: inherit;
+}
+.sort-header:hover {
+  background: none;
+  color: #1d6551;
+}
+.sort-header span {
+  display: inline-block;
+  width: 1em;
+  text-align: center;
+}
+th[aria-sort="none"] .sort-header span {
+  opacity: 0.4;
+}
+.account-cell {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.account-cell .account-name {
+  display: block;
+  color: #22312c;
+  font-size: 13px;
+  font-weight: 600;
+}
+.account-cell small {
+  display: block;
+  font-size: 11px;
+}
+.cell-note {
+  display: block;
+  margin-top: 5px;
+  font-size: 11px;
+}
+.mini-quota {
+  display: grid;
+  grid-template-columns: max-content 80px max-content max-content;
+  align-items: center;
+  gap: 4px 10px;
+}
+.mini-quota-row {
+  display: contents;
+}
+.mini-quota .meter {
+  margin: 0;
+}
+.mini-quota b {
+  font-weight: 600;
+  color: #3e5546;
+}
+.mini-quota small {
+  font-size: 11px;
+  color: #9ba793;
+}
+.mini-quota > small,
+.mini-quota > .muted {
+  grid-column: 1 / -1;
+}
+.mini-quota > .quota-warning {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #a15d3f;
+}
+
+/* 工具栏与账号卡片 */
 .toolbar {
   display: flex;
   align-items: center;
@@ -270,11 +323,6 @@ tr:last-child td {
 .toolbar > div {
   display: flex;
   gap: 8px;
-}
-.account-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
-  gap: 20px;
 }
 .account-card {
   background: #fcfdf9;
@@ -456,6 +504,35 @@ tr:last-child td {
   margin: 16px 0 12px;
 }
 
+/* 账号详情弹窗：内容即账号卡片 */
+.account-dialog {
+  border: 0;
+  border-radius: 13px;
+  padding: 0;
+  width: min(460px, calc(100vw - 32px));
+  background: none;
+  color: inherit;
+  box-shadow: 0 12px 32px #17432f26;
+}
+.account-dialog::backdrop {
+  background: #22312c4d;
+}
+.account-dialog .account-heading {
+  padding-right: 34px;
+}
+.dialog-close {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  background: none;
+  font-size: 20px;
+  color: #85947f;
+}
+
 /* 确认对话框 */
 .confirm-dialog {
   border: 1px solid #dfe5dc;
@@ -618,11 +695,8 @@ button.link:hover {
 }
 
 @media (max-width: 950px) {
-  .shell {
-    grid-template-columns: 180px 1fr;
-  }
-  .shell > aside {
-    padding: 24px 13px;
+  .topbar {
+    padding: 12px 22px;
   }
   .shell > main {
     padding: 26px 22px;
@@ -631,43 +705,17 @@ button.link:hover {
     align-items: flex-start;
     flex-direction: column;
   }
-  .account-grid {
-    grid-template-columns: 1fr;
-  }
 }
 @media (max-width: 580px) {
-  .shell {
-    display: block;
+  .topbar {
+    padding: 10px 16px;
   }
-  .shell > aside {
-    position: relative;
-    height: auto;
-    padding: 16px;
-  }
-  .shell nav {
-    display: flex;
-    overflow: auto;
-    gap: 3px;
-    margin-top: 15px;
-  }
-  .shell nav button {
-    font-size: 11px;
-    padding: 8px;
-  }
-  .shell nav button span {
-    display: none;
-  }
-  .sidebar-foot {
-    position: absolute;
-    top: 16px;
-    right: 16px;
-    margin: 0;
-  }
-  .sidebar-foot button {
-    width: auto;
+  .topbar-actions button {
     padding: 5px 8px;
     font-size: 11px;
-    background: #fff;
+  }
+  .brand small:not(.version) {
+    display: none;
   }
   .shell > main {
     padding: 20px 16px;

@@ -1,9 +1,11 @@
-// 账号与额度页：工具栏（导入凭证、GitHub 登录）与账号卡片列表。
-// 导入与登录前先弹出代理弹窗，可留空跳过（不使用代理）。
-import { useRef, useState } from "react";
+// 账号页（控制台唯一页面）：汇总指标、工具栏（导入凭证、GitHub 登录）与账号列表；
+// 点击列表行弹出该账号的卡片。导入与登录前先弹出代理弹窗，可留空跳过（不使用代理）。
+import { useEffect, useRef, useState } from "react";
 import type { AccountView } from "../api";
 import type { Actions } from "../actions";
-import { AccountCard } from "../components/AccountCard";
+import { availableCount, sumStats } from "../account";
+import { AccountDialog } from "../components/AccountDialog";
+import { AccountTable } from "../components/AccountTable";
 import { Empty } from "../components/Empty";
 import { ProxyDialog } from "../components/ProxyDialog";
 import { buildProxyUrl } from "../proxy";
@@ -29,6 +31,20 @@ export function AccountsPage({
   const fileInput = useRef<HTMLInputElement>(null);
   /** 导入流程已选的代理，供选择文件后使用。 */
   const importProxy = useRef("");
+  /** 弹出卡片的账号；按 id 从最新列表中取，自动刷新后内容随之更新。 */
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const selected = accounts.find((a) => a.id === selectedId);
+  // 账号被删除（不在列表中）时关闭弹窗。
+  useEffect(() => {
+    if (selectedId !== null && !selected) setSelectedId(null);
+  }, [selectedId, selected]);
+
+  const totals = sumStats(accounts);
+  const metrics: [string, string][] = [
+    ["可用账号", `${availableCount(accounts)} / ${accounts.length}`],
+    ["累计请求", totals.requests.toLocaleString("zh-CN")],
+    ["错误数", totals.errors.toLocaleString("zh-CN")],
+  ];
 
   function importCredential(file: File, proxy: string) {
     void actions.run(async () => {
@@ -47,8 +63,16 @@ export function AccountsPage({
 
   return (
     <>
+      <section className="metrics">
+        {metrics.map(([label, value]) => (
+          <article key={label}>
+            <span>{label}</span>
+            <strong>{value}</strong>
+          </article>
+        ))}
+      </section>
       <div className="toolbar">
-        <p>额度数据来自 GitHub，由服务端按配置的间隔（默认 1 小时）在后台自动更新，点击「刷新额度」可立即刷新；账号列表每 15 秒自动刷新。</p>
+        <p>点击账号行查看卡片并操作。额度数据来自 GitHub，由服务端按配置的间隔（默认 1 小时）在后台自动更新，可在卡片中点击「刷新额度」立即刷新；账号列表每 15 秒自动刷新。</p>
         <div>
           <button disabled={actions.busy} onClick={() => setChoosing("import")}>
             导入凭证 JSON
@@ -96,15 +120,20 @@ export function AccountsPage({
           }}
         />
       )}
-      <section className="account-grid">
-        {accounts.map((a) => (
-          <AccountCard key={a.id} account={a} actions={actions} />
-        ))}
-      </section>
-      {accounts.length === 0 && (
+      {accounts.length === 0 ? (
         <Empty
           title="添加你的第一个 Copilot 账号"
           text="使用 GitHub 设备登录，或导入已有的 Copilot 凭证 JSON 文件。"
+        />
+      ) : (
+        <AccountTable accounts={accounts} onSelect={setSelectedId} />
+      )}
+      {selected && (
+        <AccountDialog
+          key={selected.id}
+          account={selected}
+          actions={actions}
+          onClose={() => setSelectedId(null)}
         />
       )}
     </>

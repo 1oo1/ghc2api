@@ -12,17 +12,24 @@ import {
   MAX_PRIORITY,
   MIN_PRIORITY,
   parsePriority,
+  quotaWarnings,
 } from "../account";
-import { buckets, resetLabel, usedPercent, type Bucket, type Quota } from "../quota";
+import {
+  buckets,
+  creditsUsed,
+  HIGH_USAGE_PERCENT,
+  planLabel,
+  resetLabel,
+  usedPercent,
+  type Bucket,
+  type Quota,
+} from "../quota";
 import { buildProxyPatch, proxyLabel } from "../proxy";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { ProxyDialog } from "./ProxyDialog";
 
 /** 需在对话框中确认后才执行的操作。 */
 type PendingAction = { message: string; task: () => Promise<string> };
-
-/** 已用比例达到该值时进度条改用警示色。 */
-const HIGH_USAGE_PERCENT = 90;
 
 export function AccountCard({
   account,
@@ -59,7 +66,7 @@ export function AccountCard({
         </div>
         <span className={`badge ${status}`}>{accountStatusText(account, now)}</span>
       </header>
-      <QuotaPanel quota={account.quota} quotaError={account.quota_error} />
+      <QuotaPanel quota={account.quota} warnings={quotaWarnings(account)} />
       <p className="stats-line">
         请求 {account.stats.requests.toLocaleString("zh-CN")} · 错误{" "}
         {account.stats.errors.toLocaleString("zh-CN")} · 最近使用{" "}
@@ -225,33 +232,29 @@ function PriorityEditor({
 /** 额度区域：订阅计划、各额度窗口进度条、Credits 用量与各类提示。 */
 function QuotaPanel({
   quota,
-  quotaError,
+  warnings,
 }: {
   quota?: Quota;
-  quotaError?: string;
+  /** 额度提示（查询失败、数据过期），见 quotaWarnings。 */
+  warnings: string[];
 }) {
   const windows = quota ? buckets(quota) : [];
-  const credits = quota?.summary?.filter((m) => m.key === "credits_used") ?? [];
+  const credits = creditsUsed(quota);
   return (
     <section className="quota">
-      <strong>
-        {quota?.subscription?.plan || quota?.subscription?.tierName || "GitHub Copilot"}
-      </strong>
-      {quota?.stale && (
-        <p className="hint">
-          额度数据可能已过期：GitHub 限流，显示的是上一次成功获取的结果。
+      <strong>{planLabel(quota)}</strong>
+      {warnings.map((w) => (
+        <p className="hint" key={w}>
+          {w}
         </p>
-      )}
-      {quotaError && <p className="hint error">额度查询失败：{quotaError}</p>}
+      ))}
       {windows.map((bucket, i) => (
         <QuotaRow key={`${bucket.window}-${i}`} bucket={bucket} />
       ))}
-      {credits.map((m) => (
-        <p className="credits" key={m.key}>
-          已用 Credits：{m.value.toLocaleString("zh-CN")}
-        </p>
-      ))}
-      {windows.length === 0 && credits.length === 0 && (
+      {credits !== undefined && (
+        <p className="credits">已用 Credits：{credits.toLocaleString("zh-CN")}</p>
+      )}
+      {windows.length === 0 && credits === undefined && (
         <p className="muted">暂无额度数据，可点击「刷新额度」。</p>
       )}
     </section>

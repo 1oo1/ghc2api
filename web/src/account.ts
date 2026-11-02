@@ -1,4 +1,4 @@
-// 账号状态与统计汇总的纯函数，概览页与账号页共用。
+// 账号状态、统计汇总与额度提示的纯函数，账号列表与账号卡片共用。
 import type { AccountView } from "./api";
 
 export type AccountStatus = "disabled" | "cooling" | "enabled";
@@ -44,6 +44,17 @@ export function accountStatus(
 /** 可用账号数：未禁用且未冷却。 */
 export function availableCount(accounts: AccountView[], now = Date.now()) {
   return accounts.filter((a) => accountStatus(a, now) === "enabled").length;
+}
+
+/** 额度相关提示：查询失败在前，数据过期（被限流）在后；都没有时返回空数组。 */
+export function quotaWarnings(
+  account: Pick<AccountView, "quota" | "quota_error">,
+): string[] {
+  const warnings: string[] = [];
+  if (account.quota_error) warnings.push(`额度查询失败：${account.quota_error}`);
+  if (account.quota?.stale)
+    warnings.push("额度数据可能已过期：GitHub 限流，显示的是上一次成功获取的结果。");
+  return warnings;
 }
 
 /** 汇总所有账号的请求数与错误数。 */

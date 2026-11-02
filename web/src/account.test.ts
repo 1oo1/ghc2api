@@ -9,6 +9,7 @@ import {
   coolingLabel,
   isCooling,
   parsePriority,
+  quotaWarnings,
   statusLabel,
 } from "./account";
 
@@ -157,4 +158,34 @@ test("冷却截止时间已过、缺失或无效时没有可解除的冷却", ()
   expect(isCooling(accountOf(), NOW)).toBe(false);
   expect(isCooling(accountOf({ cooldown_until: "not-a-time" }), NOW)).toBe(false);
   expect(isCooling(accountOf({ disabled: true }), NOW)).toBe(false);
+});
+
+// 额度提示：quotaWarnings(account) 返回字符串数组，错误在前、过期在后。
+
+const QUOTA_ERROR_TEXT = "额度查询失败：rate limited";
+const QUOTA_STALE_TEXT =
+  "额度数据可能已过期：GitHub 限流，显示的是上一次成功获取的结果。";
+
+test("没有额度错误且数据未过期时没有提示", () => {
+  expect(quotaWarnings({})).toEqual([]);
+  expect(quotaWarnings({ quota: {} })).toEqual([]);
+  expect(quotaWarnings({ quota: { stale: false }, quota_error: "" })).toEqual(
+    [],
+  );
+});
+
+test("有额度错误时提示查询失败", () => {
+  expect(quotaWarnings({ quota_error: "rate limited" })).toEqual([
+    QUOTA_ERROR_TEXT,
+  ]);
+});
+
+test("额度数据过期时提示可能已过期", () => {
+  expect(quotaWarnings({ quota: { stale: true } })).toEqual([QUOTA_STALE_TEXT]);
+});
+
+test("错误与过期同时存在时两条都返回，错误在前", () => {
+  expect(
+    quotaWarnings({ quota: { stale: true }, quota_error: "rate limited" }),
+  ).toEqual([QUOTA_ERROR_TEXT, QUOTA_STALE_TEXT]);
 });

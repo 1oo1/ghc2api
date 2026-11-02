@@ -64,3 +64,18 @@ export function buckets(quota: Quota): Bucket[] {
         Number.isFinite(b.remainingFraction),
     );
 }
+
+/** 已用比例达到该值时进度条改用警示色。 */
+export const HIGH_USAGE_PERCENT = 90;
+
+/** 订阅计划名称：plan 优先，其次 tierName，都没有时显示 "GitHub Copilot"。 */
+export function planLabel(quota?: Quota): string {
+  return quota?.subscription?.plan || quota?.subscription?.tierName || "GitHub Copilot";
+}
+
+/** 已用 Credits：summary 中第一个数值有效的 credits_used；没有时返回 undefined。 */
+export function creditsUsed(quota?: Quota): number | undefined {
+  return quota?.summary?.find(
+    (m) => m.key === "credits_used" && Number.isFinite(m.value),
+  )?.value;
+}

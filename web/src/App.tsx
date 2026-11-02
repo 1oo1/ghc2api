@@ -1,4 +1,4 @@
-// 应用入口组件：未登录时显示登录页；登录后显示控制台（概览 / 账号与额度）。
+// 应用入口组件：未登录时显示登录页；登录后显示控制台（账号页）。
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   createManagementClient,
@@ -12,18 +12,11 @@ import type { Actions } from "./actions";
 import { DeviceLoginPanel } from "./components/DeviceLoginPanel";
 import { AccountsPage } from "./pages/AccountsPage";
 import { LoginPage } from "./pages/LoginPage";
-import { OverviewPage } from "./pages/OverviewPage";
 import { clearSession, loadSession, saveSession } from "./session";
 
 /** 账号列表自动刷新间隔（毫秒）。 */
 const REFRESH_INTERVAL_MS = 15_000;
 const EXPIRED_MESSAGE = "登录已失效，请重新输入管理密钥";
-
-type Page = "overview" | "accounts";
-const pages: { id: Page; label: string; icon: string }[] = [
-  { id: "overview", label: "概览", icon: "◎" },
-  { id: "accounts", label: "账号与额度", icon: "◈" },
-];
 
 export function App() {
   // 控制台令牌（由管理密钥换取，见 session.ts）保存在 React state 与 localStorage 中；
@@ -104,7 +97,6 @@ function Console({
     () => createManagementClient(credential),
     [credential],
   );
-  const [page, setPage] = useState<Page>("overview");
   const [accounts, setAccounts] = useState<AccountView[]>([]);
   /** 服务端版本；加载失败时不显示，不影响控制台使用。 */
   const [version, setVersion] = useState("");
@@ -183,42 +175,26 @@ function Console({
     });
 
   const actions: Actions = { client, busy, run, submit, fail };
-  const title = pages.find((p) => p.id === page)?.label ?? "";
 
   return (
     <div className="shell">
-      <aside>
+      <header className="topbar">
         <div className="brand">
           <span className="brand-mark">G</span>
           <div>
             ghc2api
             <small>GITHUB COPILOT</small>
-            {version && <small className="version">{version}</small>}
           </div>
+          {version && <small className="version">{version}</small>}
         </div>
-        <nav>
-          {pages.map((p) => (
-            <button
-              className={page === p.id ? "selected" : ""}
-              key={p.id}
-              onClick={() => setPage(p.id)}
-            >
-              <span>{p.icon}</span>
-              {p.label}
-            </button>
-          ))}
-        </nav>
-        <div className="sidebar-foot">
-          <button onClick={onLogout}>退出登录</button>
-        </div>
-      </aside>
-      <main>
-        <header>
-          <h1>{title}</h1>
+        <div className="topbar-actions">
           <button onClick={() => void reload()} disabled={busy}>
             ↻ 刷新
           </button>
-        </header>
+          <button onClick={onLogout}>退出登录</button>
+        </div>
+      </header>
+      <main>
         {error && (
           <div className="banner error" role="alert">
             {error}
@@ -241,16 +217,12 @@ function Console({
             onClose={() => setLogin(null)}
           />
         )}
-        {page === "overview" ? (
-          <OverviewPage accounts={accounts} />
-        ) : (
-          <AccountsPage
-            accounts={accounts}
-            actions={actions}
-            loginPending={login !== null}
-            onStartLogin={startLogin}
-          />
-        )}
+        <AccountsPage
+          accounts={accounts}
+          actions={actions}
+          loginPending={login !== null}
+          onStartLogin={startLogin}
+        />
       </main>
     </div>
   );
