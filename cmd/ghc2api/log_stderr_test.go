@@ -7,6 +7,7 @@ package main
 
 import (
 	"bytes"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -95,7 +96,7 @@ func TestNewConfiguredLoggerStderrFollowsLogFileOnly(t *testing.T) {
 			logger, file, err := newConfiguredLogger(appConfig{
 				LogsPath: logsDir, LogLevel: "info", LogMaxSizeMB: 1, LogMaxBackups: 1,
 				LogFileOnly: tc.fileOnly,
-			}, stderr)
+			}, stderr, new(slog.LevelVar))
 			if err != nil {
 				t.Fatalf("newConfiguredLogger() error = %v", err)
 			}
@@ -127,7 +128,7 @@ func TestLogToStderrLoadConfigToConfiguredLogger(t *testing.T) {
 				t.Fatalf("loadConfig() error = %v", err)
 			}
 			stderr := &bytes.Buffer{}
-			logger, file, err := newConfiguredLogger(config, stderr)
+			logger, file, err := newConfiguredLogger(config, stderr, new(slog.LevelVar))
 			if err != nil {
 				t.Fatalf("newConfiguredLogger() error = %v", err)
 			}

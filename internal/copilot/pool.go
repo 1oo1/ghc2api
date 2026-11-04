@@ -40,6 +40,8 @@ type PoolConfig struct {
 	LogFile               string       // 当前日志文件的完整路径，控制台据此读取日志（含滚动备份）；空表示未配置
 	Client                *http.Client // 访问 GitHub/Copilot 的客户端（测试注入），新增账号与设备登录也使用它
 	Logger                *slog.Logger
+	// ConfigStore 提供控制台读取、校验与保存配置文件的能力（见 management_config.go）；nil 表示不提供配置接口。
+	ConfigStore ConfigStore
 }
 
 // PoolAccount 是启动时载入的一个账号。
@@ -52,7 +54,7 @@ type PoolAccount struct {
 	Proxy    string // SOCKS5 代理 URL，空表示直连，见 proxy.go
 }
 
-// poolAccount 是池内一个账号的运行时状态。id、service、routes、cooldown 与 affinity 创建后不再变化；disabled、priority 与 swrrCurrent 由 Pool.mu 保护。
+// poolAccount 是池内一个账号的运行时状态。id、service、routes、cooldown、cooldownSrc 与 affinity 创建后不再变化；disabled、priority 与 swrrCurrent 由 Pool.mu 保护。
 type poolAccount struct {
 	id          string        // 账号 ID：GitHub 用户名的小写形式；无用户名时为初始下标
 	service     *Service      // 账号的 Copilot 服务
@@ -61,10 +63,12 @@ type poolAccount struct {
 	priority    int // 优先级，见 PoolAccount.Priority
 	swrrCurrent int // 平滑加权轮询的当前值，见 swrrPickLocked
 
-	cooldown time.Duration    // 冷却时长，见 PoolConfig.AccountCooldown
-	affinity *affinityTable   // 会话绑定表，冷却时删除指向本账号的绑定；未开启亲和时为 nil
-	effects  *cooldownEffects // 进入冷却的异步副作用计数，由池持有（见 Pool.WaitCooldownEffects）
-	errs     cooldownTracker  // 连续错误计数与冷却原因，见 cooldown.go
+	// cooldown 是账号固定的冷却时长，非 0 时优先；池内账号为 0，改为跟随池的当前值 cooldownSrc（见 cooldownDuration）。
+	cooldown    time.Duration
+	cooldownSrc *liveDuration
+	affinity    *affinityTable   // 会话绑定表，冷却时删除指向本账号的绑定；未开启亲和时为 nil
+	effects     *cooldownEffects // 进入冷却的异步副作用计数，由池持有（见 Pool.WaitCooldownEffects）
+	errs        cooldownTracker  // 连续错误计数与冷却原因，见 cooldown.go
 
 	requests atomic.Uint64 // 分发到该账号的请求数（含模型列表与生成）
 	failures atomic.Uint64 // 其中响应状态 >= 400 的数量
@@ -74,7 +78,7 @@ type poolAccount struct {
 }
 
 // newPoolAccount 为 Service 创建账号运行时状态，并从缓存目录恢复额度（见 restoreQuota）与未到期的冷却（见 restoreCooldown）。
-// 冷却时长与会话绑定表由池在 Pool.newAccount 中填入。
+// 冷却时长（跟随池的当前值）与会话绑定表由池在 Pool.newAccount 中填入。
 func newPoolAccount(service *Service, id string) *poolAccount {
 	account := &poolAccount{id: id, service: service, routes: service.routes(), cooldown: DefaultAccountCooldown, effects: new(cooldownEffects)}
 	account.restoreQuota()
@@ -87,23 +91,29 @@ func newPoolAccount(service *Service, id string) *poolAccount {
 // newAccount 为池创建账号运行时状态，并填入池级的冷却时长与会话绑定表。
 func (p *Pool) newAccount(service *Service, id string) *poolAccount {
 	account := newPoolAccount(service, id)
-	account.cooldown = p.cooldownDuration()
+	account.cooldown, account.cooldownSrc = 0, &p.accountCooldown
 	account.affinity = p.affinity
 	account.effects = &p.effects
 	return account
 }
 
-// cooldownDuration 返回账号冷却时长：配置未设置或非正时为 DefaultAccountCooldown。
-func (p *Pool) cooldownDuration() time.Duration {
-	if p.config.AccountCooldown > 0 {
-		return p.config.AccountCooldown
+// cooldownDuration 返回账号进入冷却时使用的时长：账号自带的固定值优先，其次是池的当前值（可由 ApplySettings 修改），
+// 都没有（或非正）时为 DefaultAccountCooldown。
+func (a *poolAccount) cooldownDuration() time.Duration {
+	if a.cooldown > 0 {
+		return a.cooldown
+	}
+	if a.cooldownSrc != nil {
+		if d := a.cooldownSrc.Load(); d > 0 {
+			return d
+		}
 	}
 	return DefaultAccountCooldown
 }
 
 // Pool 在多个 GitHub 账号之间分发请求：按优先级与额度档位分出最优档，档内做平滑加权轮询选择可用账号，并负责会话亲和（含每账号绑定数上限）、账号的运行时增删、禁用与调整优先级。
 type Pool struct {
-	apiKey     string // 所有账号共用的服务访问密钥
+	apiKey     liveString // 所有账号共用的服务访问密钥，可由 ApplySettings 修改
 	logger     *slog.Logger
 	config     PoolConfig     // 服务级配置，新增账号与设备登录时使用
 	client     *http.Client   // 新增账号与设备登录访问 GitHub 的直连客户端；带代理时改用 clientFor 构造的客户端
@@ -112,8 +122,15 @@ type Pool struct {
 	risk       *riskTable     // 风控记录表（见 riskblock.go），随会话亲和开启；关闭时为 nil
 	gate       keyGate        // 同一会话键的选账号、取 session、绑定串行化（见 pickSession），零值可用
 	management http.Handler   // 管理接口；ManagementKey 为空时为 nil
-	// generations 是生成请求的并发名额（缓冲 channel 作信号量），容量为 MaxConcurrentRequests；不限制时为 nil。
-	generations chan struct{}
+	// 以下是可由 ApplySettings 在运行中修改的设置（见 settings.go），PoolConfig 中的同名字段只是初始值。
+	managementKey        liveString
+	modelsCacheTTL       liveDuration
+	quotaRefreshInterval liveDuration
+	accountCooldown      liveDuration
+	affinityMaxPerAcct   atomic.Int64 // 每账号绑定数上限，<=0 不限制
+	generations          generationLimiter
+	settingsMu           sync.Mutex // 串行化 ApplySettings
+	configMu             sync.Mutex // 串行化配置的保存与应用（见 management_config.go）
 
 	requestSeq atomic.Uint64
 
@@ -140,8 +157,8 @@ func NewPool(configs []Config) (*Pool, error) {
 	for i, config := range configs {
 		config.APIKey = strings.TrimSpace(config.APIKey)
 		if i == 0 {
-			p.apiKey = config.APIKey
-		} else if config.APIKey != p.apiKey {
+			p.apiKey.Store(config.APIKey)
+		} else if config.APIKey != p.apiKey.Load() {
 			return nil, errors.New("所有账号的服务访问密钥必须一致")
 		}
 		if err := p.addConfigured(i+1, config, false, 0); err != nil {
@@ -183,7 +200,7 @@ func NewManagedPool(config PoolConfig, accounts []PoolAccount) (*Pool, error) {
 			return nil, fmt.Errorf("第 %d 个 GitHub 账号的用户名无效", i+1)
 		}
 		err := p.addConfigured(i+1, Config{
-			Token: account.Token, Host: account.Host, User: user, APIKey: p.apiKey,
+			Token: account.Token, Host: account.Host, User: user, APIKey: p.apiKey.Load(),
 			CacheDir: config.CacheDir, ModelsCacheTTL: config.ModelsCacheTTL,
 			QuotaRefreshInterval: config.QuotaRefreshInterval, Client: config.Client, Logger: p.logger,
 			Proxy: account.Proxy,
@@ -224,13 +241,14 @@ func newPool(config PoolConfig) *Pool {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	p := &Pool{
-		apiKey: config.APIKey, logger: logger, config: config, client: safeClient(config.Client),
-		idle: idleRoutes(),
-	}
-	if config.MaxConcurrentRequests > 0 {
-		p.generations = make(chan struct{}, config.MaxConcurrentRequests)
-	}
+	p := &Pool{logger: logger, config: config, client: safeClient(config.Client), idle: idleRoutes()}
+	p.apiKey.Store(config.APIKey)
+	p.managementKey.Store(config.ManagementKey)
+	p.modelsCacheTTL.Store(positiveOr(config.ModelsCacheTTL, DefaultModelsCacheTTL))
+	p.quotaRefreshInterval.Store(positiveOr(config.QuotaRefreshInterval, DefaultQuotaRefreshInterval))
+	p.accountCooldown.Store(positiveOr(config.AccountCooldown, DefaultAccountCooldown))
+	p.affinityMaxPerAcct.Store(int64(config.SessionAffinityMaxPerAccount))
+	p.generations.setLimit(config.MaxConcurrentRequests)
 	if config.SessionAffinityTTL > 0 {
 		p.affinity = newAffinityTable(config.SessionAffinityTTL)
 		p.loadSessionAffinity()
@@ -265,7 +283,7 @@ func (p *Pool) conflicts(service *Service, id string) bool {
 // 启用管理接口时，/management 与 /v0/management/ 下的路径改用管理密钥鉴权，不受 api_key 影响。
 // 请求日志位于各自的鉴权之内（见 withRequestLog），未通过鉴权的请求不输出请求日志。
 func (p *Pool) Handler() http.Handler {
-	business := requireAPIKey(p.apiKey, p.log, withRequestLog(p.log, http.HandlerFunc(p.dispatch)))
+	business := requireAPIKey(p.apiKey.Load, p.log, withRequestLog(p.log, http.HandlerFunc(p.dispatch)))
 	var handler http.Handler = business
 	if p.management != nil {
 		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -288,12 +306,12 @@ func (p *Pool) dispatch(w http.ResponseWriter, r *http.Request) {
 		p.idle.mux.ServeHTTP(w, r)
 	default:
 		if entry.upstream != "" {
-			if !p.acquireGeneration() {
-				p.log(r.Context(), slog.LevelWarn, "生成请求并发数已达上限", "limit", p.config.MaxConcurrentRequests)
+			if !p.generations.acquire() {
+				p.log(r.Context(), slog.LevelWarn, "生成请求并发数已达上限", "limit", p.generations.limitNow())
 				writeError(w, http.StatusServiceUnavailable, "生成请求并发数已达上限，请稍后重试")
 				return
 			}
-			defer p.releaseGeneration()
+			defer p.generations.release()
 		}
 		key, ok := p.affinityKey(r, entry.upstream)
 		if !ok {
@@ -302,26 +320,6 @@ func (p *Pool) dispatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		p.forward(w, r, key)
-	}
-}
-
-// acquireGeneration 尝试占用一个生成请求的名额，不等待；未限制时总是成功。
-func (p *Pool) acquireGeneration() bool {
-	if p.generations == nil {
-		return true
-	}
-	select {
-	case p.generations <- struct{}{}:
-		return true
-	default:
-		return false
-	}
-}
-
-// releaseGeneration 释放 acquireGeneration 占用的名额；只能在成功占用后调用。
-func (p *Pool) releaseGeneration() {
-	if p.generations != nil {
-		<-p.generations
 	}
 }
 
@@ -667,7 +665,7 @@ func (p *Pool) pickLocked(now time.Time, tried map[*poolAccount]bool) *poolAccou
 // 剩余为空（全满）时返回原 group，即忽略上限。上限 <=0 或未开启亲和时不过滤。有效绑定数来自 affinityTable.activeCounts。
 // 过滤必须在 swrrPickLocked 之前完成（SWRR 会修改参与组的 swrrCurrent）。调用方须持有 p.mu（锁顺序为先 p.mu 后 affinity.mu）。
 func (p *Pool) withinCapLocked(group []candidate, now time.Time) []candidate {
-	limit := p.config.SessionAffinityMaxPerAccount
+	limit := int(p.affinityMaxPerAcct.Load())
 	if limit <= 0 || p.affinity == nil || len(group) == 0 {
 		return group
 	}

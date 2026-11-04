@@ -351,7 +351,7 @@ func (a *poolAccount) saveQuotaLocked(ctx context.Context) {
 func (a *poolAccount) refresh(ctx context.Context, force bool) error {
 	a.quota.mu.Lock()
 	fresh := !force && !a.quota.retry && !a.quota.checkedAt.IsZero() &&
-		time.Since(a.quota.checkedAt) < a.service.quotaRefreshInterval
+		time.Since(a.quota.checkedAt) < a.service.quotaRefreshInterval.Load()
 	a.quota.mu.Unlock()
 	if fresh {
 		return nil

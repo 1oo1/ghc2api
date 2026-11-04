@@ -40,7 +40,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (runErr e
 	if err != nil {
 		return err
 	}
-	logger, logFile, err := newConfiguredLogger(config, stderr)
+	level := new(slog.LevelVar)
+	logger, logFile, err := newConfiguredLogger(config, stderr, level)
 	if err != nil {
 		return err
 	}
@@ -60,7 +61,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (runErr e
 				"mode", fmt.Sprintf("%04o", account.credentialMode))
 		}
 	}
-	return serve(ctx, config, logger)
+	return serve(ctx, config, configPath, logger, level)
 }
 
 func configPath(args []string) (string, error) {
@@ -74,11 +75,17 @@ func configPath(args []string) (string, error) {
 	}
 }
 
-func serve(ctx context.Context, config appConfig, logger *slog.Logger) error {
+// serve 启动 HTTP 服务。management_key 非空时，控制台可经 configFile 读取与修改 configPath 指向的配置文件；
+// level 是日志器使用的级别，配置保存后随 log_level 更新。
+func serve(ctx context.Context, config appConfig, configPath string, logger *slog.Logger, level *slog.LevelVar) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	pool, err := copilot.NewManagedPool(config.poolConfig(logger), config.poolAccounts())
+	poolConfig := config.poolConfig(logger)
+	if config.ManagementKey != "" {
+		poolConfig.ConfigStore = newConfigFile(configPath, config, level)
+	}
+	pool, err := copilot.NewManagedPool(poolConfig, config.poolAccounts())
 	if err != nil {
 		return err
 	}

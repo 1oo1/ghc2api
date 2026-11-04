@@ -14,13 +14,13 @@
 | 文档 | 何时阅读 | 对应代码 |
 | --- | --- | --- |
 | `README.md` | 了解项目概况与快速开始 | — |
-| `docs/config.md` | 修改配置项、启动流程、日志 | `cmd/ghc2api/config.go`、`main.go`、`logfile.go` |
+| `docs/config.md` | 修改配置项、启动流程、日志 | `cmd/ghc2api/config.go`、`configfile.go`、`main.go`、`logfile.go` |
 | `docs/credentials.md` | 修改凭证格式、目录扫描、用户名校验、凭证读写 | `cmd/ghc2api/credentials.go`、`internal/copilot/credentials.go`、`username.go` |
 | `docs/http-api.md` | 修改对外接口、鉴权、协议转发 | `internal/copilot/service.go`、`request.go`、`itemids.go`、`outputreplay.go` |
-| `docs/pool.md` | 修改账号选择、故障切换、冷却、风控记录、Pool 构造 | `internal/copilot/pool.go`、`cooldown.go`、`weight.go`、`riskblock.go` |
+| `docs/pool.md` | 修改账号选择、故障切换、冷却、风控记录、Pool 构造 | `internal/copilot/pool.go`、`cooldown.go`、`weight.go`、`riskblock.go`、`settings.go` |
 | `docs/session-affinity.md` | 修改会话键、绑定表、持久化 | `internal/copilot/affinity*.go` |
 | `docs/quota-stats.md` | 修改额度解析、刷新节流、持久化、请求统计 | `internal/copilot/quota.go` |
-| `docs/management.md` | 修改管理接口、账号导入、设备登录 | `internal/copilot/management*.go`、`logread.go`、`login.go` |
+| `docs/management.md` | 修改管理接口、账号导入、设备登录 | `internal/copilot/management*.go`（含 `management_config.go`）、`logread.go`、`login.go` |
 | `docs/web-console.md` | 修改控制台前端或其构建 | `web/` |
 | `docs/upstream.md` | 修改 session 交换、模型列表、请求身份头 | `internal/copilot/session.go`、`models.go`、`cache.go` |
 | `docs/development.md` | 运行测试、构建，查看来源与许可 | `Makefile` |

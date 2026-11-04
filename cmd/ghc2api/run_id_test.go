@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -56,7 +57,7 @@ func TestNewConfiguredLoggerStampsRunID(t *testing.T) {
 	logsDir := t.TempDir()
 	logger, file, err := newConfiguredLogger(appConfig{
 		LogsPath: logsDir, LogLevel: "debug", LogMaxSizeMB: 1, LogMaxBackups: 1, LogFileOnly: true,
-	}, &bytes.Buffer{})
+	}, &bytes.Buffer{}, new(slog.LevelVar))
 	if err != nil {
 		t.Fatalf("newConfiguredLogger() error = %v", err)
 	}
@@ -92,7 +93,7 @@ func TestNewConfiguredLoggerRunIDDiffersPerCall(t *testing.T) {
 		logsDir := t.TempDir()
 		logger, file, err := newConfiguredLogger(appConfig{
 			LogsPath: logsDir, LogLevel: "info", LogMaxSizeMB: 1, LogMaxBackups: 1, LogFileOnly: true,
-		}, &bytes.Buffer{})
+		}, &bytes.Buffer{}, new(slog.LevelVar))
 		if err != nil {
 			t.Fatalf("newConfiguredLogger() error = %v", err)
 		}

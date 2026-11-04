@@ -63,7 +63,7 @@ const managementSessionPath = managementAPIPrefix + "session"
 func (p *Pool) newManagementHandler() http.Handler {
 	api := http.NewServeMux()
 	api.HandleFunc("GET /v0/management/version", handleVersion)
-	api.HandleFunc("POST "+managementSessionPath, handleCreateSession(p.config.ManagementKey))
+	api.HandleFunc("POST "+managementSessionPath, handleCreateSession(p.managementKey.Load))
 	api.HandleFunc("GET /v0/management/accounts", p.handleListAccounts)
 	api.HandleFunc("POST /v0/management/accounts", p.handleImportAccount)
 	api.HandleFunc("PATCH /v0/management/accounts", p.handlePatchAccount)
@@ -72,11 +72,14 @@ func (p *Pool) newManagementHandler() http.Handler {
 	api.HandleFunc("POST /v0/management/login", p.handleStartLogin)
 	api.HandleFunc("GET /v0/management/login/status", p.handleLoginStatus)
 	api.HandleFunc("GET /v0/management/logs", p.handleGetLogs)
+	api.HandleFunc("GET /v0/management/config", p.handleGetConfig)
+	api.HandleFunc("POST /v0/management/config/validate", p.handleValidateConfig)
+	api.HandleFunc("PUT /v0/management/config", p.handlePutConfig)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /management", serveConsole)
 	mux.Handle(managementAPIPrefix, api)
-	return requireManagementKey(p.config.ManagementKey, p.log, withRequestLog(p.log, mux))
+	return requireManagementKey(p.managementKey.Load, p.log, withRequestLog(p.log, mux))
 }
 
 // isManagementPath 报告路径是否属于管理接口（控制台页面或 managementAPIPrefix 下的接口）。
@@ -88,13 +91,14 @@ func isManagementPath(path string) bool {
 // 管理密钥只能用于 POST /v0/management/session 换取控制台令牌（见 console_token.go），其余接口只接受有效令牌。
 // 只接受 Authorization: Bearer，不接受 X-Api-Key，因此服务访问密钥无法用来访问管理接口。
 // 校验在 next（含请求日志）之外，因此路径清理等 ServeMux 行为不会绕过它；清理前的路径不等于 session 路径，不接受管理密钥。
-// key 为空时拒绝所有管理接口请求（空密钥与 "Bearer " 后的空值哈希相同，不能交给 secretMatches）。
-func requireManagementKey(key string, logf logFunc, next http.Handler) http.Handler {
+// key 每次请求时调用（Pool 可在运行中切换管理密钥，旧密钥签发的令牌随之失效）；其返回值为空时拒绝所有管理接口请求（空密钥与 "Bearer " 后的空值哈希相同，不能交给 secretMatches）。
+func requireManagementKey(currentKey func() string, logf logFunc, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, managementAPIPrefix) {
 			next.ServeHTTP(w, r)
 			return
 		}
+		key := currentKey()
 		session := r.Method == http.MethodPost && r.URL.Path == managementSessionPath
 		value, found := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 		ok := key != "" && found &&
@@ -423,8 +427,8 @@ func (p *Pool) addVerifiedAccount(token, host, login, proxy string) (*poolAccoun
 	p.adminMu.Lock()
 	defer p.adminMu.Unlock()
 	service, err := New(Config{
-		Token: token, Host: host, User: login, APIKey: p.apiKey, CacheDir: p.config.CacheDir,
-		ModelsCacheTTL: p.config.ModelsCacheTTL, QuotaRefreshInterval: p.config.QuotaRefreshInterval,
+		Token: token, Host: host, User: login, APIKey: p.apiKey.Load(), CacheDir: p.config.CacheDir,
+		ModelsCacheTTL: p.modelsCacheTTL.Load(), QuotaRefreshInterval: p.quotaRefreshInterval.Load(),
 		Client: p.config.Client, Logger: p.logger, Proxy: proxy,
 	})
 	if err != nil {
@@ -451,6 +455,7 @@ func (p *Pool) addVerifiedAccount(token, host, login, proxy string) (*poolAccoun
 	}
 	account := p.newAccount(service, id)
 	p.mu.Lock()
+	p.syncSettingsLocked(service) // 补上创建账号期间可能发生的 ApplySettings
 	p.accounts = append(p.accounts, account)
 	p.mu.Unlock()
 	// 账号可能从缓存恢复了较新的 checked_at，因此不节流，入池后立即强制刷新。

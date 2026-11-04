@@ -8,10 +8,14 @@
 //   - ManagementClient.startLogin(proxy?: string)：proxy 非空时请求体为 { proxy }，否则不带请求体。
 //   - ManagementClient.getLogs(maxBytes?: number)：GET /v0/management/logs（有 maxBytes 时为 logs?max_bytes=<n>），
 //     返回 { text, truncated }，truncated 取自响应头 X-Log-Truncated === "true"；非 2xx 抛 ApiError。
+//   - ManagementClient.getConfig()：GET /v0/management/config，返回 ConfigSnapshot。
+//   - ManagementClient.validateConfig(content)：POST /v0/management/config/validate，请求体 {content}，返回 ConfigValidation。
+//   - ManagementClient.saveConfig(content, revision)：PUT /v0/management/config，请求体 {content, revision}，
+//     返回 ConfigSaveResult；非 2xx（如冲突 409）抛 ApiError 并保留 status。
 //   - ManagementClient.createSession()：发送 POST /v0/management/session，携带管理凭证或控制台令牌，
 //     返回 { token, expires_at }（ConsoleSession）。
 import { afterEach, expect, test, vi } from "vitest";
-import type { ConsoleSession } from "./api";
+import type { ConfigSaveResult, ConfigSnapshot, ConfigValidation, ConsoleSession } from "./api";
 import { ApiError, createManagementClient } from "./api";
 
 afterEach(() => {
@@ -289,4 +293,103 @@ test("getLogs 的错误体缺少消息时使用默认文案", async () => {
   expect(error).toBeInstanceOf(ApiError);
   expect((error as ApiError).status).toBe(500);
   expect((error as ApiError).message).toBe("请求失败（HTTP 500）");
+});
+
+// ---------------------------------------------------------------- 配置接口
+
+const configSnapshot: ConfigSnapshot = {
+  path: "/etc/ghc2api/config.yaml",
+  content: "listen: \":8080\"\n",
+  revision: "a".repeat(64),
+  writable: true,
+  restart_required: [],
+};
+
+test("getConfig 发送 GET /v0/management/config，携带令牌且无请求体", async () => {
+  const fetchMock = stubFetch(200, configSnapshot);
+
+  await createManagementClient("mgmt-key").getConfig();
+
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+  expect(url).toBe("/v0/management/config");
+  expect(init.method === undefined || init.method === "GET").toBe(true);
+  expect((init.headers as Record<string, string>).Authorization).toBe("Bearer mgmt-key");
+  expect(init.body).toBeUndefined();
+});
+
+test("getConfig 返回服务端的配置快照", async () => {
+  stubFetch(200, { ...configSnapshot, writable: false, restart_required: ["listen", "data_path"] });
+  await expect(createManagementClient("mgmt-key").getConfig()).resolves.toEqual({
+    ...configSnapshot,
+    writable: false,
+    restart_required: ["listen", "data_path"],
+  });
+});
+
+test("validateConfig 发送 POST /v0/management/config/validate，请求体为 { content }", async () => {
+  const fetchMock = stubFetch(200, { valid: true, restart_required: [] });
+  const content = "listen: \":9090\"\n# 注释\n";
+
+  await createManagementClient("mgmt-key").validateConfig(content);
+
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+  expect(url).toBe("/v0/management/config/validate");
+  expect(init.method).toBe("POST");
+  expect((init.headers as Record<string, string>).Authorization).toBe("Bearer mgmt-key");
+  expect(JSON.parse(init.body as string)).toEqual({ content });
+});
+
+test("validateConfig 返回校验结果；无效配置（HTTP 200）带 error 与 line", async () => {
+  const invalid: ConfigValidation = { valid: false, error: "yaml: line 3: bad", line: 3, restart_required: [] };
+  stubFetch(200, invalid);
+  await expect(createManagementClient("mgmt-key").validateConfig("x")).resolves.toEqual(invalid);
+
+  stubFetch(200, { valid: true, restart_required: ["listen"] });
+  await expect(createManagementClient("mgmt-key").validateConfig("x")).resolves.toEqual({
+    valid: true,
+    restart_required: ["listen"],
+  });
+});
+
+test("validateConfig 的错误保留服务端消息与状态码", async () => {
+  stubFetch(400, { error: { message: "请求体无效" } });
+  const error = await createManagementClient("mgmt-key").validateConfig("x").catch((e: unknown) => e);
+  expect(error).toBeInstanceOf(ApiError);
+  expect((error as ApiError).status).toBe(400);
+  expect((error as ApiError).message).toBe("请求体无效");
+});
+
+test("saveConfig 发送 PUT /v0/management/config，请求体为 { content, revision }", async () => {
+  const fetchMock = stubFetch(200, { revision: "b".repeat(64), changed: [], restart_required: [] });
+  const content = "listen: \":9090\"\n";
+
+  await createManagementClient("mgmt-key").saveConfig(content, configSnapshot.revision);
+
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+  expect(url).toBe("/v0/management/config");
+  expect(init.method).toBe("PUT");
+  expect((init.headers as Record<string, string>).Authorization).toBe("Bearer mgmt-key");
+  expect(JSON.parse(init.body as string)).toEqual({ content, revision: configSnapshot.revision });
+});
+
+test("saveConfig 返回新 revision、changed 与 restart_required", async () => {
+  const result: ConfigSaveResult = { revision: "b".repeat(64), changed: ["log_level", "management_key"], restart_required: ["listen"] };
+  stubFetch(200, result);
+  await expect(createManagementClient("mgmt-key").saveConfig("x", "r")).resolves.toEqual(result);
+});
+
+test.each<[number, string]>([
+  [409, "配置文件已被修改，请重新加载后再保存"],
+  [400, "配置无效：yaml: line 1: bad"],
+  [404, "未配置配置文件"],
+  [500, "写入配置文件失败"],
+])("saveConfig 的 HTTP %i 抛 ApiError，保留状态码与服务端消息", async (status, message) => {
+  stubFetch(status, { error: { message } });
+  const error = await createManagementClient("mgmt-key").saveConfig("x", "r").catch((e: unknown) => e);
+  expect(error).toBeInstanceOf(ApiError);
+  expect((error as ApiError).status).toBe(status);
+  expect((error as ApiError).message).toBe(message);
 });

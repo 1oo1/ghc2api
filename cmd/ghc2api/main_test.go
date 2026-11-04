@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -1165,7 +1166,7 @@ func TestConfiguredLoggerWritesStderrWhenFileWriteFails(t *testing.T) {
 	stderr := &bytes.Buffer{}
 	logger, file, err := newConfiguredLogger(appConfig{
 		LogsPath: t.TempDir(), LogLevel: "info", LogMaxSizeMB: 1, LogMaxBackups: 1,
-	}, stderr)
+	}, stderr, new(slog.LevelVar))
 	if err != nil {
 		t.Fatalf("newConfiguredLogger() error = %v", err)
 	}

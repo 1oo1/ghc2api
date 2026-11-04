@@ -56,10 +56,10 @@ func verifyConsoleToken(key, token string, now time.Time) bool {
 }
 
 // handleCreateSession 签发新的控制台令牌：用管理密钥调用即登录，用有效令牌调用即续期。
-// 鉴权已由 requireManagementKey 完成。
-func handleCreateSession(key string) http.HandlerFunc {
+// 鉴权已由 requireManagementKey 完成；key 每次请求时调用，令牌始终用当前管理密钥签名。
+func handleCreateSession(key func() string) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
-		token, expiresAt := issueConsoleToken(key, time.Now())
+		token, expiresAt := issueConsoleToken(key(), time.Now())
 		writeJSON(w, http.StatusOK, map[string]any{"token": token, "expires_at": expiresAt.UTC().Format(time.RFC3339)})
 	}
 }

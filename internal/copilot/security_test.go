@@ -245,7 +245,7 @@ func TestEmptyAPIKeyFailsClosed(t *testing.T) {
 		{"Authorization": "Bearer ", "X-Api-Key": ""},
 	}
 	t.Run("requireAPIKey", func(t *testing.T) {
-		handler := requireAPIKey("", noLog, ok)
+		handler := requireAPIKey(func() string { return "" }, noLog, ok)
 		for _, h := range headers {
 			r := httptest.NewRequest("GET", "/v1/models", nil)
 			for name, value := range h {
@@ -265,7 +265,7 @@ func TestEmptyAPIKeyFailsClosed(t *testing.T) {
 		}
 	})
 	t.Run("requireManagementKey", func(t *testing.T) {
-		handler := requireManagementKey("", noLog, ok)
+		handler := requireManagementKey(func() string { return "" }, noLog, ok)
 		for _, auth := range []string{"", "Bearer "} {
 			r := httptest.NewRequest("GET", "/v0/management/accounts", nil)
 			if auth != "" {

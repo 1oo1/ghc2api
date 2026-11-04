@@ -1,4 +1,4 @@
-// 应用入口组件：未登录时显示登录页；登录后显示控制台（账号页与日志页）。
+// 应用入口组件：未登录时显示登录页；登录后显示控制台（账号页、日志页与配置页）。
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   createManagementClient,
@@ -9,21 +9,25 @@ import {
   type LoginStart,
 } from "./api";
 import type { Actions } from "./actions";
+import { ConfirmDialog } from "./components/ConfirmDialog";
 import { DeviceLoginPanel } from "./components/DeviceLoginPanel";
 import { AccountsPage } from "./pages/AccountsPage";
+import { ConfigPage } from "./pages/ConfigPage";
 import { LogsPage } from "./pages/LogsPage";
 import { LoginPage } from "./pages/LoginPage";
 import { clearSession, loadSession, saveSession } from "./session";
+import { useConfig } from "./useConfig";
 import { useLogs } from "./useLogs";
 
 /** 账号列表自动刷新间隔（毫秒）。 */
 const REFRESH_INTERVAL_MS = 15_000;
 const EXPIRED_MESSAGE = "登录已失效，请重新输入管理密钥";
 
-type Page = "accounts" | "logs";
+type Page = "accounts" | "logs" | "config";
 const PAGES: [Page, string][] = [
   ["accounts", "账号"],
   ["logs", "日志"],
+  ["config", "配置"],
 ];
 
 export function App() {
@@ -87,8 +91,8 @@ export function App() {
 }
 
 /**
- * 已登录的控制台。负责页面切换、加载账号列表、定时刷新、执行变更操作与设备登录，并保存日志页的状态
- * （切换页面不丢失已加载的日志与筛选条件）；各页面只负责展示。组件卸载即丢弃全部状态（退出登录时）。
+ * 已登录的控制台。负责页面切换、加载账号列表、定时刷新、执行变更操作与设备登录，并保存日志页与配置页的状态
+ * （切换页面不丢失已加载的日志、筛选条件与未保存的配置修改）；各页面只负责展示。组件卸载即丢弃全部状态（退出登录时）。
  */
 function Console({
   credential,
@@ -126,6 +130,13 @@ function Console({
 
   const expire = useCallback(() => onExpire(EXPIRED_MESSAGE), [onExpire]);
   const logs = useLogs(client, expire);
+  const keyChanged = useCallback(
+    () => onExpire("管理密钥已更改，请使用新密钥重新登录"),
+    [onExpire],
+  );
+  const config = useConfig(client, expire, keyChanged);
+  /** 配置页有未保存修改时，刷新前先确认是否放弃。 */
+  const [confirmReload, setConfirmReload] = useState(false);
 
   const reload = useCallback(async () => {
     try {
@@ -186,6 +197,15 @@ function Console({
       setLogin(await client.startLogin(proxy));
     });
 
+  const refresh = () => {
+    if (page === "accounts") void reload();
+    else if (page === "logs") void logs.load();
+    else if (config.dirty) setConfirmReload(true);
+    else void config.load();
+  };
+  const refreshDisabled =
+    page === "accounts" ? busy : page === "logs" ? logs.loading : config.loading || config.saving;
+
   const actions: Actions = { client, busy, run, submit, fail };
 
   return (
@@ -212,10 +232,7 @@ function Console({
           ))}
         </nav>
         <div className="topbar-actions">
-          <button
-            onClick={() => void (page === "accounts" ? reload() : logs.load())}
-            disabled={page === "accounts" ? busy : logs.loading}
-          >
+          <button onClick={refresh} disabled={refreshDisabled}>
             ↻ 刷新
           </button>
           <button onClick={onLogout}>退出登录</button>
@@ -254,7 +271,18 @@ function Console({
           />
         </div>
         {page === "logs" && <LogsPage logs={logs} />}
+        {page === "config" && <ConfigPage config={config} />}
       </main>
+      {confirmReload && (
+        <ConfirmDialog
+          message="放弃未保存的修改并重新加载？"
+          onCancel={() => setConfirmReload(false)}
+          onConfirm={() => {
+            setConfirmReload(false);
+            void config.load();
+          }}
+        />
+      )}
     </div>
   );
 }

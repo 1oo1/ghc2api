@@ -199,7 +199,7 @@ var quotaIntervalCases = []struct {
 // 距上次尝试 want+1 分钟时请求上游。首次刷新没有尝试记录，必定请求。
 func assertQuotaIntervalGovernsRefresh(t *testing.T, a *poolAccount, up *mgmtUpstream, token string, want time.Duration) {
 	t.Helper()
-	if got := a.service.quotaRefreshInterval; got != want {
+	if got := a.service.quotaRefreshInterval.Load(); got != want {
 		t.Fatalf("Service.quotaRefreshInterval = %s, want %s", got, want)
 	}
 	ctx := context.Background()
@@ -274,7 +274,7 @@ func TestQuotaRefreshIntervalAppliesToManagementImport(t *testing.T) {
 	if carol == nil {
 		t.Fatal("导入后账号列表缺少 carol")
 	}
-	if got := carol.service.quotaRefreshInterval; got != 10*time.Minute {
+	if got := carol.service.quotaRefreshInterval.Load(); got != 10*time.Minute {
 		t.Fatalf("导入账号的 quotaRefreshInterval = %s, want 10m", got)
 	}
 	// 导入校验请求 1 次（入池之前），入池后的立即刷新 1 次；等它落地后再取基准次数，否则计数会多 1。

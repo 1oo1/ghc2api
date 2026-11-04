@@ -40,7 +40,13 @@ func newRunID() (string, error) {
 }
 
 // newConfiguredLogger 创建写入日志文件（及标准错误）的根日志器；其记录都带同一个 run_id 字段。
-func newConfiguredLogger(config appConfig, stderr io.Writer) (*slog.Logger, *rotatingLogWriter, error) {
+// 日志级别写入 level 并由它控制，之后修改 level 即可调整级别。
+func newConfiguredLogger(config appConfig, stderr io.Writer, level *slog.LevelVar) (*slog.Logger, *rotatingLogWriter, error) {
+	minimum, err := logLevel(config.LogLevel)
+	if err != nil {
+		return nil, nil, err
+	}
+	level.Set(minimum)
 	runID, err := newRunID()
 	if err != nil {
 		return nil, nil, err
@@ -58,12 +64,7 @@ func newConfiguredLogger(config appConfig, stderr io.Writer) (*slog.Logger, *rot
 	if config.LogFileOnly {
 		output.stderr = nil
 	}
-	logger, err := newLogger(config.LogLevel, output)
-	if err != nil {
-		_ = logFile.Close()
-		return nil, nil, err
-	}
-	return logger.With("run_id", runID), logFile, nil
+	return newLogger(level, output).With("run_id", runID), logFile, nil
 }
 
 type logOutputWriter struct {

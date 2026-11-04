@@ -1,6 +1,6 @@
 # 配置、启动与日志
 
-代码：`cmd/ghc2api/config.go`、`main.go`、`logfile.go`；字段说明见根目录 `config.example.yaml`。
+代码：`cmd/ghc2api/config.go`、`configfile.go`、`main.go`、`logfile.go`；字段说明见根目录 `config.example.yaml`。
 
 ## 启动
 
@@ -55,6 +55,26 @@ quota_refresh_interval: "1h"  # Go duration，必须 >= 1m，默认 1h
 - `appConfig.poolConfig(logger)` 生成 `copilot.PoolConfig`（`CredentialsDir=DataPath/credentials`、`CacheDir=DataPath/cache`、`QuotaRefreshInterval` 等），`poolAccounts()` 把凭证转换为 `[]copilot.PoolAccount`（保持文件名顺序）；`loadConfig` 与 `serve` 都经 `NewManagedPool` 建池。
 - `serve` 在 HTTP 服务开始监听后启动 `pool.RunQuotaRefresh`，随退出信号（或 serve 返回）取消；它不参与 HTTP 关闭等待，也不影响会话亲和的保存顺序。
 - 关闭时保存会话亲和表前，`saveSessionAffinity` 最多等待 5 秒进入冷却的异步副作用（`Pool.WaitCooldownEffectsTimeout`，清缓存、删绑定、写 `cooldown.json`）。超时记 Warn「会话亲和：等待冷却副作用超时，继续保存」并照常保存，因此关闭耗时至多增加 5 秒。
+
+## 控制台编辑与热更新
+
+代码：`cmd/ghc2api/configfile.go`（`configFile`，实现 `copilot.ConfigStore`）、`config.go` 的 `parseConfig`。接口见 `management.md`「配置读取与保存」，前端见 `web-console.md`。
+
+`parseConfig(path, data)` 是从 `loadConfig` 抽出的纯解析与校验（YAML 解码、字段校验到 `validateListen`，不访问文件系统、不加载账号）；`loadConfig` = 读文件 + `parseConfig` + 记录权限 + 加载账号与校验账号池，行为不变。控制台校验与保存都用 `parseConfig`，因此规则与启动完全一致。
+
+- 仅在 `management_key` 非空时启用（`serve` 才会创建 `configFile`）。
+- 字段分类（输出顺序固定）：
+  - 热更新（保存后立即生效）：`api_key`、`management_key`、`log_level`、`models_cache_ttl`、`quota_refresh_interval`、`session_affinity_max_per_account`、`account_cooldown`、`max_concurrent_requests`。
+  - 需重启：`listen`、`data_path`、`logs_path`、`host`、`log_to_stderr`、`log_max_size_mb`、`log_max_backups`、`session_affinity`、`session_affinity_ttl`。这些字段照常写入文件，但接口与控制台标出「需重启生效」。
+- 比较的是 `parseConfig` 规范化后的值：`session_affinity_ttl: 120m` 与 `2h` 相同，`data_path` 比较解析后的路径，密钥比较去除首尾空白后的值；只改注释时 `changed` 与 `restart_required` 都为空。`changed`（热更新字段）相对「当前已生效值」（保存成功后随之更新）；`restart_required`（需重启字段）相对「进程启动时的值」（永不更新）。
+- `revision` 是文件字节的 SHA-256 小写十六进制。保存时先比较 `revision` 与当前磁盘文件，不一致返回 409（文件已被外部修改，需重新加载）；再校验内容，无效返回 400；通过后才写文件。
+- 不能通过控制台把 `management_key` 清空：校验与保存都视为无效配置（`不能通过控制台清空 management_key（会导致控制台与管理接口不可用）`），否则控制台与管理接口会不可用。需要禁用管理接口时直接编辑文件并重启。
+- 写文件是原地写入（`O_WRONLY|O_TRUNC`，写完 `Sync`），不创建临时文件、不 `rename`。原因：Docker 单文件 bind mount 不能被 `rename` 替换（会报 `device or resource busy`，或使容器内外文件脱钩），符号链接也要保持；原地写入同时保留文件属主与权限。代价是写入不是原子的，写入过程中崩溃可能留下不完整的文件；写入失败（如磁盘已满）时 `Save` 会尽力把开头读到的原内容写回（经同一写入入口 `writeConfigContent`，恢复也失败时错误中一并带出恢复错误），已生效的值与日志级别只在写入成功后更新。文件内容原样保存，保留注释、引号与顺序。
+- 配置文件不可写（如 `:ro` 挂载，或没有写权限）时 `GET` 返回 `writable:false`，控制台只读展示。Docker 部署要在控制台编辑，需去掉 `docker-compose` 中配置文件挂载的 `:ro`，且文件属主须为容器用户（见 `docker-compose.example.yml`）。
+- `changed` 含 `management_key` 时，旧密钥签发的控制台令牌立即失效，控制台需用新密钥重新登录。
+- `validate` 不加载账号，因此修改 `data_path` 时不检查新凭证目录是否存在或其中的凭证是否有效；它只在重启时生效。
+- `healthcheck` 子命令读取的是磁盘上的配置，而运行中的服务可能仍在用启动时的 `listen`：控制台改了 `listen`（或 `data_path` 等需重启字段）但尚未重启时，健康检查可能请求到错误的地址而报不健康，重启后恢复。
+- 日志级别由 `*slog.LevelVar` 控制，`log_level` 保存后立即对新日志生效。
 
 ## 日志
 

@@ -48,14 +48,14 @@ func (s *Service) getModels(ctx context.Context, current session) (modelList, er
 		return modelList{}, err
 	}
 	defer s.modelsMu.unlock()
-	if modelCacheFresh(s.models.At, s.modelsCacheTTL) {
+	if modelCacheFresh(s.models.At, s.modelsCacheTTL.Load()) {
 		s.log(ctx, slog.LevelDebug, "复用缓存的 Copilot 模型列表", "model_count", len(s.models.Data))
 		return s.models, nil
 	}
 	if path := s.cacheFile("models"); path != "" {
 		var cached modelList
 		if err := readCacheFile(path, &cached); err == nil {
-			if modelCacheFresh(cached.At, s.modelsCacheTTL) {
+			if modelCacheFresh(cached.At, s.modelsCacheTTL.Load()) {
 				s.models = cached
 				s.log(ctx, slog.LevelDebug, "复用磁盘中的 Copilot 模型列表", "model_count", len(cached.Data))
 				return cached, nil

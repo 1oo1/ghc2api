@@ -1,6 +1,6 @@
 # 管理接口
 
-代码：`internal/copilot/management.go`、`management_login.go`、`management_logs.go`、`logread.go`、`login.go`。前端见 `web-console.md`。
+代码：`internal/copilot/management.go`、`management_login.go`、`management_logs.go`、`management_config.go`、`logread.go`、`login.go`。前端见 `web-console.md`。
 
 ## 启用与鉴权
 
@@ -26,6 +26,9 @@
 | `POST /v0/management/login` | 可选：空体或 `{"proxy":"socks5://…"}` | `200 {"state","url","user_code","interval","expires_in"}` |
 | `GET /v0/management/login/status?state=...` | — | `{"status":"pending"\|"success"\|"error","id"?,"error"?}`；未知 state 404 |
 | `GET /v0/management/logs?max_bytes=N` | `max_bytes` 可选 | 日志尾部原始 NDJSON 文本，见下文「日志读取」 |
+| `GET /v0/management/config` | — | `200 {"path","content","revision","writable","restart_required":[]}`，见下文「配置读取与保存」 |
+| `POST /v0/management/config/validate` | `{"content":"..."}` | `200 {"valid","error"?,"line"?,"restart_required":[]}` |
+| `PUT /v0/management/config` | `{"content":"...","revision":"..."}` | `200 {"revision","changed":[],"restart_required":[]}` |
 
 ```go
 type AccountView struct {
@@ -85,6 +88,22 @@ JSON 字段名为 `id`、`user`、`host`、`disabled`、`priority`、`cooldown_u
   - 从最新文件向前读，读够 `max_bytes` 即停止，不会把所有文件整体读入内存，更旧的文件不会被打开。
   - 结果只含完整的行：截断点落在行中间时丢弃首部残行；最后一个换行之后（正在写入的半行）丢弃；备份文件末尾缺换行时拼接处补一个，避免与下一文件的首行粘连。
 - 日志含用户提示词等内容（`debug` 级别还含完整上游正文），读取日志与其他管理接口同样要求控制台令牌。
+
+## 配置读取与保存
+
+代码：`internal/copilot/management_config.go`（路由、类型、错误）、`settings.go`（`ApplySettings`）；配置文件的读写与字段分类在 cmd 层 `cmd/ghc2api/configfile.go`（见 `config.md`「控制台编辑与热更新」）。
+
+- `PoolConfig.ConfigStore`（接口 `ConfigStore`：`Load`、`Validate`、`Save`）由 cmd 层实现并注入：`serve` 在 `management_key` 非空时创建 `configFile`；为 `nil` 时三个接口都返回 404，错误信息 `未配置配置文件`（写法同日志接口）。
+- `GET`：返回配置文件原文 `content`、`revision`（文件字节的 SHA-256 小写十六进制）、`writable`（文件能否以写方式打开）与 `restart_required`（磁盘内容中已修改、需重启才生效的字段；磁盘内容无法解析时为空）。所有数组字段输出 `[]` 而不是 `null`。读取失败 500。响应带 `Cache-Control: no-store`（内容含明文密钥，禁止缓存）。
+- `POST validate`：用与启动相同的规则校验 `content`，不写文件。无效配置也返回 200，`valid:false` 并带 `error` 与 `line`（错误信息中第一个 `line N`，提取不到则省略）；请求体不是合法 JSON 返回 400。`management_key` 为空也视为无效（不能通过控制台清空，否则会锁死控制台）。
+- `PUT`：校验 `revision` 与磁盘文件一致后再校验内容，通过则原地写入文件，并立即应用可热更新的字段。响应的 `changed` 是热更新字段中相对「当前已生效值」有变化的字段，`restart_required` 是需重启字段中相对「进程启动值」有变化的字段。
+  - 413：`PUT` 与 `POST validate` 的请求体超过 1 MiB（按 JSON 转义后的字节数计算，`decodeJSONBody` 经 `http.MaxBytesReader` 限制）。
+  - 400：请求体不是合法 JSON，`revision` 缺失或为空，或内容无效（`errors.Is(err, ErrConfigInvalid)`，消息为错误信息）。
+  - 409：`revision` 与磁盘文件不一致（`ErrConfigConflict`，文件已被修改，需重新加载后再保存）。
+  - 500：读取或写入配置文件失败等其他错误。
+  - 成功时在 `Pool.configMu` 内依次执行 `store.Save` 与 `Pool.ApplySettings(result.Settings)`，并发保存因此按顺序生效；随后输出 Info 日志 `配置已更新`，字段 `changed`、`restart_required`，不记录任何配置值。
+- `ApplySettings(RuntimeSettings)` 应用的字段：`api_key`、`management_key`（旧密钥签发的控制台令牌立即失效，新令牌用新密钥签名）、`models_cache_ttl`、`quota_refresh_interval`、`account_cooldown`、`session_affinity_max_per_account`、`max_concurrent_requests`；`log_level` 由 cmd 层的 `slog.LevelVar` 处理。`api_key` 与 `management_key` 为空（含纯空白）时忽略；时长 `<=0` 取默认值；绑定上限与并发上限 `<=0` 表示不限制。`PoolConfig` 中的对应字段只是初始值，运行中以 `ApplySettings` 的值为准。
+- `changed` 含 `management_key` 时，现有控制台令牌全部失效，控制台需用新密钥重新登录。
 
 ## 导入账号
 

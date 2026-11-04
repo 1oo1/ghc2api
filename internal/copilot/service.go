@@ -30,10 +30,11 @@ type Service struct {
 	upstream atomic.Pointer[upstreamClient]
 	logger   *slog.Logger
 
-	cacheDir       string
-	modelsCacheTTL time.Duration
+	cacheDir string
+	// modelsCacheTTL 与 quotaRefreshInterval 可由 Pool.ApplySettings 在运行中修改，读写都经原子操作。
+	modelsCacheTTL liveDuration
 	// quotaRefreshInterval 是额度非强制刷新的节流窗口（见 quota.go 的 refresh）。
-	quotaRefreshInterval time.Duration
+	quotaRefreshInterval liveDuration
 	// cacheMu 串行化缓存写入与账号删除，cacheRemoved 为账号已删除的标记（见 writeCache、removeCache）。
 	cacheMu      sync.RWMutex
 	cacheRemoved bool
@@ -111,9 +112,11 @@ func New(config Config) (*Service, error) {
 	service := &Service{
 		config: config, refused: make(map[string]refusedModel),
 		logger: config.Logger, secrets: make(map[string]struct{}),
-		cacheDir: cacheDir, modelsCacheTTL: modelsCacheTTL, quotaRefreshInterval: quotaRefreshInterval,
+		cacheDir:  cacheDir,
 		sessionMu: make(contextMutex, 1), modelsMu: make(contextMutex, 1),
 	}
+	service.modelsCacheTTL.Store(modelsCacheTTL)
+	service.quotaRefreshInterval.Store(quotaRefreshInterval)
 	service.upstream.Store(&upstreamClient{client: client, proxy: config.Proxy})
 	service.addSecret(config.Token)
 	service.addSecret(config.APIKey)
@@ -149,7 +152,8 @@ func (s *Service) useProxyClient(client *http.Client, proxy string) {
 
 // Handler 返回原协议 HTTP 接口，不在三种生成协议之间转换。鉴权在请求日志之外：未通过鉴权的请求不输出请求日志。
 func (s *Service) Handler() http.Handler {
-	return withRequestID(s.logger, &s.requestSeq, requireAPIKey(s.config.APIKey, s.log, withRequestLog(s.log, s.routes().mux)))
+	// 单独使用 Service 时 api_key 固定为构造时的值，不支持热更新（生产路径使用 Pool.Handler）。
+	return withRequestID(s.logger, &s.requestSeq, requireAPIKey(func() string { return s.config.APIKey }, s.log, withRequestLog(s.log, s.routes().mux)))
 }
 
 // routeNeed 描述路由访问上游的方式，决定 Pool 如何分发请求。
@@ -202,13 +206,13 @@ func (t serviceRoutes) handle(method, path string, handler http.HandlerFunc, ent
 	t.entries[pattern] = entry
 }
 
-// requireAPIKey 对除 /healthz、/favicon.ico 外的请求校验服务访问密钥。apiKey 为空时拒绝所有需鉴权的请求（失败即拒绝），
+// requireAPIKey 对除 /healthz、/favicon.ico 外的请求校验服务访问密钥；apiKey 每次请求时调用，以便 Pool 在运行中切换密钥。其返回值为空时拒绝所有需鉴权的请求（失败即拒绝），
 // 构造函数也会拒绝空密钥，这里是第二道防线。
 // Service 与 Pool 共用此中间件，未通过时输出鉴权告警（见 logAuthFailure）并返回 401。
-func requireAPIKey(apiKey string, logf logFunc, next http.Handler) http.Handler {
+func requireAPIKey(apiKey func() string, logf logFunc, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		skipped := r.URL.Path == "/healthz" || r.URL.Path == "/favicon.ico"
-		if !skipped && !authorizedRequest(apiKey, r) {
+		if !skipped && !authorizedRequest(apiKey(), r) {
 			logAuthFailure(logf, r, "客户端鉴权失败")
 			writeError(w, http.StatusUnauthorized, "服务访问密钥无效或缺失")
 			return

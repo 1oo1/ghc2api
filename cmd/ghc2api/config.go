@@ -88,6 +88,7 @@ type accountConfig struct {
 }
 
 // loadConfig 只读取 YAML 中的设置，不读取环境变量或命令行覆盖项。
+// 配置内容的解析与校验见 parseConfig；这里额外读取文件、记录权限，并加载账号、校验账号池。
 func loadConfig(path string) (appConfig, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -103,6 +104,37 @@ func loadConfig(path string) (appConfig, error) {
 	if err != nil {
 		return appConfig{}, fmt.Errorf("无法读取配置文件 %q: %w", path, err)
 	}
+	config, err := parseConfig(path, data)
+	if err != nil {
+		return appConfig{}, err
+	}
+	config.configMode = info.Mode().Perm()
+	config.insecurePermissions = runtime.GOOS != "windows" && config.configMode&0o077 != 0
+
+	credentialsDir := filepath.Join(config.DataPath, credentialsDirName)
+	// 启用管理接口时可以从零个账号开始，因此凭证目录不存在时自动创建，并允许没有凭证文件。
+	allowEmpty := config.ManagementKey != ""
+	if allowEmpty {
+		if err := os.MkdirAll(credentialsDir, 0o700); err != nil {
+			return appConfig{}, fmt.Errorf("无法创建 credentials 目录 %q: %w", credentialsDir, err)
+		}
+	}
+	config.Accounts, err = loadAccounts(credentialsDir, config.Host, allowEmpty)
+	if err != nil {
+		return appConfig{}, err
+	}
+	// 启动前用与 serve 相同的配置校验账号，确保 loadConfig 通过即可创建账号池。
+	// 校验用的池立即丢弃，因此其日志也丢弃：否则绑定文件损坏时的 Warn 会输出到默认 logger，并与 serve 输出的重复。
+	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if _, err := copilot.NewManagedPool(config.poolConfig(discard), config.poolAccounts()); err != nil {
+		return appConfig{}, err
+	}
+	return config, nil
+}
+
+// parseConfig 解析并校验配置内容（与启动相同的规则），不访问文件系统、不加载账号。
+// path 用于解析相对路径与错误信息。
+func parseConfig(path string, data []byte) (appConfig, error) {
 	if len(data) > maxConfigSize {
 		return appConfig{}, fmt.Errorf("配置文件 %q 超过 1 MiB 限制", path)
 	}
@@ -120,9 +152,6 @@ func loadConfig(path string) (appConfig, error) {
 		}
 		return appConfig{}, fmt.Errorf("配置文件 %q 包含无效的尾随内容: %w", path, err)
 	}
-	config.configMode = info.Mode().Perm()
-	config.insecurePermissions = runtime.GOOS != "windows" && config.configMode&0o077 != 0
-
 	config.Listen = strings.TrimSpace(config.Listen)
 	if config.Listen == "" {
 		config.Listen = "127.0.0.1:8080"
@@ -243,25 +272,6 @@ func loadConfig(path string) (appConfig, error) {
 	if err := validateListen(config.Listen); err != nil {
 		return appConfig{}, err
 	}
-
-	credentialsDir := filepath.Join(config.DataPath, credentialsDirName)
-	// 启用管理接口时可以从零个账号开始，因此凭证目录不存在时自动创建，并允许没有凭证文件。
-	allowEmpty := config.ManagementKey != ""
-	if allowEmpty {
-		if err := os.MkdirAll(credentialsDir, 0o700); err != nil {
-			return appConfig{}, fmt.Errorf("无法创建 credentials 目录 %q: %w", credentialsDir, err)
-		}
-	}
-	config.Accounts, err = loadAccounts(credentialsDir, config.Host, allowEmpty)
-	if err != nil {
-		return appConfig{}, err
-	}
-	// 启动前用与 serve 相同的配置校验账号，确保 loadConfig 通过即可创建账号池。
-	// 校验用的池立即丢弃，因此其日志也丢弃：否则绑定文件损坏时的 Warn 会输出到默认 logger，并与 serve 输出的重复。
-	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
-	if _, err := copilot.NewManagedPool(config.poolConfig(discard), config.poolAccounts()); err != nil {
-		return appConfig{}, err
-	}
 	return config, nil
 }
 
@@ -341,10 +351,7 @@ func logLevel(value string) (slog.Level, error) {
 	}
 }
 
-func newLogger(level string, output io.Writer) (*slog.Logger, error) {
-	minimum, err := logLevel(level)
-	if err != nil {
-		return nil, err
-	}
-	return slog.New(slog.NewJSONHandler(output, &slog.HandlerOptions{Level: minimum})), nil
+// newLogger 创建 JSON 日志器，最低级别由 level 决定；level 可在运行中修改（见 configFile.Save）。
+func newLogger(level *slog.LevelVar, output io.Writer) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(output, &slog.HandlerOptions{Level: level}))
 }

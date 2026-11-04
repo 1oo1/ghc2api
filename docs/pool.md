@@ -5,7 +5,7 @@
 ## 结构与构造
 
 - `Pool.accounts []*poolAccount` 保持插入顺序：启动时为凭证文件名顺序，管理接口新增的追加到末尾。ID 只用于查找与唯一性。
-- `poolAccount`：`id`、`service *Service`、`routes`、`disabled`、`priority`、`swrrCurrent`（轮询状态）、`cooldown`（冷却时长）、`affinity`（会话绑定表，冷却时清理用）、`errs`（连续错误计数与冷却原因，见 `cooldown.go`）、请求统计、额度缓存。各账号的 session 与缓存相互独立。
+- `poolAccount`：`id`、`service *Service`、`routes`、`disabled`、`priority`、`swrrCurrent`（轮询状态）、`cooldown`（账号固定的冷却时长，池内账号为 0）、`cooldownSrc`（池的当前冷却时长，见下文「冷却」）、`affinity`（会话绑定表，冷却时清理用）、`errs`（连续错误计数与冷却原因，见 `cooldown.go`）、请求统计、额度缓存。各账号的 session 与缓存相互独立。
 - 被选中的账号指针在请求期间独立使用，删除账号不影响进行中的请求。
 
 ```go
@@ -13,7 +13,7 @@ NewPool(configs []Config) (*Pool, error)   // 亲和与管理关闭，至少 1 �
 NewManagedPool(PoolConfig, []PoolAccount) (*Pool, error)
 ```
 
-- `PoolConfig`：`APIKey`、`ManagementKey`、`CredentialsDir`、`Host`（顶层覆盖）、`CacheDir`（测试须指向 `t.TempDir()`）、`ModelsCacheTTL`、`SessionAffinityTTL`（≤0 关闭亲和）、`SessionAffinityMaxPerAccount`（每账号有效绑定数上限，≤0 不限制；缺省 5 由 cmd 层设置，见 `session-affinity.md`）、`AccountCooldown`（账号冷却时长，≤0 使用 `DefaultAccountCooldown` = 2 小时；cmd 层由 `account_cooldown` 设置，见 `config.md`）、`MaxConcurrentRequests`（生成请求并发上限，≤0 不限制；缺省 32 由 cmd 层设置，见下文「分发」流程）、`Client`（测试注入）、`Logger`。
+- `PoolConfig`：`APIKey`、`ManagementKey`、`CredentialsDir`、`Host`（顶层覆盖）、`CacheDir`（测试须指向 `t.TempDir()`）、`ModelsCacheTTL`、`SessionAffinityTTL`（≤0 关闭亲和）、`SessionAffinityMaxPerAccount`（每账号有效绑定数上限，≤0 不限制；缺省 5 由 cmd 层设置，见 `session-affinity.md`）、`AccountCooldown`（账号冷却时长，≤0 使用 `DefaultAccountCooldown` = 2 小时；cmd 层由 `account_cooldown` 设置，见 `config.md`）、`MaxConcurrentRequests`（生成请求并发上限，≤0 不限制；缺省 32 由 cmd 层设置，见下文「分发」流程）、`ConfigStore`（控制台读写配置文件的存储，nil 不提供配置接口，见 `management.md`）、`Client`（测试注入）、`Logger`。其中密钥、`ModelsCacheTTL`、`QuotaRefreshInterval`、`SessionAffinityMaxPerAccount`、`AccountCooldown`、`MaxConcurrentRequests` 只是初始值，运行中可由 `Pool.ApplySettings` 修改（`settings.go`）。
 - `(*Pool).WaitCooldownEffectsTimeout(d) bool`：最多等待 d，等待进入冷却的异步副作用（清空缓存、删除绑定、写 `cooldown.json`）全部结束；超时返回 false。cmd 层关闭时使用（`d` 为 5 秒，见 `config.md`）。`(*Pool).WaitCooldownEffects()` 无上界，供测试使用。
 - `APIKey` 必填（失败即拒绝）：`New`、`NewPool`、`NewManagedPool` 在 `APIKey` 去首尾空白后为空时返回错误；`requireAPIKey` 收到空密钥时拒绝除 `/healthz`、`/favicon.ico` 外的所有请求，`requireManagementKey` 收到空管理密钥时同样拒绝（空密钥与空请求头的哈希相同，不能交给 `secretMatches` 比较）。库层只要求非空，32 字节的长度下限由 cmd 配置层（`loadConfig`）强制。
 - `PoolAccount`：`Token`、`Host`、`User`（必填）、`Disabled`、`Priority`。
@@ -66,7 +66,7 @@ flowchart TD
     R -- "其他 ≥400" --> R2["失败数 +1；按状态码计入错误（见下图）<br/>429 不刷新额度，其他 ≥400 异步刷新额度<br/>（客户端取消时不计数、不刷新）"]
 ```
 
-生成请求占用的并发名额在 `dispatch` 返回时释放（流式响应写完之后），因此名额覆盖整个流式响应的时长。名额只用缓冲 channel 做信号量，不排队等待；名额已满时立即 503，与账号选择、会话亲和互不影响。
+生成请求占用的并发名额在 `dispatch` 返回时释放（流式响应写完之后），因此名额覆盖整个流式响应的时长。名额由互斥锁保护的在途计数加上限实现（`generationLimiter`），不排队等待；在途数不低于上限时立即 503，与账号选择、会话亲和互不影响。上限可由 `ApplySettings` 热更新：调低后进行中的请求不中断，在途数降到新上限以下之前新的生成请求返回 503；调高或改为不限制（`<=0`）立即放行。
 生成响应向客户端写入时每次写入都续期 60 秒的写超时（`generationWriteTimeout`，见 `http-api.md`）：客户端长时间不读取导致写超时后，请求结束并释放名额，因此一个不读取响应的客户端不会永久占用名额。
 
 同一会话键的选择、取 session、绑定由 `pickSession` 在会话门（`keyGate`）内串行执行，后到的同键请求等待先到者完成绑定后再选账号（见 `session-affinity.md`「选择规则」）。门在成功绑定之后、`serve` 之前释放；全部失败（503 或最后账号的错误）与客户端取消时，门在 `pickSession` 返回前释放（`defer`），错误响应在门外写入。等待门时客户端取消则直接返回，不选账号、不推进轮询、不写响应。等待时长受请求 ctx 约束、没有服务端总超时，最坏约为账号数 × 单次取 session 超时（30 秒），细则见 `session-affinity.md`。亲和关闭或键为空时不加门。
@@ -112,7 +112,7 @@ flowchart TD
 - 只修改组内成员的 `swrrCurrent`，因此最优档之外的账号状态不变。
 - 命中会话绑定时直接使用绑定账号（受下条 Credits 让位约束），不推进轮询，也不受每账号绑定上限限制（见 `session-affinity.md`）。绑定账号冷却中时视为不可用，改为无可用绑定的选择。
 - Credits 让位：绑定账号无 Credits（主额度剩余不大于 0，含无额度数据），而当前最优档（排除禁用、冷却、耗尽、本请求已尝试后的最优档）有 Credits 时，绑定视为不可用，改为无可用绑定的选择，之后改绑到新账号；最优档也无 Credits（例如更高优先级的账号同样无 Credits）时继续使用绑定账号。绑定账号自身有 Credits 时，即使存在更高优先级的账号也继续使用。注意 `unlimited` 账号与尚无额度数据的账号都按无 Credits 计，池中有其他有 Credits 的账号时，绑在它们上的会话会让位。
-- 无可用绑定的会话（新会话或故障切换）且键非空、开启亲和时，先取最优档，再在最优档内排除有效绑定数已达 `SessionAffinityMaxPerAccount` 的账号，对剩余账号做 SWRR。最优档全满时忽略上限，对整个最优档做 SWRR，因此上限绝不会把新会话降到低优先级或无 Credits 档，也不会因此返回 503；冷却账号本来就不是候选，因此上限也不会把会话推向冷却账号。`SessionAffinityMaxPerAccount <= 0` 时不排除；键为空或关闭亲和时上限无效。细则见 `session-affinity.md` 的「绑定上限」。
+- 无可用绑定的会话（新会话或故障切换）且键非空、开启亲和时，先取最优档，再在最优档内排除有效绑定数已达 `SessionAffinityMaxPerAccount` 的账号，对剩余账号做 SWRR。最优档全满时忽略上限，对整个最优档做 SWRR，因此上限绝不会把新会话降到低优先级或无 Credits 档，也不会因此返回 503；冷却账号本来就不是候选，因此上限也不会把会话推向冷却账号。`SessionAffinityMaxPerAccount <= 0` 时不排除（该上限与并发上限、冷却时长、密钥、模型缓存有效期、额度刷新间隔一样可由 `ApplySettings` 热更新，之后的选择立即使用新值，见 `management.md`「配置读取与保存」；实现见 `settings.go`）；键为空或关闭亲和时上限无效。细则见 `session-affinity.md` 的「绑定上限」。
 
 其他说明：
 
@@ -164,7 +164,7 @@ flowchart TD
 
 冷却：
 
-- 时长由 `account_cooldown` 配置（缺省 `2h`，见 `config.md`；402 例外，见上），库层 `PoolConfig.AccountCooldown <= 0` 时使用 `DefaultAccountCooldown`。原来的 1 分钟短冷却已取消。
+- 时长由 `account_cooldown` 配置（缺省 `2h`，见 `config.md`；402 例外，见上），库层 `PoolConfig.AccountCooldown <= 0` 时使用 `DefaultAccountCooldown`。冷却时长可由 `ApplySettings` 热更新：账号进入冷却时读取池的当前值（`poolAccount.cooldownDuration`，`NewPool` 路径与未接入池的账号使用缺省值），已在冷却中的截止时间不变。原来的 1 分钟短冷却已取消。
 - 冷却期间账号完全不参与选择（与额度耗尽一样跳过），会话绑定指向冷却账号时视为不可用；全部账号不可用时返回 503。
 - 冷却原因 `reason`：触发那次错误的状态码字符串（如 `401`、`402`、`403`、`429`，上游真实返回的 `502`），网络错误等无状态码时为 `network`。
 - 进入冷却时，截止时间与原因的设置、计数清零同步完成，并同步输出一条 Warn 日志（含账号、原因与截止时间（RFC3339），不含 token），触发冷却的响应立即返回。随后的副作用在后台异步执行，不阻塞请求，也不随请求取消，顺序固定：

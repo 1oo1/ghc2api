@@ -14,7 +14,7 @@ services:
       - "127.0.0.1:8080:8080"
     volumes:
       # 配置文件只读挂载到数据目录中；凭证、会话亲和与额度缓存、日志（默认在 /data/data、/data/logs）保存在命名卷里。
-      - ./config.yaml:/data/config.yaml:ro
+      - ./config.yaml:/data/config.yaml
       - ghc2api-data:/data
 
 volumes:

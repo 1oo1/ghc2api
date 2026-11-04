@@ -68,6 +68,34 @@ export type ConsoleSession = {
   expires_at: string;
 };
 
+/** 配置文件快照，与服务端 ConfigSnapshot 一致。 */
+export type ConfigSnapshot = {
+  path: string;
+  content: string;
+  /** 内容的 sha256，保存时用于检测文件是否已被外部修改。 */
+  revision: string;
+  /** 配置文件不可写（如只读挂载）时为 false。 */
+  writable: boolean;
+  /** 文件内容中与进程启动值不同、需重启才生效的字段。 */
+  restart_required: string[];
+};
+
+/** 配置校验结果；无效配置同样是 HTTP 200，valid 为 false。 */
+export type ConfigValidation = {
+  valid: boolean;
+  error?: string;
+  /** 错误所在行（从 1 起），无法定位时不存在。 */
+  line?: number;
+  restart_required: string[];
+};
+
+/** 保存配置的结果：changed 为已热更新生效的字段，restart_required 为需重启生效的字段。 */
+export type ConfigSaveResult = {
+  revision: string;
+  changed: string[];
+  restart_required: string[];
+};
+
 /** 服务端返回的非 2xx 错误，保留 HTTP 状态码便于区分处理。 */
 export class ApiError extends Error {
   readonly status: number;
@@ -167,6 +195,13 @@ export function createManagementClient(credential: string) {
       request<LoginStatus>(
         `login/status?state=${encodeURIComponent(state)}`,
       ),
+    getConfig: () => request<ConfigSnapshot>("config"),
+    /** 由服务端校验配置内容（与启动时相同的规则）。 */
+    validateConfig: (content: string) =>
+      request<ConfigValidation>("config/validate", "POST", { content }),
+    /** revision 为读取时得到的值；文件已被修改时服务端返回 409。 */
+    saveConfig: (content: string, revision: string) =>
+      request<ConfigSaveResult>("config", "PUT", { content, revision }),
     /** 读取日志尾部原始文本（NDJSON）；maxBytes 缺省时不带参数（服务端默认 8 MiB）。 */
     getLogs: async (
       maxBytes?: number,

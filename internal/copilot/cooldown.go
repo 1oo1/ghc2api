@@ -78,7 +78,7 @@ func (a *poolAccount) countFailure(ctx context.Context, rule failureRule, reason
 		return false
 	}
 	now := time.Now()
-	until := now.Add(a.cooldown)
+	until := now.Add(a.cooldownDuration())
 	if rule == ruleUntilReset {
 		until = a.untilResetDeadline(now) // 在 errs.mu 之外读取额度缓存，避免嵌套加锁
 	}
@@ -103,7 +103,7 @@ func (a *poolAccount) countFailure(ctx context.Context, rule failureRule, reason
 }
 
 // untilResetDeadline 返回 402 冷却的截止时间：缓存额度中主额度的重置时刻；
-// 没有额度数据、没有主额度、重置时间不可解析或不晚于 now 时退回 now + a.cooldown。
+// 没有额度数据、没有主额度、重置时间不可解析或不晚于 now 时退回 now + 冷却时长（见 cooldownDuration）。
 // 额外预算用尽不会自行恢复，冷却到重置时刻可避免反复试探；付款后可手动解除冷却（clear_cooldown）。
 func (a *poolAccount) untilResetDeadline(now time.Time) time.Time {
 	quota, _ := a.quota.snapshot()
@@ -112,7 +112,7 @@ func (a *poolAccount) untilResetDeadline(now time.Time) time.Time {
 			return reset
 		}
 	}
-	return now.Add(a.cooldown)
+	return now.Add(a.cooldownDuration())
 }
 
 // countSessionFailure 计入一次 session 获取失败：上游错误按其状态码计入；其他错误（网络等）按网络错误计入。
