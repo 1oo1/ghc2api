@@ -37,6 +37,7 @@ type PoolConfig struct {
 	// 名额已满时立即返回 503，不读取请求体、不选账号；名额在请求处理结束（含流式响应结束）后释放。
 	// 模型列表、健康检查与管理接口不占用名额。缺省值由 cmd 层设置（32）。
 	MaxConcurrentRequests int
+	LogFile               string       // 当前日志文件的完整路径，控制台据此读取日志（含滚动备份）；空表示未配置
 	Client                *http.Client // 访问 GitHub/Copilot 的客户端（测试注入），新增账号与设备登录也使用它
 	Logger                *slog.Logger
 }

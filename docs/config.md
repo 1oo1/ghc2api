@@ -59,6 +59,8 @@ quota_refresh_interval: "1h"  # Go duration，必须 >= 1m，默认 1h
 ## 日志
 
 - JSON 格式写入 `<logs_path>/ghc2api.log` 并默认同步输出到标准错误；`log_to_stderr: false` 时只写文件，终端不再打印（启动失败等致命错误仍输出到标准错误；容器中关闭后 `docker logs` 看不到服务日志，需从 `logs_path` 读取）；级别 `debug`/`info`/`warn`/`error`。
+- 每条日志都带字段 `run_id`：进程启动时用 `crypto/rand` 生成的 16 位小写十六进制字符串（`newRunID`），同一进程内的所有记录相同，每次启动不同。`request_id` 每次启动都从 1 重新计数，控制台据此区分不同次运行的同号请求。
+- 控制台可读取这些日志（含滚动备份），见 `web-console.md`「日志页」与 `management.md`「日志读取」。
 - `log_to_stderr: false` 时没有兜底：日志文件写入失败（如磁盘满），或单条记录超过 `log_max_size_mb`（`debug` 级别记录完整上游正文时可能发生）时，该记录会被丢弃，且不会输出到标准错误；默认的同时输出模式下标准错误仍有这些记录。
 - 单文件上限默认 10 MiB，保留 5 个备份；用 `log_max_size_mb`、`log_max_backups` 调整（备份数 `0` 表示不保留）。
 - 同一 `logs_path` 只应由一个进程使用。

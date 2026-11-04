@@ -20,7 +20,8 @@ body {
   margin: 0;
 }
 button,
-input {
+input,
+select {
   font: inherit;
 }
 button,
@@ -67,7 +68,15 @@ input {
   padding: 10px 12px;
   min-width: 0;
 }
-input:focus {
+select {
+  background: #fcfcfa;
+  color: #243d32;
+  border: 1px solid #d8e1d9;
+  border-radius: 7px;
+  padding: 9px 10px;
+}
+input:focus,
+select:focus {
   outline: 2px solid #93c5ae;
   outline-offset: 1px;
 }
@@ -121,6 +130,30 @@ label {
 .topbar-actions {
   display: flex;
   gap: 8px;
+}
+/* 顶栏的页面切换：分段按钮组，当前页高亮 */
+.page-switch {
+  display: flex;
+  margin-right: auto;
+  margin-left: 24px;
+}
+.page-switch button {
+  border-radius: 0;
+  padding: 7px 18px;
+}
+.page-switch button + button {
+  margin-left: -1px;
+}
+.page-switch button:first-child {
+  border-radius: 8px 0 0 8px;
+}
+.page-switch button:last-child {
+  border-radius: 0 8px 8px 0;
+}
+.page-switch button.active {
+  background: #1d6551;
+  border-color: #1d6551;
+  color: #fff;
 }
 .brand {
   display: flex;
@@ -419,6 +452,31 @@ th[aria-sort="none"] .sort-header span {
   border-color: #d5dad2;
   color: #7d887f;
 }
+/* 日志页的状态码与级别徽标：2xx 绿、3xx 黄、4xx/5xx 红，无状态灰 */
+.badge.tone-success,
+.badge.level-info {
+  background: #eef6ec;
+  border-color: #d2e3d5;
+  color: #4f7358;
+}
+.badge.tone-redirect,
+.badge.level-warn {
+  background: #fff3dd;
+  border-color: #e9ce99;
+  color: #8a5a28;
+}
+.badge.tone-error,
+.badge.level-error {
+  background: #fdeceb;
+  border-color: #ebc3bf;
+  color: #a93a37;
+}
+.badge.tone-none,
+.badge.level-debug {
+  background: #eef0ec;
+  border-color: #d5dad2;
+  color: #5f6a63;
+}
 
 /* 额度区域 */
 .quota {
@@ -613,6 +671,182 @@ button.link:hover {
   margin-right: auto;
 }
 
+/* 日志页 */
+.logs-toolbar {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.logs-size {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.logs-filter {
+  flex: 1;
+  max-width: 420px;
+}
+.logs-status {
+  margin: 0 0 12px;
+  font-size: 12px;
+  color: #5c6b60;
+}
+.log-groups {
+  display: grid;
+  gap: 8px;
+}
+.log-group {
+  background: #fcfdf9;
+  border: 1px solid #e0e5da;
+  border-radius: 10px;
+  overflow: hidden;
+}
+.log-group-head {
+  width: 100%;
+  justify-content: flex-start;
+  gap: 12px;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  padding: 10px 14px;
+  text-align: left;
+  font-size: 12px;
+}
+.log-group-head:hover {
+  background: #f1f6f2;
+}
+.log-caret {
+  width: 10px;
+  color: #5c6b60;
+}
+.log-time,
+.log-rid,
+.log-duration,
+.log-count {
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  color: #5c6b60;
+}
+.log-rid {
+  min-width: 44px;
+  color: #3e5546;
+}
+.log-run {
+  font-size: 11px;
+  color: #5c6b60;
+}
+.log-route {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #22312c;
+  font-weight: 600;
+}
+.log-duration {
+  min-width: 64px;
+  text-align: right;
+}
+.log-items {
+  list-style: none;
+  margin: 0;
+  padding: 4px 14px 10px;
+  border-top: 1px solid #eaf0e3;
+}
+.log-item {
+  padding: 8px 0;
+  border-bottom: 1px solid #f0f4ea;
+}
+.log-item:last-child {
+  border-bottom: 0;
+}
+.log-item-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  font-size: 12px;
+}
+.log-msg {
+  color: #22312c;
+  font-weight: 600;
+}
+.log-field {
+  color: #5c6b60;
+  word-break: break-all;
+}
+.log-field b {
+  color: #5c6b60;
+  font-weight: 500;
+}
+.log-status {
+  font-weight: 600;
+}
+.log-status.tone-success {
+  color: #2f7050;
+}
+.log-status.tone-redirect {
+  color: #8a5a28;
+}
+.log-status.tone-error {
+  color: #a93a37;
+}
+.log-fold {
+  margin-top: 6px;
+  font-size: 12px;
+}
+.log-fold > summary {
+  cursor: pointer;
+  color: #5c6b60;
+  user-select: none;
+}
+.log-fold > summary:hover {
+  color: #1d6551;
+}
+.log-warn {
+  font-style: normal;
+  color: #8a5a28;
+}
+.code-note {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: #8a5a28;
+}
+.log-more {
+  justify-self: center;
+}
+
+/* 代码块：等宽、横向与纵向滚动；高亮记号的配色 */
+.code-block {
+  margin: 6px 0 0;
+  padding: 10px 12px;
+  max-height: 360px;
+  overflow: auto;
+  background: #f6f8f1;
+  border: 1px solid #e8ebdf;
+  border-radius: 8px;
+  line-height: 1.5;
+}
+.tok-key {
+  color: #1d6551;
+}
+.tok-string {
+  color: #8a5a2b;
+}
+.tok-number {
+  color: #2f5f94;
+}
+.tok-boolean {
+  color: #8b4a8f;
+}
+.tok-null {
+  color: #5f6a63;
+}
+.tok-punct {
+  color: #5f6a63;
+}
+
 /* 顶部提示条 */
 .banner {
   background: #e1efdf;
@@ -698,6 +932,9 @@ button.link:hover {
   .topbar {
     padding: 12px 22px;
   }
+  .logs-toolbar {
+    flex-wrap: wrap;
+  }
   .shell > main {
     padding: 26px 22px;
   }
@@ -716,6 +953,13 @@ button.link:hover {
   }
   .brand small:not(.version) {
     display: none;
+  }
+  .page-switch {
+    margin-left: 10px;
+  }
+  .page-switch button {
+    padding: 5px 10px;
+    font-size: 11px;
   }
   .shell > main {
     padding: 20px 16px;

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +13,9 @@ import (
 	"strings"
 	"sync"
 )
+
+// logFileName 是日志目录下当前日志文件的名称；控制台读取日志时使用同一个文件（见 poolConfig）。
+const logFileName = "ghc2api.log"
 
 // rotatingLogWriter 按大小滚动日志文件，并保留配置数量的备份。
 type rotatingLogWriter struct {
@@ -24,9 +29,24 @@ type rotatingLogWriter struct {
 	failure    error
 }
 
+// newRunID 生成本次进程运行的标识：8 字节随机数的 16 位小写十六进制。
+// 日志中的 request_id 每次启动都从 1 重新计数，run_id 使控制台能区分不同次运行的同号请求。
+func newRunID() (string, error) {
+	var buf [8]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", fmt.Errorf("无法生成日志运行标识: %w", err)
+	}
+	return hex.EncodeToString(buf[:]), nil
+}
+
+// newConfiguredLogger 创建写入日志文件（及标准错误）的根日志器；其记录都带同一个 run_id 字段。
 func newConfiguredLogger(config appConfig, stderr io.Writer) (*slog.Logger, *rotatingLogWriter, error) {
+	runID, err := newRunID()
+	if err != nil {
+		return nil, nil, err
+	}
 	logFile, err := newRotatingLogWriter(
-		filepath.Join(config.LogsPath, "ghc2api.log"),
+		filepath.Join(config.LogsPath, logFileName),
 		config.LogMaxSizeMB*(1<<20),
 		config.LogMaxBackups,
 	)
@@ -43,7 +63,7 @@ func newConfiguredLogger(config appConfig, stderr io.Writer) (*slog.Logger, *rot
 		_ = logFile.Close()
 		return nil, nil, err
 	}
-	return logger, logFile, nil
+	return logger.With("run_id", runID), logFile, nil
 }
 
 type logOutputWriter struct {

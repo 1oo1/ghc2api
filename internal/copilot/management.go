@@ -71,6 +71,7 @@ func (p *Pool) newManagementHandler() http.Handler {
 	api.HandleFunc("POST /v0/management/quota/refresh", p.handleRefreshQuota)
 	api.HandleFunc("POST /v0/management/login", p.handleStartLogin)
 	api.HandleFunc("GET /v0/management/login/status", p.handleLoginStatus)
+	api.HandleFunc("GET /v0/management/logs", p.handleGetLogs)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /management", serveConsole)

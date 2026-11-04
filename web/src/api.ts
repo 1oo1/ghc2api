@@ -96,11 +96,12 @@ export type ManagementClient = ReturnType<typeof createManagementClient>;
  * 凭据只放在请求头中发送，本模块不做任何持久化。
  */
 export function createManagementClient(credential: string) {
-  async function request<T>(
+  /** 发送请求；非 2xx 时抛 ApiError（错误体应为 JSON，解析失败时用默认文案）。 */
+  async function send(
     path: string,
     method = "GET",
     body?: unknown,
-  ): Promise<T> {
+  ): Promise<Response> {
     const response = await fetch(`/v0/management/${path}`, {
       method,
       headers: {
@@ -109,14 +110,23 @@ export function createManagementClient(credential: string) {
       },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
-    const data = await response.json().catch(() => ({}));
     if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
       throw new ApiError(
         data?.error?.message ?? `请求失败（HTTP ${response.status}）`,
         response.status,
       );
     }
-    return data as T;
+    return response;
+  }
+
+  async function request<T>(
+    path: string,
+    method = "GET",
+    body?: unknown,
+  ): Promise<T> {
+    const response = await send(path, method, body);
+    return (await response.json().catch(() => ({}))) as T;
   }
 
   return {
@@ -157,5 +167,17 @@ export function createManagementClient(credential: string) {
       request<LoginStatus>(
         `login/status?state=${encodeURIComponent(state)}`,
       ),
+    /** 读取日志尾部原始文本（NDJSON）；maxBytes 缺省时不带参数（服务端默认 8 MiB）。 */
+    getLogs: async (
+      maxBytes?: number,
+    ): Promise<{ text: string; truncated: boolean }> => {
+      const response = await send(
+        maxBytes === undefined ? "logs" : `logs?max_bytes=${maxBytes}`,
+      );
+      return {
+        text: await response.text(),
+        truncated: response.headers.get("X-Log-Truncated") === "true",
+      };
+    },
   };
 }

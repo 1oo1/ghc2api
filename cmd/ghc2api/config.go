@@ -279,6 +279,7 @@ func (c appConfig) poolConfig(logger *slog.Logger) copilot.PoolConfig {
 		SessionAffinityTTL: affinityTTL, SessionAffinityMaxPerAccount: c.SessionAffinityMaxPerAccount,
 		AccountCooldown:       c.AccountCooldown,
 		MaxConcurrentRequests: c.MaxConcurrentRequests, Logger: logger,
+		LogFile: filepath.Join(c.LogsPath, logFileName),
 	}
 }
 

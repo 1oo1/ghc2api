@@ -1,4 +1,4 @@
-// 应用入口组件：未登录时显示登录页；登录后显示控制台（账号页）。
+// 应用入口组件：未登录时显示登录页；登录后显示控制台（账号页与日志页）。
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   createManagementClient,
@@ -11,12 +11,20 @@ import {
 import type { Actions } from "./actions";
 import { DeviceLoginPanel } from "./components/DeviceLoginPanel";
 import { AccountsPage } from "./pages/AccountsPage";
+import { LogsPage } from "./pages/LogsPage";
 import { LoginPage } from "./pages/LoginPage";
 import { clearSession, loadSession, saveSession } from "./session";
+import { useLogs } from "./useLogs";
 
 /** 账号列表自动刷新间隔（毫秒）。 */
 const REFRESH_INTERVAL_MS = 15_000;
 const EXPIRED_MESSAGE = "登录已失效，请重新输入管理密钥";
+
+type Page = "accounts" | "logs";
+const PAGES: [Page, string][] = [
+  ["accounts", "账号"],
+  ["logs", "日志"],
+];
 
 export function App() {
   // 控制台令牌（由管理密钥换取，见 session.ts）保存在 React state 与 localStorage 中；
@@ -79,8 +87,8 @@ export function App() {
 }
 
 /**
- * 已登录的控制台。负责加载账号列表、定时刷新、执行变更操作与设备登录；
- * 各页面只负责展示。组件卸载即丢弃全部状态（退出登录时）。
+ * 已登录的控制台。负责页面切换、加载账号列表、定时刷新、执行变更操作与设备登录，并保存日志页的状态
+ * （切换页面不丢失已加载的日志与筛选条件）；各页面只负责展示。组件卸载即丢弃全部状态（退出登录时）。
  */
 function Console({
   credential,
@@ -97,6 +105,7 @@ function Console({
     () => createManagementClient(credential),
     [credential],
   );
+  const [page, setPage] = useState<Page>("accounts");
   const [accounts, setAccounts] = useState<AccountView[]>([]);
   /** 服务端版本；加载失败时不显示，不影响控制台使用。 */
   const [version, setVersion] = useState("");
@@ -114,6 +123,9 @@ function Console({
       .then((v) => setVersion(v.version))
       .catch(() => {});
   }, [client]);
+
+  const expire = useCallback(() => onExpire(EXPIRED_MESSAGE), [onExpire]);
+  const logs = useLogs(client, expire);
 
   const reload = useCallback(async () => {
     try {
@@ -187,42 +199,61 @@ function Console({
           </div>
           {version && <small className="version">{version}</small>}
         </div>
+        <nav className="page-switch" aria-label="页面">
+          {PAGES.map(([id, label]) => (
+            <button
+              key={id}
+              className={page === id ? "active" : undefined}
+              aria-current={page === id ? "page" : undefined}
+              onClick={() => setPage(id)}
+            >
+              {label}
+            </button>
+          ))}
+        </nav>
         <div className="topbar-actions">
-          <button onClick={() => void reload()} disabled={busy}>
+          <button
+            onClick={() => void (page === "accounts" ? reload() : logs.load())}
+            disabled={page === "accounts" ? busy : logs.loading}
+          >
             ↻ 刷新
           </button>
           <button onClick={onLogout}>退出登录</button>
         </div>
       </header>
       <main>
-        {error && (
-          <div className="banner error" role="alert">
-            {error}
-          </div>
-        )}
-        {syncError && (
-          <div className="banner error" role="alert">
-            账号列表加载失败：{syncError}
-          </div>
-        )}
-        {notice && (
-          <div className="banner" role="status">
-            {notice}
-          </div>
-        )}
-        {login && (
-          <DeviceLoginPanel
-            login={login}
+        {/* 账号页保持挂载（隐藏即可），设备登录的轮询不会因切换页面而中断。 */}
+        <div hidden={page !== "accounts"}>
+          {error && (
+            <div className="banner error" role="alert">
+              {error}
+            </div>
+          )}
+          {syncError && (
+            <div className="banner error" role="alert">
+              账号列表加载失败：{syncError}
+            </div>
+          )}
+          {notice && (
+            <div className="banner" role="status">
+              {notice}
+            </div>
+          )}
+          {login && (
+            <DeviceLoginPanel
+              login={login}
+              actions={actions}
+              onClose={() => setLogin(null)}
+            />
+          )}
+          <AccountsPage
+            accounts={accounts}
             actions={actions}
-            onClose={() => setLogin(null)}
+            loginPending={login !== null}
+            onStartLogin={startLogin}
           />
-        )}
-        <AccountsPage
-          accounts={accounts}
-          actions={actions}
-          loginPending={login !== null}
-          onStartLogin={startLogin}
-        />
+        </div>
+        {page === "logs" && <LogsPage logs={logs} />}
       </main>
     </div>
   );

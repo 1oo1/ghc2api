@@ -1,6 +1,6 @@
 # 管理接口
 
-代码：`internal/copilot/management.go`、`management_login.go`、`login.go`。前端见 `web-console.md`。
+代码：`internal/copilot/management.go`、`management_login.go`、`management_logs.go`、`logread.go`、`login.go`。前端见 `web-console.md`。
 
 ## 启用与鉴权
 
@@ -25,6 +25,7 @@
 | `POST /v0/management/quota/refresh` | `{"id":"alice"}` | `200 AccountView`（强制刷新） |
 | `POST /v0/management/login` | 可选：空体或 `{"proxy":"socks5://…"}` | `200 {"state","url","user_code","interval","expires_in"}` |
 | `GET /v0/management/login/status?state=...` | — | `{"status":"pending"\|"success"\|"error","id"?,"error"?}`；未知 state 404 |
+| `GET /v0/management/logs?max_bytes=N` | `max_bytes` 可选 | 日志尾部原始 NDJSON 文本，见下文「日志读取」 |
 
 ```go
 type AccountView struct {
@@ -69,6 +70,21 @@ JSON 字段名为 `id`、`user`、`host`、`disabled`、`priority`、`cooldown_u
 - 解除冷却与错误计数规则见 `pool.md`「限流、错误计数与冷却」。解除后，之前进入冷却时尚未完成的异步副作用不会把冷却记录写回磁盘。
 - 400：请求体非法 JSON；PATCH 缺 `id`，或 `disabled`、`priority`、`proxy`、`clear_cooldown`（为 `true`）都未提供，或 `priority` 超出 [-1,100] 或非整数，或 `proxy` 格式非法、新代理返回的登录名与账号不一致（均不写文件、不改状态）；PATCH 设置代理时验证失败 502；DELETE/refresh 缺 `id`。404：`id` 不存在。凭证写入失败 500（此时冷却、`disabled`、`priority` 全部不变）。解除冷却失败 500（见上文）。
 - 凭证写入、同名冲突与登录名规则见 `credentials.md`。
+
+## 日志读取
+
+`GET /v0/management/logs` 返回日志文件及其滚动备份（`ghc2api.log.N` … `ghc2api.log.1`、`ghc2api.log`，最旧在前）按时间顺序拼接后的最后至多 `max_bytes` 字节，供控制台日志页使用（见 `web-console.md`）。代码：`management_logs.go`（处理函数）、`logread.go`（`readLogTail`）。
+
+- 服务端只读取原始日志，**不解析**：按请求分组、合并正文块、JSON 格式化与高亮都在浏览器中完成。
+- 日志文件路径来自 `PoolConfig.LogFile`（cmd 层设为 `<logs_path>/ghc2api.log`，文件名常量 `logFileName` 与日志写入共用）；为空返回 404，错误信息 `未配置日志文件`。
+- `max_bytes`：十进制整数，范围 1 到 67108864（64 MiB，`maxLogReadBytes`），缺省 8388608（8 MiB，`defaultLogReadBytes`）；非整数、空值（`?max_bytes=`）、小于 1 或超过上限返回 400，错误信息含 `max_bytes`。读取失败返回 500。
+- 成功 200：`Content-Type: application/x-ndjson; charset=utf-8`、`Cache-Control: no-store`、`X-Log-Truncated: true|false`（因 `max_bytes` 截掉了更早的内容时为 `true`），正文可能为空。本接口自身照常输出请求日志。
+- `readLogTail` 的规则：
+  - 备份文件是与当前日志同目录、名为 `<文件名>.<正整数>` 的普通文件（后缀须能被 `strconv.Atoi` 解析且不小于 1），按数字降序拼接（`.10` 比 `.2` 更旧），最后是当前文件；文件不存在则跳过，其他读取错误返回 500。
+  - 先打开文件再用文件句柄取大小，与日志滚动并发时不会读错文件；文件在读取期间被截短时按实际读到的字节处理，仍只返回完整的行。
+  - 从最新文件向前读，读够 `max_bytes` 即停止，不会把所有文件整体读入内存，更旧的文件不会被打开。
+  - 结果只含完整的行：截断点落在行中间时丢弃首部残行；最后一个换行之后（正在写入的半行）丢弃；备份文件末尾缺换行时拼接处补一个，避免与下一文件的首行粘连。
+- 日志含用户提示词等内容（`debug` 级别还含完整上游正文），读取日志与其他管理接口同样要求控制台令牌。
 
 ## 导入账号
 

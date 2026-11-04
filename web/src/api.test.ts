@@ -6,6 +6,8 @@
 //   - ManagementClient.importAccount(credential: unknown, proxy?: string)：proxy 非空时写入请求体的 credential.proxy（覆盖凭证中原有的 proxy），
 //     未提供或为空串时凭证原样发送。
 //   - ManagementClient.startLogin(proxy?: string)：proxy 非空时请求体为 { proxy }，否则不带请求体。
+//   - ManagementClient.getLogs(maxBytes?: number)：GET /v0/management/logs（有 maxBytes 时为 logs?max_bytes=<n>），
+//     返回 { text, truncated }，truncated 取自响应头 X-Log-Truncated === "true"；非 2xx 抛 ApiError。
 //   - ManagementClient.createSession()：发送 POST /v0/management/session，携带管理凭证或控制台令牌，
 //     返回 { token, expires_at }（ConsoleSession）。
 import { afterEach, expect, test, vi } from "vitest";
@@ -219,4 +221,72 @@ test("startLogin 没有代理时不带请求体", async () => {
     expect(init.method).toBe("POST");
     expect(init.body).toBeUndefined();
   }
+});
+
+/** 替换全局 fetch，返回纯文本响应（日志接口的 NDJSON 正文）。 */
+function stubTextFetch(status: number, text: string, headers: Record<string, string> = {}) {
+  const fetchMock = vi.fn(async () => new Response(text, { status, headers }));
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
+test("getLogs 不带 maxBytes 时请求 /v0/management/logs 且携带 Authorization", async () => {
+  const fetchMock = stubTextFetch(200, "", { "X-Log-Truncated": "false" });
+
+  await createManagementClient("mgmt-key").getLogs();
+
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+  expect(url).toBe("/v0/management/logs");
+  expect(init.method === undefined || init.method === "GET").toBe(true);
+  expect((init.headers as Record<string, string>).Authorization).toBe("Bearer mgmt-key");
+  expect(init.body).toBeUndefined();
+});
+
+test("getLogs 带 maxBytes 时 URL 为 logs?max_bytes=<n>", async () => {
+  const fetchMock = stubTextFetch(200, "");
+
+  await createManagementClient("mgmt-key").getLogs(2097152);
+
+  const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+  expect(url).toBe("/v0/management/logs?max_bytes=2097152");
+  expect((init.headers as Record<string, string>).Authorization).toBe("Bearer mgmt-key");
+});
+
+test("getLogs 返回原始文本与 truncated（响应头为 true）", async () => {
+  const text = '{"time":"2026-11-03T10:00:00Z","level":"INFO","msg":"a"}\n{"time":"2026-11-03T10:00:01Z","level":"INFO","msg":"b"}\n';
+  stubTextFetch(200, text, { "Content-Type": "application/x-ndjson; charset=utf-8", "X-Log-Truncated": "true" });
+
+  await expect(createManagementClient("mgmt-key").getLogs()).resolves.toEqual({ text, truncated: true });
+});
+
+test("getLogs 的 truncated 在响应头为 false 或缺失时为 false", async () => {
+  stubTextFetch(200, "line\n", { "X-Log-Truncated": "false" });
+  await expect(createManagementClient("mgmt-key").getLogs()).resolves.toEqual({ text: "line\n", truncated: false });
+
+  stubTextFetch(200, "line\n");
+  await expect(createManagementClient("mgmt-key").getLogs()).resolves.toEqual({ text: "line\n", truncated: false });
+});
+
+test("getLogs 的非 2xx 响应抛 ApiError，保留服务端消息与状态码", async () => {
+  stubFetch(404, { error: { message: "未配置日志文件" } });
+  const error = await createManagementClient("mgmt-key").getLogs().catch((e: unknown) => e);
+  expect(error).toBeInstanceOf(ApiError);
+  expect((error as ApiError).status).toBe(404);
+  expect((error as ApiError).message).toBe("未配置日志文件");
+});
+
+test("getLogs 的 401 抛 ApiError(status 401)", async () => {
+  stubFetch(401, { error: { message: "未授权" } });
+  const error = await createManagementClient("bad").getLogs().catch((e: unknown) => e);
+  expect(error).toBeInstanceOf(ApiError);
+  expect((error as ApiError).status).toBe(401);
+});
+
+test("getLogs 的错误体缺少消息时使用默认文案", async () => {
+  stubFetch(500, {});
+  const error = await createManagementClient("mgmt-key").getLogs().catch((e: unknown) => e);
+  expect(error).toBeInstanceOf(ApiError);
+  expect((error as ApiError).status).toBe(500);
+  expect((error as ApiError).message).toBe("请求失败（HTTP 500）");
 });
