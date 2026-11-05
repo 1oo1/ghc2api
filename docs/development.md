@@ -25,7 +25,7 @@ make web          # 仅修改 web/ 后需要，需 Node.js 与 npm
   - bind mount 的宿主机目录需对 uid 65532 可读写（`chown -R 65532 <目录>`），配置与凭证文件权限建议 0600；命名卷无需处理。
   - 运行：`docker run -d -p 8080:8080 -v $PWD/ghc2api:/data ghcr.io/<owner>/<repo>:latest`
   - 健康检查：镜像内置 `HEALTHCHECK`，调用 `ghc2api healthcheck -c /data/config.yaml`（语义见 `config.md`；每 30 秒一次，连续 3 次失败标记为 unhealthy）。用 `docker ps` 或 `docker inspect --format '{{.State.Health.Status}}' <容器>` 查看，compose 自动继承。每次探测会在服务日志里留下两条 `/healthz` 请求日志。
-  - Compose：复制 `docker-compose.example.yml` 为 `docker-compose.yml`，步骤见文件内注释；配置文件只读挂载，数据放在命名卷。
+  - Compose：复制 `docker-compose.example.yml` 为 `docker-compose.yml`，步骤见文件内注释；配置文件以读写方式挂载（控制台在线编辑需要写权限），数据放在命名卷。
   - 本地验证构建：`docker buildx build --platform linux/arm64 --build-arg VERSION=v0.0.1 --load -t ghc2api:dev .`（多平台构建需要 `docker buildx create --use` 的 docker-container driver，且结果需 `--push` 推送）。
 
 ## 来源与服务条款
