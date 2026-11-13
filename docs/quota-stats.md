@@ -77,6 +77,7 @@ JSON 名为小驼峰（如 `remainingFraction`、`observedAt`），完整定义�
 
 每账号内存记录 `requests`（分发到该账号的请求数，含模型列表与生成）、`errors`（响应状态 ≥400）、`last_used_at`，重启清零。
 
-- session 失败后切换账号，只计入最终处理的账号；所有账号都失败时计入最后尝试的账号（`requests`、`errors` 各 +1）。
+- 生成请求 session 失败后切换账号，只计入最终处理的账号；所有账号都失败时计入最后尝试的账号（`requests`、`errors` 各 +1）。
+- 模型列表（`GET /models`、`/v1/models`，见 `pool.md`「模型列表」）不同：每次尝试各计该账号一次 `requests`，失败的尝试（含 session 失败）各计一次 `errors`；客户端取消的尝试不计错误。
 - 客户端取消不计 `errors`（`requests` 可计）。
 - `/responses` 的失效输出项错误（401/400，见 `http-api.md`）标记为忽略（写给客户端的 401 改为 500）：不计 `errors`，也不触发错误后的额度刷新（`requests` 照常计）。

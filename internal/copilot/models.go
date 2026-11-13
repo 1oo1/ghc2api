@@ -35,7 +35,10 @@ type modelList struct {
 	// Endpoints 记录每个 chat 模型（含隐藏模型）支持的路径；旧缓存没有该字段。
 	Endpoints map[string][]string `json:"endpoints"`
 	Waiting   map[string]bool     `json:"waiting"`
-	At        time.Time           `json:"at"`
+	// Disabled 记录策略明确不是 enabled 且没有条款的 chat 模型（不论是否内部 id、Experimental、picker 启用）：
+	// 它们不进可见列表，只在 Endpoints 里留有路径记录，账号并不能用，modelAvailability 据此不算它们 listed。旧缓存没有该字段，视为空。
+	Disabled map[string]bool `json:"disabled"`
+	At       time.Time       `json:"at"`
 }
 
 type refusedModel struct {
@@ -56,7 +59,7 @@ func (s *Service) getModels(ctx context.Context, current session) (modelList, er
 		var cached modelList
 		if err := readCacheFile(path, &cached); err == nil {
 			if modelCacheFresh(cached.At, s.modelsCacheTTL.Load()) {
-				s.models = cached
+				s.storeModels(cached)
 				s.log(ctx, slog.LevelDebug, "复用磁盘中的 Copilot 模型列表", "model_count", len(cached.Data))
 				return cached, nil
 			}
@@ -72,7 +75,7 @@ func (s *Service) getModels(ctx context.Context, current session) (modelList, er
 		s.log(ctx, slog.LevelWarn, "刷新 Copilot 模型列表失败", "error", s.redactString(err.Error()))
 		return modelList{}, err
 	}
-	list := modelList{Data: []json.RawMessage{}, Endpoints: map[string][]string{}, Waiting: map[string]bool{}, At: time.Now()}
+	list := modelList{Data: []json.RawMessage{}, Endpoints: map[string][]string{}, Waiting: map[string]bool{}, Disabled: map[string]bool{}, At: time.Now()}
 	for _, raw := range wire.Data {
 		var m model
 		if json.Unmarshal(raw, &m) != nil || m.ID == "" || m.Capabilities.Type != "chat" {
@@ -83,7 +86,13 @@ func (s *Service) getModels(ctx context.Context, current session) (modelList, er
 		} else {
 			list.Endpoints[m.ID] = m.Endpoints
 		}
-		if internalModel.MatchString(m.ID) || m.Vendor == "Experimental" || (!m.Picker && m.Category == "") {
+		// 策略明确不是 enabled 且没有条款：账号不能用该模型，无论下面是否展示都记入 Disabled（见 modelList.Disabled）。
+		if m.Policy != nil && m.Policy.State != "enabled" && m.Policy.Terms == "" {
+			list.Disabled[m.ID] = true
+		}
+		// 内部 id 一律不展示；picker 未启用的模型在没有 category 或属于 Experimental 时不展示。
+		// picker 启用的 Experimental 模型与其他模型一样按下面的策略规则展示。
+		if internalModel.MatchString(m.ID) || (!m.Picker && (m.Category == "" || m.Vendor == "Experimental")) {
 			continue
 		}
 		// 策略已启用（或无策略且在选择器中）的模型直接可见；待接受条款的模型可见并记入 Waiting；其余跳过。
@@ -104,7 +113,7 @@ func (s *Service) getModels(ctx context.Context, current session) (modelList, er
 		normalized, _ := json.Marshal(metadata)
 		list.Data = append(list.Data, normalized)
 	}
-	s.models = list
+	s.storeModels(list)
 	if err := s.writeCacheUnlessCooling("models", list); err != nil {
 		s.log(ctx, slog.LevelWarn, "写入磁盘模型缓存失败", "error", s.redactString(err.Error()))
 	}
@@ -121,7 +130,43 @@ func (s *Service) forgetModels(still func() bool) error {
 		return nil
 	}
 	s.models = modelList{}
+	s.modelIDs.Store(nil) // 列表回到未知
 	return s.removeCacheFile("models")
+}
+
+// storeModels 加载了模型列表（刷新或从磁盘缓存读入）：替换内存中的列表，并同步更新 modelAvailability 读取的 id 快照
+// （Data 中的模型，加上 Endpoints 中未被策略禁用（Disabled）的隐藏 chat 模型）。调用方须持有 modelsMu。
+// forgetModels 清空列表时自行把快照置回 nil；acceptTerms 只改 Waiting 与 At，不影响 id 集合，不需要更新快照。
+func (s *Service) storeModels(list modelList) {
+	s.models = list
+	ids := make(map[string]struct{}, len(list.Data)+len(list.Endpoints))
+	for _, raw := range list.Data {
+		var m model
+		if json.Unmarshal(raw, &m) == nil && m.ID != "" {
+			ids[m.ID] = struct{}{}
+		}
+	}
+	for id := range list.Endpoints {
+		if !list.Disabled[id] {
+			ids[id] = struct{}{}
+		}
+	}
+	s.modelIDs.Store(&ids)
+}
+
+// modelAvailability 报告账号最近一次加载的模型列表（不论是否过期）是否含有模型 id，供 Pool 选号时排除没有该模型的账号。
+// known 为 false 表示列表未知（从未加载，或已被 forgetModels 清空），此时 listed 无意义，调用方不应排除该账号；
+// listed 为 true 当且仅当 id 在可见列表中，或在隐藏 chat 模型中且未被策略禁用（Disabled），且账号当前未拒绝它（isRefused）。
+// 只读原子快照，不访问上游，也不等待 modelsMu：选号时持有 Pool.mu，不能被模型列表的刷新阻塞。
+func (s *Service) modelAvailability(id string) (listed, known bool) {
+	ids := s.modelIDs.Load()
+	if ids == nil {
+		return false, false
+	}
+	if _, ok := (*ids)[id]; !ok {
+		return false, true
+	}
+	return !s.isRefused(id), true
 }
 
 func modelCacheFresh(at time.Time, ttl time.Duration) bool {

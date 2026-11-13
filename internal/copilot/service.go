@@ -49,6 +49,9 @@ type Service struct {
 	session   session
 	modelsMu  contextMutex
 	models    modelList
+	// modelIDs 是 models 中模型 id 的快照（可见模型与隐藏 chat 模型），nil 表示列表未知；每次给 models 赋值时由 storeModels 更新，
+	// 读取无需 modelsMu（见 modelAvailability）。
+	modelIDs  atomic.Pointer[map[string]struct{}]
 	refusedMu sync.Mutex
 	refused   map[string]refusedModel
 	// refusalSeq 在锁内递增，删除记录后也不重置，避免不同拒绝的版本相同。
@@ -161,7 +164,8 @@ type routeNeed int
 
 const (
 	needNone    routeNeed = iota // 不访问上游（健康检查、未注册路由、重定向等）：由 Pool 的 idle 路由直接处理，不参与账号选择
-	needSession                  // 需要 Copilot session（模型列表、生成请求）：预取 session，失败时切换账号
+	needSession                  // 需要 Copilot session（生成请求）：选出一个账号，预取其 session，失败时切换账号
+	needModels                   // 模型列表：按账号逐个尝试，首个成功即返回，见 pool_models.go
 )
 
 // routeEntry 登记一条业务路由的路径及其上游访问方式。
@@ -185,7 +189,7 @@ func (s *Service) routes() serviceRoutes {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	}, routeEntry{need: needNone})
 	for _, path := range []string{"/models", "/v1/models"} {
-		routes.handle("GET", path, s.handleModels, routeEntry{need: needSession})
+		routes.handle("GET", path, s.handleModels, routeEntry{need: needModels})
 	}
 	for local, upstream := range map[string]string{
 		"/chat/completions": "/chat/completions", "/v1/chat/completions": "/chat/completions",
@@ -374,6 +378,7 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 	if path == "/responses" {
 		body = withoutLoneToolChoice(body)
 		body = withoutOutputReplay(body)
+		body = plainItemIDs(body) // 在 retryStaleItems 之前改写，重发的请求体也基于它
 	}
 	// 请求体不是对象、model 缺失/为 null/非字符串/空白时都视为无效（null 能成功解码为空结构体，故还要检查 Model 是否为 nil）。
 	var request struct {
@@ -385,6 +390,22 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 		return
 	}
 	model := *request.Model
+	// Copilot 的 Gemini 对部分工具 schema 整个请求返回 400，转发前适配（见 geminitools.go）。
+	if path == "/chat/completions" && geminiModel(model) {
+		body = geminiToolUnions(geminiToolsFit(body))
+	}
+	// Copilot 前面的 Grok 对自定义工具、namespace 工具与根联合的参数返回裸的 400/422，转发前改写（见 groktools.go）；
+	// 有改名或自定义调用时，2xx 回复里模型的调用要还原（见 grokreply.go）。其后的重试请求体基于改写后的请求体。
+	var restore *grokRestorer
+	if path == "/responses" && grokModel(model) {
+		var calls grokCalls
+		body, calls = grokRequest(body)
+		// namespace 摊平后 tools 可能为空（里面只有 function 与 custom 之外的工具），此时 tool_choice 同样要去掉。
+		body = withoutLoneToolChoice(body)
+		if len(calls) > 0 {
+			restore = newGrokRestorer(calls)
+		}
+	}
 	// 写超时只针对响应写入，因此包装放在读取请求体之后（读取阶段不写响应）。请求结束时不清除截止时间，见 generationWriter。
 	// 注意：http.MaxBytesReader 超限时只有底层 w 实现 requestTooLarge 才会标记关闭连接（net/http 的 *response 实现了它）。
 	// 这里的 w 已被 withRequestLog（Pool 另有 record）包装为 statusResponseWriter，不实现该方法，
@@ -479,7 +500,7 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 	s.log(r.Context(), apiStatusLogLevel(res.StatusCode), "生成响应开始返回客户端",
 		"status", res.StatusCode, "model", model)
 	// 429 与其他错误的计数、冷却由 Pool 按写给客户端的状态码处理（见 cooldown.go）；这里原样流式透传。
-	streamResponse(w, res, path == "/responses")
+	streamResponse(w, res, path == "/responses", restore)
 }
 
 // modelRefusal 判断上游 400 正文是否为模型不可用的拒绝：

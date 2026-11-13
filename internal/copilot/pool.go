@@ -3,10 +3,12 @@ package copilot
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"slices"
 	"strconv"
@@ -298,12 +300,15 @@ func (p *Pool) Handler() http.Handler {
 }
 
 // dispatch 按路由登记的上游访问方式分发请求：不访问上游的请求直接处理且不参与账号选择；
-// 需要 session 的请求进入 forward。生成请求（登记了 upstream 的路由）先占用一个并发名额，名额已满时返回 503。
+// 模型列表按账号逐个尝试、首个成功即返回（见 serveModels）；生成请求（登记了 upstream 的路由）先占用一个并发名额，名额已满时返回 503，
+// 然后进入 forward。
 func (p *Pool) dispatch(w http.ResponseWriter, r *http.Request) {
 	entry := p.routeOf(r)
 	switch entry.need {
 	case needNone:
 		p.idle.mux.ServeHTTP(w, r)
+	case needModels:
+		p.serveModels(w, r)
 	default:
 		if entry.upstream != "" {
 			if !p.generations.acquire() {
@@ -313,13 +318,13 @@ func (p *Pool) dispatch(w http.ResponseWriter, r *http.Request) {
 			}
 			defer p.generations.release()
 		}
-		key, ok := p.affinityKey(r, entry.upstream)
+		key, model, ok := p.peekGeneration(r, entry.upstream)
 		if !ok {
 			p.log(r.Context(), slog.LevelWarn, "无法计算会话键")
 			writeError(w, http.StatusInternalServerError, "无法计算模型缓存 key")
 			return
 		}
-		p.forward(w, r, key)
+		p.forward(w, r, key, model)
 	}
 }
 
@@ -334,35 +339,51 @@ func (p *Pool) routeOf(r *http.Request) routeEntry {
 	return entry
 }
 
-// affinityKey 计算生成请求的会话键。未开启亲和或非生成接口时不读取请求体，返回空键。
+// peekGeneration 读取生成请求体一次，取出选号需要的会话键与模型。非生成接口（upstream 为空）不读取请求体，返回空键与空模型。
 // 请求体最多读取 maxRequestBody 字节，读出的部分与剩余内容拼接后原样放回 r.Body，下游仍能读到完整请求体；
-// 读取失败或超过上限时不计算会话键，返回空键，下游会照常返回错误（如 413）。
-// 请求体读取成功但没有任何会话信号时 ok 为 false，调用方应拒绝该请求。
-func (p *Pool) affinityKey(r *http.Request, upstream string) (key string, ok bool) {
-	if upstream == "" || p.affinity == nil || r.Body == nil {
-		return "", true
+// 读取失败或超过上限时返回空键与空模型（不计算会话键、不过滤账号），下游会照常返回错误（如 413）。
+// 模型取顶层 model（键名大小写不敏感，与 Service 一致）：请求体不是 JSON 对象、model 缺失、为 null、不是字符串或为空白时视为无模型。
+// 会话键只在开启亲和时计算：请求体读取成功但没有任何会话信号时 ok 为 false，调用方应拒绝该请求。
+func (p *Pool) peekGeneration(r *http.Request, upstream string) (key, model string, ok bool) {
+	if upstream == "" || r.Body == nil {
+		return "", "", true
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody+1))
 	r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), r.Body))
 	if err != nil || len(body) > maxRequestBody {
-		return "", true
+		return "", "", true
+	}
+	model = requestModel(body)
+	if p.affinity == nil {
+		return "", model, true
 	}
 	key = sessionKey(r, body, upstream)
-	return key, key != ""
+	return key, model, key != ""
 }
 
-// forward 处理需要 session 的请求。先由 pickSession 选出账号、取得 session 并绑定会话键，再把请求交给该账号处理。
+// requestModel 返回请求体顶层的 model；不是非空字符串（含请求体非法）时返回空串。解析规则与 Service.handleGeneration 一致。
+func requestModel(body []byte) string {
+	var request struct {
+		Model *string `json:"model"`
+	}
+	if json.Unmarshal(body, &request) != nil || request.Model == nil || strings.TrimSpace(*request.Model) == "" {
+		return ""
+	}
+	return *request.Model
+}
+
+// forward 处理生成请求。先由 pickSession 按会话键与模型选出账号、取得 session 并绑定会话键，再把请求交给该账号处理。
 // 全部失败时按最后一个账号的 handleError 规则返回错误；没有任何可选账号时返回 503。
 // 取 session 期间客户端已取消时不冷却账号；等待会话门时客户端已取消则不写响应。
 // 请求体校验（生成接口）在预取 session 之后才执行，因此全部账号的 session 都失败时，
 // 无效请求体会收到 session 错误而不是 400，这是有意的取舍。
 //
 // 会话键命中风控记录（见 riskblock.go）时，在会话门与选账号之前直接返回 500（消息附原始状态码），不访问上游。
-func (p *Pool) forward(w http.ResponseWriter, r *http.Request, key string) {
+func (p *Pool) forward(w http.ResponseWriter, r *http.Request, key, model string) {
 	if p.riskBlocked(r.Context(), w, key) {
 		return
 	}
-	pick, err := p.pickSession(r, key)
+	pick, err := p.pickSession(r, key, model)
 	if err != nil {
 		// 等待同会话门时客户端已取消：不选账号、不冷却、不计数，也不写响应。
 		return
@@ -393,8 +414,9 @@ type sessionPick struct {
 // 先到者完成绑定后，后到者按已有绑定选择同一账号，从而不会因竞争各选各的账号。
 // 门通过 defer 在返回前释放，因此只覆盖选择、取 session 与绑定，不会持有到响应结束。
 // 等待门时 ctx 被取消则返回错误，此时没有选择任何账号。
-// 账号 session 获取失败时按错误规则计入（见 countSessionFailure），并在同一请求内改用其他尚未尝试的账号，每个账号最多尝试一次。
-func (p *Pool) pickSession(r *http.Request, key string) (sessionPick, error) {
+// 账号 session 获取失败时按错误规则计入（见 countSessionFailure），并在同一请求内改用其他尚未尝试的账号，每个账号最多尝试一次；
+// 每次选择都按 model 过滤账号（见 chooseFor）。
+func (p *Pool) pickSession(r *http.Request, key, model string) (sessionPick, error) {
 	if p.affinity != nil && key != "" {
 		release, err := p.gate.acquire(r.Context(), key)
 		if err != nil {
@@ -406,7 +428,7 @@ func (p *Pool) pickSession(r *http.Request, key string) (sessionPick, error) {
 	var pick sessionPick
 	tried := map[*poolAccount]bool{}
 	for {
-		account := p.choose(key, tried)
+		account := p.chooseFor(key, model, tried)
 		if account == nil {
 			return pick, nil
 		}
@@ -418,12 +440,7 @@ func (p *Pool) pickSession(r *http.Request, key string) (sessionPick, error) {
 			if pick.ctx.Err() != nil {
 				return pick, nil
 			}
-			account.service.log(pick.ctx, slog.LevelWarn, "账号会话获取失败", "error", err)
-			status, cooled := account.countSessionFailure(pick.ctx, err)
-			p.recordRisk(pick.ctx, key, status, cooled)
-			if !isUpstreamRateLimit(err) {
-				account.refreshAfterError()
-			}
+			p.noteSessionFailure(pick.ctx, key, account, err)
 			continue
 		}
 		// 取得 session 之后账号可能已因另一个请求的错误进入冷却：冷却账号不得被绑定。
@@ -433,6 +450,17 @@ func (p *Pool) pickSession(r *http.Request, key string) (sessionPick, error) {
 		}
 		pick.account = account
 		return pick, nil
+	}
+}
+
+// noteSessionFailure 处理账号 session 获取失败（客户端未取消时）：输出告警，按错误规则计入（见 countSessionFailure），
+// 使账号进入冷却的 401/403 记录会话键 key 的风控（key 为空时不记录），非限流错误时异步刷新额度。
+func (p *Pool) noteSessionFailure(ctx context.Context, key string, account *poolAccount, err error) {
+	account.service.log(ctx, slog.LevelWarn, "账号会话获取失败", "error", err)
+	status, cooled := account.countSessionFailure(ctx, err)
+	p.recordRisk(ctx, key, status, cooled)
+	if !isUpstreamRateLimit(err) {
+		account.refreshAfterError()
 	}
 }
 
@@ -546,27 +574,66 @@ func (p *Pool) services() []*Service {
 	return services
 }
 
-// choose 选择处理本次请求的账号。键非空且开启亲和时：会话已绑定且该账号仍可用（未禁用、未冷却、未耗尽、本请求未尝试过），
-// 且它有 Credits 或最优档也没有 Credits，则直接使用它，且不推进轮询；
-// 否则为无可用绑定的会话（新会话或故障切换）选择：先取最优档，在档内排除有效绑定数已达上限的账号后轮询；最优档全满则忽略上限，不降档。
-// 键为空或未开启亲和时按 pickLocked 选择。没有候选（包括全部冷却）时返回 nil。
+// choose 选择处理本次请求的账号，不按模型过滤，等价于 chooseFor(key, "", tried)。
 func (p *Pool) choose(key string, tried map[*poolAccount]bool) *poolAccount {
+	return p.chooseFor(key, "", tried)
+}
+
+// chooseFor 在 chooseLocked 的基础上按请求的模型过滤账号：model 非空时，模型列表已知（known）却不含该模型（!listed）的账号
+// 在本次选择中视为排除（见 Service.modelAvailability），与已尝试（tried）的账号一样不参与分档、绑定上限、SWRR、creditsElsewhere，
+// 也不使用指向它的亲和绑定。排除后选不出账号时去掉模型排除再选一次，即没有该过滤时的行为：交给账号处理，由上游返回 400。
+// 被排除不等于已尝试，因此 tried 不记录它们，回退时仍可选。列表未知的账号不被排除；model 为空（模型列表、无效请求体）时不过滤。
+func (p *Pool) chooseFor(key, model string, tried map[*poolAccount]bool) *poolAccount {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
-	if key == "" || p.affinity == nil {
-		return p.pickLocked(now, tried)
+	if model != "" {
+		if skip := p.skipLackingModelLocked(model, tried); skip != nil {
+			if account := p.chooseLocked(key, now, skip); account != nil {
+				return account
+			}
+		}
 	}
-	group := p.topGroupLocked(now, tried)
+	return p.chooseLocked(key, now, tried)
+}
+
+// skipLackingModelLocked 返回在 tried 之外再加上列表已知却没有 model 的账号的排除集合；没有账号被排除时返回 nil。调用方须持有 p.mu。
+func (p *Pool) skipLackingModelLocked(model string, tried map[*poolAccount]bool) map[*poolAccount]bool {
+	var skip map[*poolAccount]bool
+	for _, a := range p.accounts {
+		if listed, known := a.service.modelAvailability(model); known && !listed {
+			if skip == nil {
+				skip = make(map[*poolAccount]bool, len(tried)+1)
+				maps.Copy(skip, tried)
+			}
+			skip[a] = true
+		}
+	}
+	return skip
+}
+
+// chooseLocked 在 skip 之外的账号中选择处理本次请求的账号。键非空且开启亲和时：会话已绑定且该账号仍可用（未禁用、未冷却、未耗尽、不在 skip 中），
+// 且它有 Credits 或最优档也没有 Credits，则直接使用它，且不推进轮询；
+// 否则为无可用绑定的会话（新会话或故障切换）选择：先取最优档，在档内排除有效绑定数已达上限的账号后轮询；最优档全满则忽略上限，不降档。
+// 键为空或未开启亲和时按 pickLocked 选择。没有候选（包括全部冷却）时返回 nil。调用方须持有 p.mu。
+func (p *Pool) chooseLocked(key string, now time.Time, skip map[*poolAccount]bool) *poolAccount {
+	if key == "" || p.affinity == nil {
+		return p.pickLocked(now, skip)
+	}
+	group := p.topGroupLocked(now, skip)
 	if id, ok := p.affinity.lookup(key, now); ok {
-		if account := p.findLocked(id); account != nil && !account.disabled &&
-			!tried[account] && account.service.available(now) && !account.exhausted(now) &&
+		if account := p.findLocked(id); account != nil && !skip[account] && account.usable(now) &&
 			!creditsElsewhere(account, group, now) {
 			return account
 		}
 	}
 	// 上限只在最优档内生效：先取最优档，再排除其中已满的账号；最优档全满时忽略上限，仍对整个最优档轮询，绝不因上限降档。
 	return swrrPickLocked(p.withinCapLocked(group, now))
+}
+
+// usable 报告账号在 now 时是否可参与选择：未禁用、未冷却、未耗尽。调用方须持有 p.mu（读取 disabled）。
+func (a *poolAccount) usable(now time.Time) bool {
+	return !a.disabled && a.service.available(now) && !a.exhausted(now)
 }
 
 // creditsElsewhere 报告绑定账号是否应让位给有 Credits 的账号：它自身无 Credits，而最优档 group 有 Credits。
@@ -617,7 +684,7 @@ type candidate struct {
 func (p *Pool) topGroupLocked(now time.Time, skip map[*poolAccount]bool) []candidate {
 	var group []candidate
 	for _, a := range p.accounts {
-		if a.disabled || skip[a] || !a.service.available(now) || a.exhausted(now) {
+		if skip[a] || !a.usable(now) {
 			continue
 		}
 		c := candidate{account: a, key: keyOf(a, now)}

@@ -3,6 +3,8 @@ package copilot
 // 本文件覆盖“隐藏模型的路径知识”：
 // getModels 记录 /models 中每个 chat 模型（含隐藏、内部 id、Experimental）支持的路径，
 // 没有 supported_endpoints 的 chat 模型视为只支持 /chat/completions；非 chat 模型不记录。
+// 可见性：内部 id 一律不展示；picker 未启用的模型在没有 category，或属于 Experimental 时不展示；
+// picker 启用的 Experimental 模型与其他模型一样，按策略（enabled / 待接受条款）展示。
 // 生成请求校验路径时按以下顺序取模型支持的路径：
 //  1. 可见模型（出现在 /v1/models 中）：使用 /models 的 supported_endpoints；
 //  2. /models 中的隐藏 chat 模型：使用 /models 的路径（为空时视为只支持 /chat/completions）；
@@ -14,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -22,7 +25,8 @@ import (
 
 // endpointTestModels 是本文件使用的 /models 响应：
 // visible-chat 可见且只支持 /chat/completions；hidden-resp 隐藏且只支持 /responses；hidden-noep 隐藏且未声明路径；
-// gpt-x-secondary 为内部 id、exp-model 为 Experimental，二者都只支持 /responses；embed-model 不是 chat 模型。
+// gpt-x-secondary 为内部 id（不可见）、exp-model 为 picker 启用的 Experimental（可见），二者都只支持 /responses；
+// embed-model 不是 chat 模型。
 const endpointTestModels = `{"data":[` +
 	`{"id":"visible-chat","model_picker_enabled":true,"capabilities":{"type":"chat"},"supported_endpoints":["/chat/completions"],"policy":{"state":"enabled"}},` +
 	`{"id":"hidden-resp","model_picker_enabled":false,"capabilities":{"type":"chat"},"supported_endpoints":["/responses"]},` +
@@ -188,6 +192,7 @@ func TestHiddenChatModelRejectedWhenEndpointUnsupported(t *testing.T) {
 }
 
 // TestModelsEndpointStillHidesHiddenModels 记录隐藏模型的路径不改变 /v1/models 的输出：只列出可见模型，不含 auto。
+// 可见的是 visible-chat 与 picker 启用的 Experimental 模型 exp-model；隐藏模型与内部 id、非 chat 模型仍不展示。
 func TestModelsEndpointStillHidesHiddenModels(t *testing.T) {
 	u := &endpointTestUpstream{}
 	s := newEndpointTestService(t, u)
@@ -207,8 +212,8 @@ func TestModelsEndpointStillHidesHiddenModels(t *testing.T) {
 	for _, m := range got.Data {
 		ids[m.ID] = true
 	}
-	want := map[string]bool{"visible-chat": true}
-	if len(ids) != len(want) || !ids["visible-chat"] || ids["auto"] {
+	want := map[string]bool{"visible-chat": true, "exp-model": true}
+	if !reflect.DeepEqual(ids, want) {
 		t.Fatalf("/v1/models IDs = %v, want %v（不应追加 auto）", ids, want)
 	}
 }
@@ -267,5 +272,108 @@ func TestUnknownModelAndUnsupportedPathMessages(t *testing.T) {
 				t.Fatalf("400 时上游生成接口不应被调用，实际 %+v", calls)
 			}
 		})
+	}
+}
+
+// experimentalTestModels 是 Experimental 可见性测试使用的 /models 响应。
+// 展示规则：内部 id 一律不展示；picker 未启用且（没有 category 或属于 Experimental）不展示；
+// 其余按策略展示（enabled，或没有策略且 picker 启用，或待接受条款）。
+const experimentalTestModels = `{"data":[` +
+	// picker 启用的 Experimental：按常规策略规则展示。
+	`{"id":"exp-picker","vendor":"Experimental","model_picker_enabled":true,"capabilities":{"type":"chat"},"supported_endpoints":["/chat/completions"],"policy":{"state":"enabled"}},` +
+	`{"id":"exp-picker-nopolicy","vendor":"Experimental","model_picker_enabled":true,"capabilities":{"type":"chat"},"supported_endpoints":["/chat/completions"]},` +
+	`{"id":"exp-picker-terms","vendor":"Experimental","model_picker_enabled":true,"capabilities":{"type":"chat"},"supported_endpoints":["/chat/completions"],"policy":{"state":"disabled","terms":"Accept terms"}},` +
+	`{"id":"exp-picker-denied","vendor":"Experimental","model_picker_enabled":true,"capabilities":{"type":"chat"},"supported_endpoints":["/chat/completions"],"policy":{"state":"disabled"}},` +
+	// picker 未启用的 Experimental：即使有 category 也不展示。
+	`{"id":"exp-category","vendor":"Experimental","model_picker_enabled":false,"model_picker_category":"powerful","capabilities":{"type":"chat"},"supported_endpoints":["/chat/completions"],"policy":{"state":"enabled"}},` +
+	`{"id":"exp-plain","vendor":"Experimental","model_picker_enabled":false,"capabilities":{"type":"chat"},"supported_endpoints":["/chat/completions"],"policy":{"state":"enabled"}},` +
+	// 内部 id 与非 chat 模型：即使是 picker 启用的 Experimental 也不展示。
+	`{"id":"exp-secondary","vendor":"Experimental","model_picker_enabled":true,"capabilities":{"type":"chat"},"supported_endpoints":["/chat/completions"]},` +
+	`{"id":"exp-embed","vendor":"Experimental","model_picker_enabled":true,"capabilities":{"type":"embeddings"}},` +
+	// 非 Experimental：picker 未启用但有 category 的展示，没有 category 的不展示（规则不变）。
+	`{"id":"cat-model","model_picker_enabled":false,"model_picker_category":"lightweight","capabilities":{"type":"chat"},"supported_endpoints":["/chat/completions"],"policy":{"state":"enabled"}},` +
+	`{"id":"plain-hidden","model_picker_enabled":false,"capabilities":{"type":"chat"},"supported_endpoints":["/chat/completions"],"policy":{"state":"enabled"}}` +
+	`]}`
+
+// TestModelsExperimentalVisibility picker 启用的 Experimental 模型按常规策略规则展示（enabled、无策略、待接受条款），
+// 待接受条款的记入 Waiting；picker 未启用的 Experimental（有无 category 都一样）、内部 id 与非 chat 模型仍不展示；
+// 非 Experimental 模型的规则不变。
+func TestModelsExperimentalVisibility(t *testing.T) {
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/copilot_internal/v2/token":
+			testSession(w, "", time.Now().Add(time.Hour))
+		case "/models":
+			_, _ = io.WriteString(w, experimentalTestModels)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})})
+	w := testRequest(s, http.MethodGet, "/v1/models", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	var got struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]bool{}
+	for _, m := range got.Data {
+		ids[m.ID] = true
+	}
+	want := map[string]bool{"exp-picker": true, "exp-picker-nopolicy": true, "exp-picker-terms": true, "cat-model": true}
+	if !reflect.DeepEqual(ids, want) {
+		t.Fatalf("/v1/models IDs = %v, want %v", ids, want)
+	}
+	// 待接受条款的 Experimental 模型与其他待接受条款的模型一样记入 Waiting；被策略拒绝（无条款）的不记。
+	if !s.models.Waiting["exp-picker-terms"] || s.models.Waiting["exp-picker-denied"] {
+		t.Fatalf("Waiting = %v, want 仅 exp-picker-terms", s.models.Waiting)
+	}
+}
+
+// TestModelsExperimentalEndpointsStillRecorded 展示规则的放宽不改变路径记录：所有 chat 模型（含不展示的 Experimental 与内部 id）
+// 仍记录支持的路径，手选时按路径放行；非 chat 模型仍不记录。
+func TestModelsExperimentalEndpointsStillRecorded(t *testing.T) {
+	var mu sync.Mutex
+	var forwarded []string
+	s := testService(t, Config{APIKey: testAPIKey, Token: "github-secret", Client: testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/copilot_internal/v2/token":
+			testSession(w, "", time.Now().Add(time.Hour))
+		case "/models":
+			_, _ = io.WriteString(w, experimentalTestModels)
+		case "/chat/completions":
+			var body struct {
+				Model string `json:"model"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			forwarded = append(forwarded, body.Model)
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})})
+	for _, model := range []string{"exp-picker", "exp-category", "exp-plain", "exp-secondary"} {
+		w := testRequest(s, http.MethodPost, "/v1/chat/completions", endpointTestBody("/v1/chat/completions", model))
+		if w.Code != http.StatusOK {
+			t.Errorf("POST model=%s status=%d body=%s, want 200", model, w.Code, w.Body.String())
+		}
+	}
+	w := testRequest(s, http.MethodPost, "/v1/chat/completions", endpointTestBody("/v1/chat/completions", "exp-embed"))
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("非 chat 模型 status=%d body=%s, want 400", w.Code, w.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"exp-picker", "exp-category", "exp-plain", "exp-secondary"}; !reflect.DeepEqual(forwarded, want) {
+		t.Fatalf("转发的模型 = %v, want %v", forwarded, want)
 	}
 }

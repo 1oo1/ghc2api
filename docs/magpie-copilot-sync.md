@@ -8,7 +8,7 @@
 并按「同步 VS Code 的 Credits 与 Additional Budget」核对 [VS Code](https://github.com/microsoft/vscode)
 的额度解析与展示，三者的基线分别记录。
 
-当前实现对照的上游基线：`65bd4e4f724121bc66800d5cb431dc9ce7c046f2`。
+当前实现对照的上游基线：`c4f7ba9d3a06d53156ee5186f72773a25b9d1f73`。
 完成后续同步并通过验证时，应将本文和 README 中记录的基线更新为实际核对的上游提交。
 
 ## 已删除的 Auto
@@ -55,7 +55,7 @@ git -C .local/magpie log -1 --format='%H %cs %s'
 从上次同步记录的提交开始查看相关差异。首次核对可用本文开头的基线：
 
 ```sh
-BASE=65bd4e4f724121bc66800d5cb431dc9ce7c046f2
+BASE=c4f7ba9d3a06d53156ee5186f72773a25b9d1f73
 git -C .local/magpie diff --name-status "${BASE}..HEAD"
 git -C .local/magpie diff "${BASE}..HEAD" -- \
   internal/provider/account.go \
@@ -97,8 +97,12 @@ git -C .local/magpie log --oneline --all --regexp-ignore-case --grep='copilot'
 | --- | --- |
 | `internal/copilot/login.go`、`credentials.go` | `internal/provider/copilot_signin.go`、`copilot_accounts.go`、`account.go` 中的 OAuth 登录和凭证行为 |
 | `internal/copilot/config.go`、`session.go` | `internal/provider/account.go`、`copilot_ghe.go` 中的主机、OAuth session 和身份头行为 |
-| `internal/copilot/models.go` | `internal/provider/account.go` 及相关模型数据和测试（不含 Auto 相关部分） |
+| `internal/copilot/models.go` | `internal/provider/account.go` 的 `copilotModels` 及相关模型数据和测试（不含 Auto 相关部分）。展示规则同步 #4343（picker 启用的 `Experimental` 模型可见）；不同步图片模型（`Draws`，本项目不提供 `/images`）与把 `max_prompt_tokens` 当窗口（模型元数据原样透传） |
 | `internal/copilot/service.go`、`request.go`、`itemids.go`、`outputreplay.go` | provider 请求签名与 `internal/gateway/` 的转发、协议和流式行为（含 `itemids.go` 的 Responses 项 id 统一、`outputreplay.go` 对应 `codex_backend.go` 的 `forVendor` 中去掉 output token replay 的部分） |
+| `internal/copilot/inputitemids.go` | `internal/gateway/codex_backend.go` 的 `plainItemIDs`（含 `itemIDCap`、`boundItemID`、`idOptional`、`itemKindPrefix`、`openaiItemPrefix`），在 `service.go` 的 `handleGeneration` 中于 `withoutOutputReplay` 之后调用。不同步 `boundCallIDs`（`call_id` 超长，仅 ChatGPT 后端）与 `callItemIDs`（`fc_` 改 `tsc_`/`ctc_`） |
+| `internal/copilot/geminitools.go` | `internal/gateway/copilot_gemini_required.go` 的 `copilotGeminiToolsFit`、`copilot_gemini_schema.go` 的 `copilotGeminiToolUnions`（含不相交证明）与 `gemini_schema.go` 的 `geminiNamed`，调用顺序同 `gateway.go`（先 ToolsFit 再 ToolUnions）。不同步 Gemini 可空联合补 `type`（magpie 自身翻译层的行为）；Grok 部分见下一行 |
+| `internal/copilot/groktools.go`、`grokschema.go`、`grokreply.go` | `internal/gateway/copilot_gemini_schema.go` 的 `copilotGrokFlat`、`grok_integral.go` 的 `grokModel`、`gateway.go` 中 Copilot Grok 有自定义工具时翻译的分支；`internal/provider/grok.go` 的 `GrokFlatBody`、`grokFlat`、`flatCall`、`FlatName`、`liteNamespace`、`ObjectRoot`（含 `objectRootIn`、`nestedUnion`、`appendDistinct`、`grokRef`）；`internal/gateway/responses.go` 的 `customSchema`、`customDescription`、`customInput`、`callTo`、`itemPrefix`，工具提供、历史项转换与流式事件发出；`custom_tool.go` 的 `customStream`；`grok_namespace.go` 的 `namespacedIn`、`nsTidy`。magpie 有翻译层，自定义工具当 function、namespace 摊平、根联合合并后，模型的调用在翻译层还原；本项目没有翻译层，改为请求改写（`grokRequest`）加回复还原（`grokRestorer`，SSE 与 JSON，先于 `itemids.go` 的 id 统一）。不同步 tool search（`tool_search_call`）与 `additional_tools` 中的工具、「自定义工具被拒后再学习」的机制（本项目对 Copilot 的 Grok 固定改写） |
+| `internal/copilot/pool.go`（`peekGeneration`、`chooseFor`）、`pool_models.go`、`models.go` 的 `modelAvailability` | `internal/provider/copilot_pool.go`（b9a1b4aa1）：只同步生成请求按模型过滤账号（只发往有该模型的账号）；模型列表不取并集（`/models` 逐个尝试、首个成功即返回，见 `pool.md`「模型列表」）。只借用语义，实现按本项目结构；不同步 24h 节流与桌面账号管理 |
 
 只同步本服务已经支持的功能。magpie 的多账号管理、桌面 UI、agent 集成等不属于本项目的
 provider 代理范围；不要整文件复制，也不要为追求代码结构一致而引入这些依赖。
@@ -106,7 +110,7 @@ provider 代理范围；不要整文件复制，也不要为追求代码结构�
 ## 同步 CLIProxyAPI 会话亲和键
 
 本项目会话键（`sessionKey`，见 `session-affinity.md`）的会话 ID 来源与优先级参照 cpa。cpa 的
-基线：`90c447d3a8727d115aa7552ec93ce023736ed492`（2026-10-29）。
+基线：`9a8ca1b577ef8573c5ccf108450b93ed57716cc4`（2026-11-12）。
 
 首次获取与更新方式同 magpie，克隆到 `.local/cpa`：
 
@@ -123,7 +127,7 @@ git -C .local/cpa log -1 --format='%H %cs %s'
 核对差异：
 
 ```sh
-CPA_BASE=90c447d3a8727d115aa7552ec93ce023736ed492
+CPA_BASE=9a8ca1b577ef8573c5ccf108450b93ed57716cc4
 git -C .local/cpa diff "${CPA_BASE}..HEAD" -- \
   sdk/cliproxy/session/info.go \
   sdk/cliproxy/session/identity.go \
@@ -162,7 +166,7 @@ git -C .local/cpa grep -n -i -E \
 | Gemini `cachedContent`、请求体外层 `request` 包装 | 不同步，本项目不接收 Gemini 协议 |
 | `execution_session_id`、LCP 前缀匹配、`derived` 会话指纹 | 不同步，保留本项目的「首条 user 消息」兜底 |
 | 绑定键含 provider 与 model | 不同步，键只由会话信号决定，不含客户端密钥与 model |
-| gjson 宽松解析：数字等非字符串字段转成字符串；未闭合或带尾随内容的 `metadata.user_id` JSON 仍可取出 `session_id`；重复键取第一个 | `encoding/json` 严格解析：只接受 JSON 字符串；畸形 `user_id` JSON 不识别为 Claude 会话（落到 `user:` 或兜底）；重复键取最后一个 |
+| gjson 宽松解析（cpa 于 6e6afab9 改用 API 兼容的 MoeForge `ojson`）：数字等非字符串字段转成字符串；未闭合或带尾随内容的 `metadata.user_id` JSON 仍可取出 `session_id`；重复键取第一个 | `encoding/json` 严格解析：只接受 JSON 字符串；畸形 `user_id` JSON 不识别为 Claude 会话（落到 `user:` 或兜底）；重复键取最后一个 |
 
 cpa 新增或调整会话来源（请求头、请求体字段、优先级、规范化）时，先在 `affinity_key_test.go`
 补测试，再修改来源表，并同步 `session-affinity.md`「会话键」。会话键变化会使已持久化的绑定失效，
@@ -173,7 +177,7 @@ cpa 新增或调整会话来源（请求头、请求体字段、优先级、规�
 本项目额度（`quota-stats.md`）的主额度窗口（Credits / Premium requests / Chat messages）、
 Additional Budget 窗口，以及生成响应头的额度快照合并，语义参照 VS Code（Copilot 扩展已并入
 `microsoft/vscode` 仓库的 `extensions/copilot/`）。对应的初次同步是本项目提交 `571ca90`。VS Code 的
-基线：`b6bfa95ebee8b183d65dee4997c0527eadfe5384`（2026-10-29）。
+基线：`52073a464821e207fc0510f2b6ccdba47f706aad`（2026-11-12）。
 
 VS Code 仓库很大，用浅克隆放到 `.local/vscode-src`：
 
@@ -189,7 +193,7 @@ git -C .local/vscode-src log -1 --format='%H %cs %s'
 浅克隆没有提交历史，`log` 不能列出区间内的提交；把基线也按提交号浅取下来，再比较两棵树：
 
 ```sh
-VSCODE_BASE=b6bfa95ebee8b183d65dee4997c0527eadfe5384
+VSCODE_BASE=52073a464821e207fc0510f2b6ccdba47f706aad
 git -C .local/vscode-src fetch --depth=1 origin "${VSCODE_BASE}"
 git -C .local/vscode-src diff "${VSCODE_BASE}" HEAD -- \
   extensions/copilot/src/platform/chat/common/chatQuotaServiceImpl.ts \

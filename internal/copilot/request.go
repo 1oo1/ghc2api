@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -104,24 +105,35 @@ func (b upstreamBody) Read(p []byte) (int, error) {
 }
 
 // streamResponse 把上游回复透传给客户端，SSE 回复每读到一段就 flush。
-// tidyItemIDs 为 true 时（仅 /responses），SSE 流经 itemIDTidy 统一输出项 id；非 SSE 回复始终逐字节透传。
-func streamResponse(w http.ResponseWriter, res *http.Response, tidyItemIDs bool) {
+// tidyItemIDs 为 true 时（仅 /responses），SSE 流经 itemIDTidy 统一输出项 id；非 SSE 回复除下面的还原外逐字节透传。
+// restore 非空时（仅 Grok 的 /responses 且请求有改名或自定义调用，见 grokreply.go）且上游状态是 2xx，回复里模型的调用先被还原：
+// SSE 流在 itemIDTidy 之前经 restore 改写；JSON 回复读完整后改写，Content-Length 随之更新。错误状态的回复不改写。
+func streamResponse(w http.ResponseWriter, res *http.Response, tidyItemIDs bool, restore *grokRestorer) {
 	defer res.Body.Close()
+	if res.StatusCode/100 != 2 {
+		restore = nil
+	}
 	copyResponseHeaders(w.Header(), res.Header)
 	if res.StatusCode >= http.StatusBadRequest {
 		// 错误状态的正文可能读取不完整，不转发 Content-Length（同 writeUpstreamError）。
 		w.Header().Del("Content-Length")
 	}
-	stream := strings.HasPrefix(strings.ToLower(res.Header.Get("Content-Type")), "text/event-stream")
+	contentType := strings.ToLower(res.Header.Get("Content-Type"))
+	stream := strings.HasPrefix(contentType, "text/event-stream")
 	if stream {
 		w.Header().Set("X-Accel-Buffering", "no")
 	}
-	w.WriteHeader(res.StatusCode)
 	body := upstreamBody{body: res.Body, w: w, success: res.StatusCode < http.StatusBadRequest}
 	if !stream {
+		if restore != nil && strings.Contains(contentType, "json") {
+			copyRestoredJSON(w, res.StatusCode, body, restore)
+			return
+		}
+		w.WriteHeader(res.StatusCode)
 		_, _ = io.Copy(w, body)
 		return
 	}
+	w.WriteHeader(res.StatusCode)
 	controller := http.NewResponseController(w)
 	_ = controller.Flush()
 	var tidy *itemIDTidy
@@ -143,6 +155,9 @@ func streamResponse(w http.ResponseWriter, res *http.Response, tidyItemIDs bool)
 		n, err := body.Read(buffer)
 		if n > 0 {
 			chunk := buffer[:n]
+			if restore != nil {
+				chunk = restore.write(chunk)
+			}
 			if tidy != nil {
 				chunk = tidy.write(chunk)
 			}
@@ -151,11 +166,59 @@ func streamResponse(w http.ResponseWriter, res *http.Response, tidyItemIDs bool)
 			}
 		}
 		if err != nil {
-			if tidy != nil {
-				send(tidy.flush())
+			// 两层都只输出完整事件：restore 的不完整尾部经 tidy 缓存后与它自己的尾部一起原样写出。
+			var rest []byte
+			if restore != nil {
+				rest = restore.flush()
+				if tidy != nil {
+					rest = tidy.write(rest)
+				}
 			}
+			if tidy != nil {
+				rest = append(rest, tidy.flush()...)
+			}
+			send(rest)
 			return
 		}
+	}
+}
+
+// grokJSONLimit 是还原非流式 JSON 回复时最多读入内存的字节数（默认 16 MiB）。更大的回复不还原，原样透传。包级变量便于测试缩短。
+var grokJSONLimit = 16 << 20
+
+// writeChunkSize 是向客户端分块写出整块数据时每次 Write 的字节数：generationWriter 每次 Write 前续期写截止时间，
+// 分块使慢客户端读一个大回复时按块续期，而不是被一次整体写超时。
+const writeChunkSize = 32 << 10
+
+// writeChunks 把 data 按 writeChunkSize 分块写给 w，写失败时返回错误。
+func writeChunks(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n := min(len(data), writeChunkSize)
+		if _, err := w.Write(data[:n]); err != nil {
+			return err
+		}
+		data = data[n:]
+	}
+	return nil
+}
+
+// copyRestoredJSON 读入上游的 JSON 回复，还原其中模型的调用后分块写给客户端。回复不是可还原的 response 或没有改动时原样写出；
+// 超过 grokJSONLimit 时不还原，把已读部分与剩余部分原样写出，状态码、响应头与 Content-Length 都不变。
+// 改写后 Content-Length 设为新正文的长度。读取上游失败时（已由 upstreamBody 标记网络错误）把已读到的部分原样写出，与不还原时一致。
+func copyRestoredJSON(w http.ResponseWriter, status int, body io.Reader, restore *grokRestorer) {
+	data, err := io.ReadAll(io.LimitReader(body, int64(grokJSONLimit)+1))
+	if err == nil && len(data) <= grokJSONLimit {
+		if restored, ok := restore.restoreJSON(data); ok {
+			data = restored
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		}
+		w.WriteHeader(status)
+		_ = writeChunks(w, data)
+		return
+	}
+	w.WriteHeader(status)
+	if writeChunks(w, data) == nil && err == nil {
+		_, _ = io.Copy(w, body)
 	}
 }
 

@@ -1,6 +1,6 @@
 # 账号池：选择、故障切换与冷却
 
-代码：`internal/copilot/pool.go`（`forward`、`pickSession`、`record`、`choose`）、`cooldown.go`（错误计数、冷却与持久化，`setCooldown`/`available`）、`affinity_gate.go`（会话门）、`weight.go`（读取额度，不访问上游）、`quota_header.go`（`parseQuotaHeader`、`quotaHeaderSnapshot`、`applyQuotaHeaders`：生成响应头额度快照合并，见 `quota-stats.md`）、`service.go`。额度桶 `QuotaBucket` 在 `quota.go`，其字段 `Entitlement` 仅 `additional_budget` 桶使用。
+代码：`internal/copilot/pool.go`（`peekGeneration`、`forward`、`pickSession`、`record`、`choose`、`chooseFor`）、`pool_models.go`（模型列表按账号逐个尝试，`serveModels`）、`cooldown.go`（错误计数、冷却与持久化，`setCooldown`/`available`）、`affinity_gate.go`（会话门）、`weight.go`（读取额度，不访问上游）、`quota_header.go`（`parseQuotaHeader`、`quotaHeaderSnapshot`、`applyQuotaHeaders`：生成响应头额度快照合并，见 `quota-stats.md`）、`service.go`、`models.go`（`modelAvailability`，选号按模型过滤的依据）。额度桶 `QuotaBucket` 在 `quota.go`，其字段 `Entitlement` 仅 `additional_budget` 桶使用。
 
 ## 结构与构造
 
@@ -27,9 +27,10 @@ NewManagedPool(PoolConfig, []PoolAccount) (*Pool, error)
 flowchart TD
     A["业务请求（已通过 api_key 鉴权）"] --> B{"routeOf：需要访问上游？"}
     B -- "否：healthz / 404 / 405 / 重定向" --> B1["idle 路由直接处理<br/>不选账号，0 账号也可用"]
-    B -- 是 --> B2{"生成接口（登记了 upstream）？<br/>占用并发名额 MaxConcurrentRequests"}
+    B -- "模型列表" --> BM["serveModels：choose(空键, tried) 逐个选账号，首个 2xx 原样返回<br/>不绑定会话、不按模型过滤，见「模型列表」"]
+    B -- "生成请求" --> B2{"占用并发名额 MaxConcurrentRequests"}
     B2 -- "名额已满" --> B3["503 生成请求并发数已达上限<br/>不读取请求体、不选账号、不访问上游"]
-    B2 -- "非生成接口，或占用成功" --> C["affinityKey：计算会话键<br/>仅生成请求且开启亲和；请求体 ≤100 MiB<br/>否则 key 为空"]
+    B2 -- "占用成功" --> C["peekGeneration：读取请求体一次，取 model 与会话键<br/>会话键仅开启亲和时计算；请求体 ≤100 MiB<br/>超限或读取失败则 key、model 为空"]
     C -- "开启亲和、请求体已读取但无会话信号" --> C0["500 无法计算模型缓存 key<br/>不选账号、不访问上游"]
     C --> C1{"key 非空且开启亲和？"}
     C1 -- 否 --> D["tried = 空集"]
@@ -38,8 +39,8 @@ flowchart TD
     CR -- 否 --> C2["取得会话门 keyGate(key)<br/>同键请求在此排队；等待受 ctx 约束"]
     C2 -- "等待中客户端取消" --> C3["直接返回<br/>不选账号、不推进轮询、不计数、不写响应"]
     C2 -- 获得门 --> D
-    D --> E["choose(key, tried)"]
-    E --> F{"key 非空、开启亲和且已绑定，<br/>绑定账号存在、未禁用、未冷却、<br/>未耗尽、本请求未尝试，<br/>且（有 Credits 或最优档也无 Credits）？"}
+    D --> E["chooseFor(key, model, tried)<br/>model 非空时先排除列表已知却没有该模型的账号<br/>选不出再去掉排除（见「按模型过滤」）"]
+    E --> F{"key 非空、开启亲和且已绑定，<br/>绑定账号存在、未禁用、未冷却、<br/>未耗尽、本请求未尝试、不在模型排除内，<br/>且（有 Credits 或最优档也无 Credits）？"}
     F -- 是 --> G["使用绑定账号<br/>（不受上限限制，不推进轮询）"]
     F -- 否 --> F1{"key 非空且开启亲和？"}
     F1 -- 否 --> H["pickLocked(now, tried)<br/>先分档，再档内 SWRR（见下图）"]
@@ -119,7 +120,26 @@ flowchart TD
 - 权重与耗尽判断只读账号的额度缓存，不访问上游。缓存额度在两种时机变化：刷新，以及生成请求的上游响应头额度快照合并（`applyQuotaHeaders`，见 `quota-stats.md`「响应头额度快照合并」）；后者在两次轮询之间也会生效，因此账号可能不经刷新就被判为耗尽并被跳过。额度由后台定时刷新保持新鲜（无需打开控制台，与是否配置 `management_key` 无关），账号请求失败（非 429）时还会异步刷新该账号的额度；因此一次失败后，该账号的额度可能立即变为耗尽并被跳过。启用 `management_key` 后仍可在控制台强制刷新额度。
 - 无可选账号（0 个、全部禁用、全部冷却，或全部耗尽未到重置时刻）时，需要账号的请求直接返回 503（`没有可用的 GitHub Copilot 账号`），不访问上游。
 - `/healthz`、404、405、重定向不访问上游，由池直接处理，0 账号也能工作。
-- 模型列表是各账号独立获取的；订阅不同时某模型可能只在部分账号可用，被分到不支持的账号会返回 400。
+- 各账号订阅可能不同，模型列表也可能不同：生成请求按请求的模型过滤账号（见下文「按模型过滤」）；`GET /models` 不做并集，只返回首个成功账号的列表（见「模型列表」）。
+
+### 按模型过滤（`chooseFor`）
+
+生成请求在选号前由 `peekGeneration` 从请求体取 `model`，与会话键共用一次读取：读后原样放回 `r.Body`，上限 `maxRequestBody`；未开启亲和时也读取。按 `encoding/json` 解析顶层 `model`（键名大小写不敏感，与 `Service` 一致），不是非空字符串、请求体非法、读取失败或超限时视为无模型，不过滤。
+
+有模型时，账号的模型列表**已知**却不含该模型的账号在本次选择中视为排除。判断来自 `(*Service).modelAvailability(id) (listed, known)`：
+
+- 依据是账号内存中最近一次加载的模型列表（不论是否过期），读取原子快照（每次给 `Service.models` 赋值时更新），**不阻塞**：选号时持有 `Pool.mu`，不能等待 `modelsMu`（可能正在刷新模型列表），也不会为路由额外访问上游。列表在账号首次处理生成请求（校验模型）或查询模型列表时自然加载（含从磁盘缓存读入）。
+- `known = false`：从未加载过，或已被冷却清空（`forgetModels`）。此时账号不被排除，行为同旧版。
+- `listed = true` 当且仅当该 id 在可见列表（`Data`）中，或在隐藏 chat 模型（`Endpoints`）中且不在 `Disabled` 中，并且账号当前未拒绝它（`isRefused` 为 false）。`Disabled` 记录 `/models` 里策略明确不是 `enabled` 且没有条款（`policy.terms` 为空）的 chat 模型（不论内部 id、`Experimental`、picker 启用与否）：它们不进可见列表，只在 `Endpoints` 里留有路径记录，账号并不能用，否则请求仍会落到该账号得到 400/403。`Disabled` 随模型列表持久化到磁盘缓存（JSON 键 `disabled`，旧缓存没有该字段时视为空，即旧行为）。生成前的路径校验不看 `Disabled`，仍可手动指定隐藏模型。`known && !listed` 即被排除。
+
+排除的效果：
+
+- 被排除的账号与已尝试的账号一样不参与分档（`topGroupLocked`）、绑定上限（`withinCapLocked`）、SWRR 与 Credits 让位（`creditsElsewhere`），只在未被排除的账号中计算；
+- 亲和绑定的账号被排除时不使用该绑定，按常规重新选择并改绑；
+- 排除后选不出任何账号时，去掉模型排除再选一次，即旧行为：请求交给账号处理，由其按模型列表校验返回 400（不是 503），亲和绑定也照旧使用。被排除不等于已尝试，因此回退时仍可选，session 失败后换号的循环里每次选择都是如此；
+- 无模型的请求（模型列表、无效请求体）选号行为不变。
+
+`choose(key, tried)` 保留，等价于不带模型的 `chooseFor`。
 
 ### 分档与轮询（`pickLocked`）
 
@@ -140,8 +160,19 @@ flowchart TD
 
 - 会话已绑定账号时优先使用；该账号禁用、冷却、耗尽、本请求已尝试过，或无 Credits 而最优档有 Credits 时，改为无可用绑定的选择（先取最优档，在档内排除已达上限的账号，再 SWRR，见 `session-affinity.md`）。
 - 取得 session 之后账号可能已因另一个请求的错误进入冷却：此时不绑定会话键，本次请求仍由该账号处理（它在冷却前已被选中，属于在途请求），之后的请求不会再选中它。
-- 仅模型列表与生成请求（chat completions、responses、`/v1/messages`）在 session 获取失败（网络错误、上游错误响应、无效 session）时切换：该次失败计入账号的连续错误（按状态码规则，见下文），同请求改用未尝试过的账号（冷却中与耗尽的账号不参与），每个账号每请求最多尝试一次，全部失败返回最后一个账号的错误。session 失败不再造成 1 分钟的短冷却。
+- 仅生成请求（chat completions、responses、`/v1/messages`）在 session 获取失败（网络错误、上游错误响应、无效 session）时切换（模型列表的逐个尝试见「模型列表」）：该次失败计入账号的连续错误（按状态码规则，见下文），同请求改用未尝试过的账号（冷却中与耗尽的账号不参与；换号时同样按模型过滤），每个账号每请求最多尝试一次，全部失败返回最后一个账号的错误。session 失败不再造成 1 分钟的短冷却。
 - 生成请求失败后不会在其他账号重发。
+
+## 模型列表（`pool_models.go`）
+
+`GET /models`、`GET /v1/models`（路由登记为 `needModels`）不做并集：前提是各账号的模型相同，因此只取一个账号的列表；各账号模型不同时，只返回首个成功账号的列表（并集要等所有账号，没有收益）。
+
+- 选号：`serveModels` 用 `choose("", tried)` 逐个选账号，即没有会话键、不按模型过滤，仍按优先级与 Credits 分档加 SWRR，排除禁用、冷却、耗尽与本请求已试过的账号，与生成请求共用同一份轮询状态。
+- 每次尝试调用 `queryModels`，复用该账号现有的 `handleModels`（含 session 获取、模型缓存、被该账号拒绝的模型隐藏），响应先写入内存。账号返回 2xx 时把它的响应（状态码、响应头、正文）原样写给客户端并结束，不再访问其他账号；否则把该账号记入 `tried`，继续选下一个。
+- 全部失败时原样写出最后一次失败的响应；一个账号都选不出（0 个、全部禁用、冷却或耗尽）时返回 503（`没有可用的 GitHub Copilot 账号`），不访问上游。某次尝试失败后发现客户端已取消时停止尝试，不写响应，也不计入连续错误（尝试已成功时照常写出）。
+- 计数复用现有规则，与经 Pool 把 `/models` 发往单个账号时一致：每次尝试计该账号一次请求；session 获取失败经 `noteSessionFailure` 按 `countSessionFailure` 计入一次（`record` 以 `countErrors=false` 只更新统计）；`handleModels` 的上游错误按状态码计入，401/403 一次即冷却。无会话键，不涉及风控记录与亲和绑定。
+- 输出 Info 日志「模型列表已返回」（成功）或 Warn 日志「模型列表查询全部失败」：尝试的账号数 `attempts` 与是否成功 `succeeded`。
+- 各账号的模型列表按 `models_cache_ttl` 缓存，缓存有效期内不再访问上游。
 
 ## 限流、错误计数与冷却
 
@@ -192,4 +223,4 @@ flowchart TD
 
 ## 测试依赖的内部名字
 
-`riskTable`（`newRiskTable`、`add`、`lookup`、`save`、`load`）、`riskBlockTTL`、`riskBlockMessage`、`riskBlockFileName`、`Pool.risk`、`(*Pool).gate`、`keyGate`（字段 `mu`、`m`）、`gateEntry.waiters`、`Pool.accounts`、`pickLocked(now, tried map[*poolAccount]bool)`、`(*Pool).choose(key string, tried map[*poolAccount]bool)`、`(quotaWeight).swrrWeight() int`、`DefaultSessionAffinityMaxPerAccount`、`PoolConfig.SessionAffinityMaxPerAccount`、`(*affinityTable).activeCounts(time.Time) map[string]int`、`MinPriority`/`MaxPriority`、`quotaWeight`/`weigh(*Quota)`、`exhaustedUntil(*Quota)`、`(*poolAccount).exhausted(time.Time) bool`、`DefaultAccountCooldown`、`PoolConfig.AccountCooldown`、`(*Service).setCooldown(time.Time)`/`available(time.Time) bool`、`ruleOf`/`ruleUntilReset`（`cooldown.go`）、`(*poolAccount).record`、`(*Pool).findAccount(id)`（忽略大小写）、`(*Service).cacheDir`、`(*Pool).Handler()`、`generationWriteTimeout`；额度刷新相关的 `DefaultQuotaRefreshInterval`、`(*Service).quotaRefreshInterval`、`quotaRefreshTick`、`quotaErrorRefreshInterval`、`quotaRefreshTimeout`、`(*Pool).RunQuotaRefresh(ctx)`、`(*poolAccount).refreshAfterError()`、`quotaCache.refreshing`；测试辅助 `testClient`、`testJSON`、`testService`、`testDevice`（login_test.go）、`poolUpstream`（pool_test.go）、`quotaTimeoutMessage`（management_review_test.go）。其余名字见 `session-affinity.md`、`quota-stats.md`、`management.md`。
+`(*Service).modelAvailability(id string) (listed, known bool)`、`(*Pool).chooseFor(key, model string, tried map[*poolAccount]bool)`、`(*Pool).peekGeneration`、`(*Pool).serveModels`、`riskTable`（`newRiskTable`、`add`、`lookup`、`save`、`load`）、`riskBlockTTL`、`riskBlockMessage`、`riskBlockFileName`、`Pool.risk`、`(*Pool).gate`、`keyGate`（字段 `mu`、`m`）、`gateEntry.waiters`、`Pool.accounts`、`pickLocked(now, tried map[*poolAccount]bool)`、`(*Pool).choose(key string, tried map[*poolAccount]bool)`、`(quotaWeight).swrrWeight() int`、`DefaultSessionAffinityMaxPerAccount`、`PoolConfig.SessionAffinityMaxPerAccount`、`(*affinityTable).activeCounts(time.Time) map[string]int`、`MinPriority`/`MaxPriority`、`quotaWeight`/`weigh(*Quota)`、`exhaustedUntil(*Quota)`、`(*poolAccount).exhausted(time.Time) bool`、`DefaultAccountCooldown`、`PoolConfig.AccountCooldown`、`(*Service).setCooldown(time.Time)`/`available(time.Time) bool`、`ruleOf`/`ruleUntilReset`（`cooldown.go`）、`(*poolAccount).record`、`(*Pool).findAccount(id)`（忽略大小写）、`(*Service).cacheDir`、`(*Pool).Handler()`、`generationWriteTimeout`；额度刷新相关的 `DefaultQuotaRefreshInterval`、`(*Service).quotaRefreshInterval`、`quotaRefreshTick`、`quotaErrorRefreshInterval`、`quotaRefreshTimeout`、`(*Pool).RunQuotaRefresh(ctx)`、`(*poolAccount).refreshAfterError()`、`quotaCache.refreshing`；测试辅助 `testClient`、`testJSON`、`testService`、`testDevice`（login_test.go）、`poolUpstream`（pool_test.go）、`quotaTimeoutMessage`（management_review_test.go）。其余名字见 `session-affinity.md`、`quota-stats.md`、`management.md`。

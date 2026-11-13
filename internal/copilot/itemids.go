@@ -23,27 +23,32 @@ type itemIDTidy struct {
 // write 追加上游字节，返回其中已完整的事件（可能经过改写）；不完整的部分留待后续。
 func (t *itemIDTidy) write(b []byte) []byte {
 	t.buf = append(t.buf, b...)
-	var out []byte
-	start := 0
-	for i := 0; i < len(t.buf); i++ {
-		if t.buf[i] != '\n' {
+	out, rest := rewriteEvents(t.buf, t.event)
+	t.buf = append(t.buf[:0], t.buf[rest:]...)
+	return out
+}
+
+// rewriteEvents 把 buf 中已完整的 SSE 事件（以空行结束，行尾为 LF 或 CRLF）依次交给 rewrite，返回改写结果的拼接，
+// 以及 buf 中未处理的部分（不完整的尾部）的起点。rewrite 返回的字节会被复制，不必与 buf 分离；返回空表示丢弃该事件。
+func rewriteEvents(buf []byte, rewrite func(ev []byte) []byte) (out []byte, rest int) {
+	for i := 0; i < len(buf); i++ {
+		if buf[i] != '\n' {
 			continue
 		}
 		end := 0
-		if i+1 < len(t.buf) && t.buf[i+1] == '\n' {
+		if i+1 < len(buf) && buf[i+1] == '\n' {
 			end = i + 2
-		} else if i+2 < len(t.buf) && t.buf[i+1] == '\r' && t.buf[i+2] == '\n' {
+		} else if i+2 < len(buf) && buf[i+1] == '\r' && buf[i+2] == '\n' {
 			end = i + 3
 		}
 		if end == 0 {
 			continue
 		}
-		out = append(out, t.event(t.buf[start:end])...)
-		start = end
+		out = append(out, rewrite(buf[rest:end])...)
+		rest = end
 		i = end - 1
 	}
-	t.buf = append(t.buf[:0], t.buf[start:]...)
-	return out
+	return out, rest
 }
 
 // flush 原样返回剩余的不完整字节并清空缓冲。
