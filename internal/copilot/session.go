@@ -15,6 +15,15 @@ var editorHeaders = map[string]string{
 	"Copilot-Integration-Id": "vscode-chat", "User-Agent": "GitHubCopilotChat/0.68.0",
 }
 
+// chatAPIVersion 是发往 Copilot API（session 返回的 API 主机）除 GET /models 外所有请求的 X-GitHub-Api-Version，沿用 magpie。
+const chatAPIVersion = "2026-01-09"
+
+// modelsAPIVersion 只用于 GET /models：Copilot Chat 0.68（@vscode/copilot-api 0.5.2）对 /models 发送此版本。
+// 在 2026-01-09 下，有长上下文档的模型只列出默认档的 max_prompt_tokens（claude-opus-5.5 为 200000）；
+// 从 2026-06-01 起列出完整窗口（1000000），并在 billing.token_prices 中给出 default 与 long_context 两档。
+// 本项目原样透传模型元数据，客户端由此看到完整窗口（对应 magpie 767029501）。
+const modelsAPIVersion = "2026-08-01"
+
 type session struct {
 	Token     string `json:"token"`
 	ExpiresAt int64  `json:"expires_at"`
@@ -32,7 +41,7 @@ type cachedSession struct {
 
 func (session session) setHeaders(header http.Header) {
 	header.Set("Authorization", "Bearer "+session.Token)
-	header.Set("X-GitHub-Api-Version", "2026-01-09")
+	header.Set("X-GitHub-Api-Version", chatAPIVersion)
 	for key, value := range editorHeaders {
 		header.Set(key, value)
 	}

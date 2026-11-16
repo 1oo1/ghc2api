@@ -8,7 +8,7 @@
 并按「同步 VS Code 的 Credits 与 Additional Budget」核对 [VS Code](https://github.com/microsoft/vscode)
 的额度解析与展示，三者的基线分别记录。
 
-当前实现对照的上游基线：`e5b8f381dcd027ebd77a5b3861e2536e51068c0f`。
+当前实现对照的上游基线：`58f24cc23527776b5f1958cfd4a8092a659bdfb5`。
 完成后续同步并通过验证时，应将本文和 README 中记录的基线更新为实际核对的上游提交。
 
 ## 已删除的 Auto
@@ -55,7 +55,7 @@ git -C .local/magpie log -1 --format='%H %cs %s'
 从上次同步记录的提交开始查看相关差异。首次核对可用本文开头的基线：
 
 ```sh
-BASE=e5b8f381dcd027ebd77a5b3861e2536e51068c0f
+BASE=58f24cc23527776b5f1958cfd4a8092a659bdfb5
 git -C .local/magpie diff --name-status "${BASE}..HEAD"
 git -C .local/magpie diff "${BASE}..HEAD" -- \
   internal/provider/account.go \
@@ -97,7 +97,7 @@ git -C .local/magpie log --oneline --all --regexp-ignore-case --grep='copilot'
 | --- | --- |
 | `internal/copilot/login.go`、`credentials.go` | `internal/provider/copilot_signin.go`、`copilot_accounts.go`、`account.go` 中的 OAuth 登录和凭证行为 |
 | `internal/copilot/config.go`、`session.go` | `internal/provider/account.go`、`copilot_ghe.go` 中的主机、OAuth session 和身份头行为 |
-| `internal/copilot/models.go` | `internal/provider/account.go` 的 `copilotModels` 及相关模型数据和测试（不含 Auto 相关部分）。展示规则同步 #4343（picker 启用的 `Experimental` 模型可见）；不同步图片模型（`Draws`，本项目不提供 `/images`）与把 `max_prompt_tokens` 当窗口（模型元数据原样透传） |
+| `internal/copilot/models.go` | `internal/provider/account.go` 的 `copilotModels` 及相关模型数据和测试（不含 Auto 相关部分）。展示规则同步 #4343（picker 启用的 `Experimental` 模型可见）；同步 767029501 的 `GET /models` 使用 API 版本 `2026-08-01`（上游 `copilotModelsVersion`，本项目 `modelsAPIVersion`，见 `upstream.md`「请求身份」）；不同步图片模型（`Draws`，本项目不提供 `/images`）、把 `max_prompt_tokens` 当窗口与按 `billing.token_prices` 计算窗口/价格（`copilotTokenPrices.apply`，模型元数据原样透传，由客户端自行解读） |
 | `internal/copilot/service.go`、`request.go`、`itemids.go`、`outputreplay.go` | provider 请求签名与 `internal/gateway/` 的转发、协议和流式行为（含 `itemids.go` 的 Responses 项 id 统一、`outputreplay.go` 对应 `codex_backend.go` 的 `forVendor` 中去掉 output token replay 的部分） |
 | `internal/copilot/inputitemids.go` | `internal/gateway/codex_backend.go` 的 `plainItemIDs`（含 `itemIDCap`、`boundItemID`、`idOptional`、`itemKindPrefix`、`openaiItemPrefix`），在 `service.go` 的 `handleGeneration` 中于 `withoutOutputReplay` 之后调用。不同步 `boundCallIDs`（`call_id` 超长，仅 ChatGPT 后端）与 `callItemIDs`（`fc_` 改 `tsc_`/`ctc_`） |
 | `internal/copilot/geminitools.go`、`geminishapes.go`、`geminitypes.go`、`jsontree.go` | `internal/gateway/copilot_gemini_required.go` 的 `copilotGeminiToolsFit`、`copilot_gemini_shapes.go` 的 `copilotGeminiToolShapes`、`gemini_schema.go` 的 `geminiTypes`（`keepUnions` 固定为 true，即非根联合节点不补 `type`）与 `geminiSchemaShapes`、`geminiNamed`，以及 `kimi_schema.go` 的类型推断辅助函数（`schemaTypes`、`keywordType`、`valuesType` 等），调用顺序同 `gateway.go`（先 ToolsFit、再 ToolShapes、最后 geminiTypes）。差异与已知缺口见下文「Gemini 工具 schema」；Grok 部分见下一行 |
@@ -106,6 +106,10 @@ git -C .local/magpie log --oneline --all --regexp-ignore-case --grep='copilot'
 
 只同步本服务已经支持的功能。magpie 的多账号管理、桌面 UI、agent 集成等不属于本项目的
 provider 代理范围；不要整文件复制，也不要为追求代码结构一致而引入这些依赖。
+
+### 已核对但不同步的上游提交
+
+- 62ced98cc（`gateway/gemini_level_body.go` 的 `geminiLevelBody`）：在非 Gemini 官方的 Chat/Anthropic 上游上，把 Gemini 3+ 的 thinking budget 改写为 thinking level。动机是自建中转把 budget 原样转给 Gemini 后被拒，没有 Copilot 拒绝 budget 的证据；本项目也不做协议翻译。出现 Copilot 拒绝的实例后再评估。
 
 ### Gemini 工具 schema
 
@@ -137,7 +141,7 @@ provider 代理范围；不要整文件复制，也不要为追求代码结构�
 ## 同步 CLIProxyAPI 会话亲和键
 
 本项目会话键（`sessionKey`，见 `session-affinity.md`）的会话 ID 来源与优先级参照 cpa。cpa 的
-基线：`1aaf56bc6a0fc6fce19049ba7ae8554c882304a6`（2026-11-13）。
+基线：`43806c865da7d47f9252316e95e315ad9f885b84`（2026-11-15）。
 
 首次获取与更新方式同 magpie，克隆到 `.local/cpa`：
 
@@ -154,7 +158,7 @@ git -C .local/cpa log -1 --format='%H %cs %s'
 核对差异：
 
 ```sh
-CPA_BASE=1aaf56bc6a0fc6fce19049ba7ae8554c882304a6
+CPA_BASE=43806c865da7d47f9252316e95e315ad9f885b84
 git -C .local/cpa diff "${CPA_BASE}..HEAD" -- \
   sdk/cliproxy/session/info.go \
   sdk/cliproxy/session/identity.go \
@@ -204,7 +208,7 @@ cpa 新增或调整会话来源（请求头、请求体字段、优先级、规�
 本项目额度（`quota-stats.md`）的主额度窗口（Credits / Premium requests / Chat messages）、
 Additional Budget 窗口，以及生成响应头的额度快照合并，语义参照 VS Code（Copilot 扩展已并入
 `microsoft/vscode` 仓库的 `extensions/copilot/`）。对应的初次同步是本项目提交 `571ca90`。VS Code 的
-基线：`4daf8f5c819d69f7014870ccd8478f74a64bd000`（2026-11-13）。
+基线：`91e8df9540c40b6e1664e87a0e528b8d7aab6393`（2026-11-16）。
 
 VS Code 仓库很大，用浅克隆放到 `.local/vscode-src`：
 
@@ -220,7 +224,7 @@ git -C .local/vscode-src log -1 --format='%H %cs %s'
 浅克隆没有提交历史，`log` 不能列出区间内的提交；把基线也按提交号浅取下来，再比较两棵树：
 
 ```sh
-VSCODE_BASE=4daf8f5c819d69f7014870ccd8478f74a64bd000
+VSCODE_BASE=91e8df9540c40b6e1664e87a0e528b8d7aab6393
 git -C .local/vscode-src fetch --depth=1 origin "${VSCODE_BASE}"
 git -C .local/vscode-src diff "${VSCODE_BASE}" HEAD -- \
   extensions/copilot/src/platform/chat/common/chatQuotaServiceImpl.ts \

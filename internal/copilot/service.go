@@ -327,6 +327,9 @@ func (s *Service) apiRequest(ctx context.Context, session session, method, path 
 		return nil, err
 	}
 	session.setHeaders(req.Header)
+	if method == http.MethodGet && path == "/models" {
+		req.Header.Set("X-GitHub-Api-Version", modelsAPIVersion)
+	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
