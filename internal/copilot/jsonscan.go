@@ -10,6 +10,7 @@ package copilot
 // json.Decoder.Token 对每个数字也会分配字符串，同样不可取。
 
 import (
+	"bytes"
 	"encoding/json"
 	"unicode/utf8"
 )
@@ -156,4 +157,95 @@ func hexValue(digits []byte) rune {
 		}
 	}
 	return r
+}
+
+// objectFields 把 raw 解析为 JSON 对象的成员（成员的值保持原文）；raw 不是对象（含 null）时返回 nil，读取 nil map 总是安全的。
+func objectFields(raw json.RawMessage) map[string]json.RawMessage {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil {
+		return nil
+	}
+	return fields
+}
+
+// decodeJSONString 把 JSON 字符串字面量 raw 解码到 s；raw 不是字符串（含 null）时返回 false。
+func decodeJSONString(raw json.RawMessage, s *string) bool {
+	return firstByte(raw) == '"' && json.Unmarshal(raw, s) == nil
+}
+
+// jsonMember 是 JSON 对象的一个成员在其容器原文中的位置。
+type jsonMember struct {
+	name    string // 解码后的键
+	value   []byte // 值的原文（容器的子切片，不含前导空白）
+	valueAt int    // value 在容器原文中的下标
+}
+
+// jsonMembers 按顺序返回 JSON 对象 raw 的成员，位置相对 raw 的起点；raw 不是对象时返回 nil。
+// 重复的键都会返回。值按 valueEnd 定界，不解析容器内部；输入非法时在无法前进处停止。
+func jsonMembers(raw []byte) []jsonMember {
+	i := skipJSONSpace(raw, 0)
+	if i >= len(raw) || raw[i] != '{' {
+		return nil
+	}
+	i++
+	var members []jsonMember
+	for {
+		i = skipJSONSpace(raw, i)
+		if i >= len(raw) || raw[i] != '"' {
+			return members // 对象结束，或非法输入
+		}
+		end := jsonStringEnd(raw, i)
+		member := jsonMember{name: decodeKey(raw[i : end+1])}
+		i = skipJSONSpace(raw, end+1)
+		if i >= len(raw) || raw[i] != ':' {
+			return members
+		}
+		i = skipJSONSpace(raw, i+1)
+		end = valueEnd(raw, i)
+		if end <= i {
+			return members
+		}
+		member.value, member.valueAt = raw[i:end], i
+		members = append(members, member)
+		i = skipJSONSpace(raw, end)
+		if i < len(raw) && raw[i] == ',' {
+			i++
+		}
+	}
+}
+
+// decodeKey 解码键的字面量（含引号）；没有转义时不分配临时对象，解码失败返回空串。
+func decodeKey(literal []byte) string {
+	if len(literal) < 2 {
+		return ""
+	}
+	if bytes.IndexByte(literal, '\\') < 0 {
+		return string(literal[1 : len(literal)-1])
+	}
+	var key string
+	_ = json.Unmarshal(literal, &key)
+	return key
+}
+
+// findMember 返回第一个名为 name 的成员。
+func findMember(members []jsonMember, name string) (jsonMember, bool) {
+	for _, m := range members {
+		if m.name == name {
+			return m, true
+		}
+	}
+	return jsonMember{}, false
+}
+
+// topLevelArray 返回请求体顶层键 name 的数组值的原文及其在 body 中的下标；
+// 请求体不是 JSON 对象、没有该键或其值不是数组时返回 nil。
+func topLevelArray(body []byte, name string) (at int, value []byte) {
+	if firstByte(body) != '{' || !bytes.Contains(body, []byte(`"`+name+`"`)) {
+		return 0, nil
+	}
+	member, ok := findMember(jsonMembers(body), name)
+	if !ok || firstByte(member.value) != '[' {
+		return 0, nil
+	}
+	return member.valueAt, member.value
 }

@@ -8,7 +8,7 @@
 并按「同步 VS Code 的 Credits 与 Additional Budget」核对 [VS Code](https://github.com/microsoft/vscode)
 的额度解析与展示，三者的基线分别记录。
 
-当前实现对照的上游基线：`c4f7ba9d3a06d53156ee5186f72773a25b9d1f73`。
+当前实现对照的上游基线：`e5b8f381dcd027ebd77a5b3861e2536e51068c0f`。
 完成后续同步并通过验证时，应将本文和 README 中记录的基线更新为实际核对的上游提交。
 
 ## 已删除的 Auto
@@ -55,7 +55,7 @@ git -C .local/magpie log -1 --format='%H %cs %s'
 从上次同步记录的提交开始查看相关差异。首次核对可用本文开头的基线：
 
 ```sh
-BASE=c4f7ba9d3a06d53156ee5186f72773a25b9d1f73
+BASE=e5b8f381dcd027ebd77a5b3861e2536e51068c0f
 git -C .local/magpie diff --name-status "${BASE}..HEAD"
 git -C .local/magpie diff "${BASE}..HEAD" -- \
   internal/provider/account.go \
@@ -100,17 +100,44 @@ git -C .local/magpie log --oneline --all --regexp-ignore-case --grep='copilot'
 | `internal/copilot/models.go` | `internal/provider/account.go` 的 `copilotModels` 及相关模型数据和测试（不含 Auto 相关部分）。展示规则同步 #4343（picker 启用的 `Experimental` 模型可见）；不同步图片模型（`Draws`，本项目不提供 `/images`）与把 `max_prompt_tokens` 当窗口（模型元数据原样透传） |
 | `internal/copilot/service.go`、`request.go`、`itemids.go`、`outputreplay.go` | provider 请求签名与 `internal/gateway/` 的转发、协议和流式行为（含 `itemids.go` 的 Responses 项 id 统一、`outputreplay.go` 对应 `codex_backend.go` 的 `forVendor` 中去掉 output token replay 的部分） |
 | `internal/copilot/inputitemids.go` | `internal/gateway/codex_backend.go` 的 `plainItemIDs`（含 `itemIDCap`、`boundItemID`、`idOptional`、`itemKindPrefix`、`openaiItemPrefix`），在 `service.go` 的 `handleGeneration` 中于 `withoutOutputReplay` 之后调用。不同步 `boundCallIDs`（`call_id` 超长，仅 ChatGPT 后端）与 `callItemIDs`（`fc_` 改 `tsc_`/`ctc_`） |
-| `internal/copilot/geminitools.go` | `internal/gateway/copilot_gemini_required.go` 的 `copilotGeminiToolsFit`、`copilot_gemini_schema.go` 的 `copilotGeminiToolUnions`（含不相交证明）与 `gemini_schema.go` 的 `geminiNamed`，调用顺序同 `gateway.go`（先 ToolsFit 再 ToolUnions）。不同步 Gemini 可空联合补 `type`（magpie 自身翻译层的行为）；Grok 部分见下一行 |
+| `internal/copilot/geminitools.go`、`geminishapes.go`、`geminitypes.go`、`jsontree.go` | `internal/gateway/copilot_gemini_required.go` 的 `copilotGeminiToolsFit`、`copilot_gemini_shapes.go` 的 `copilotGeminiToolShapes`、`gemini_schema.go` 的 `geminiTypes`（`keepUnions` 固定为 true，即非根联合节点不补 `type`）与 `geminiSchemaShapes`、`geminiNamed`，以及 `kimi_schema.go` 的类型推断辅助函数（`schemaTypes`、`keywordType`、`valuesType` 等），调用顺序同 `gateway.go`（先 ToolsFit、再 ToolShapes、最后 geminiTypes）。差异与已知缺口见下文「Gemini 工具 schema」；Grok 部分见下一行 |
 | `internal/copilot/groktools.go`、`grokschema.go`、`grokreply.go` | `internal/gateway/copilot_gemini_schema.go` 的 `copilotGrokFlat`、`grok_integral.go` 的 `grokModel`、`gateway.go` 中 Copilot Grok 有自定义工具时翻译的分支；`internal/provider/grok.go` 的 `GrokFlatBody`、`grokFlat`、`flatCall`、`FlatName`、`liteNamespace`、`ObjectRoot`（含 `objectRootIn`、`nestedUnion`、`appendDistinct`、`grokRef`）；`internal/gateway/responses.go` 的 `customSchema`、`customDescription`、`customInput`、`callTo`、`itemPrefix`，工具提供、历史项转换与流式事件发出；`custom_tool.go` 的 `customStream`；`grok_namespace.go` 的 `namespacedIn`、`nsTidy`。magpie 有翻译层，自定义工具当 function、namespace 摊平、根联合合并后，模型的调用在翻译层还原；本项目没有翻译层，改为请求改写（`grokRequest`）加回复还原（`grokRestorer`，SSE 与 JSON，先于 `itemids.go` 的 id 统一）。不同步 tool search（`tool_search_call`）与 `additional_tools` 中的工具、「自定义工具被拒后再学习」的机制（本项目对 Copilot 的 Grok 固定改写） |
 | `internal/copilot/pool.go`（`peekGeneration`、`chooseFor`）、`pool_models.go`、`models.go` 的 `modelAvailability` | `internal/provider/copilot_pool.go`（b9a1b4aa1）：只同步生成请求按模型过滤账号（只发往有该模型的账号）；模型列表不取并集（`/models` 逐个尝试、首个成功即返回，见 `pool.md`「模型列表」）。只借用语义，实现按本项目结构；不同步 24h 节流与桌面账号管理 |
 
 只同步本服务已经支持的功能。magpie 的多账号管理、桌面 UI、agent 集成等不属于本项目的
 provider 代理范围；不要整文件复制，也不要为追求代码结构一致而引入这些依赖。
 
+### Gemini 工具 schema
+
+算法见 `http-api.md` 的「Gemini 模型的工具 schema 适配」，这里只记与上游的差异，下次同步时逐条核对。
+
+不同步：
+- `copilotGeminiToolUnions`：上游已删除（把 `anyOf` 改名 `oneOf` 会被 Copilot 的 Gemini 丢掉分支）。
+- 模型、协议与 provider 检查：由 `service.go` 按 `/chat/completions` 与 `geminiModel` 决定。
+
+相对上游的差异：
+- 用标准库代替 gjson：`jsontree.go` 的带位置节点树，保持「就地在左花括号后插入 `type`」。
+- 先校验请求体是合法 JSON，非法时返回原切片。
+- Shapes 重编码 `tools` 数组时不转义 HTML（上游的 `json.Marshal` 会转义）。
+- `$defs` 等映射按键排序处理：上游按 Go map 随机序，联合分支的 `$ref` 可能读到已被改写的 `$defs` 项，结果不确定。
+- 联合分支比较 `type` 用 `reflect.DeepEqual`：上游 `!=` 在两个 `type` 都是数组时 panic。
+- 类型推断展开 `$ref` 最多 256 次（`refExpansionBudget`）：上游对 `allOf` 互相引用的环会指数展开。
+- Shapes 每处 schema 最多写入 256 份 `$ref` 内联拷贝（`derefBudget`，只按写进输出的拷贝数扣，用尽后按解析不了的 `$ref` 处理）：上游无上限，大 `$defs` 被很多联合引用时输出线性放大。目标的序列化按 `$ref` 缓存。
+- 三处 schema 位置统一为 `function.parameters`、`parameters`、`input_schema`：上游 Shapes 在有 `function` 时只看其下的 `parameters`/`input_schema`，没有时才看工具自身的。
+- Types 把节点补成 `object` 且它是裸 object（无 `properties`，也无 `$ref`/`allOf`/`anyOf`/`oneOf`）时一并补 `properties:{}`：Copilot 对无 `properties` 的 object 返回 400，而 Shapes 先于 Types 运行。
+- Types 去掉值为 `false` 的属性时同步去掉同级 `required` 里的该名字，删空则去掉键：否则留下 Fit 要避免的 400 条件。
+
+已知缺口（与上游一致，未修）：
+- 可空的 `$ref` 联合在目标里含嵌套 `$ref` 时（`derefLocal` 不展开）被降为 `string`。
+- `derefLocal` 不处理 `~0`/`~1`/`%20` 转义。
+- 没有 `type` 的 `items` 加 `enum` 节点在管线里成为带 `enum` 的数组：Shapes 先于 Types，`enum` 没被挪到 `items`。
+- 联合分支的 `type` 写成数组时：分支带有可推断类型的关键字（`properties`、`items`、全字符串 `enum`、字符串 `const`）则 `guessType` 推出的类型覆盖数组 `type`，可空性丢失；没有这些关键字则整个联合被去掉。
+- Shapes 不遍历 `if`/`then`/`else`、`dependentSchemas`、`unevaluated*`、`propertyNames`、`contentSchema`，其中已写 `type:"object"` 却没有 `properties` 的节点不会补 `properties`（Types 不管已有 `type` 的节点）。
+
 ## 同步 CLIProxyAPI 会话亲和键
 
 本项目会话键（`sessionKey`，见 `session-affinity.md`）的会话 ID 来源与优先级参照 cpa。cpa 的
-基线：`9a8ca1b577ef8573c5ccf108450b93ed57716cc4`（2026-11-12）。
+基线：`1aaf56bc6a0fc6fce19049ba7ae8554c882304a6`（2026-11-13）。
 
 首次获取与更新方式同 magpie，克隆到 `.local/cpa`：
 
@@ -127,7 +154,7 @@ git -C .local/cpa log -1 --format='%H %cs %s'
 核对差异：
 
 ```sh
-CPA_BASE=9a8ca1b577ef8573c5ccf108450b93ed57716cc4
+CPA_BASE=1aaf56bc6a0fc6fce19049ba7ae8554c882304a6
 git -C .local/cpa diff "${CPA_BASE}..HEAD" -- \
   sdk/cliproxy/session/info.go \
   sdk/cliproxy/session/identity.go \
@@ -177,7 +204,7 @@ cpa 新增或调整会话来源（请求头、请求体字段、优先级、规�
 本项目额度（`quota-stats.md`）的主额度窗口（Credits / Premium requests / Chat messages）、
 Additional Budget 窗口，以及生成响应头的额度快照合并，语义参照 VS Code（Copilot 扩展已并入
 `microsoft/vscode` 仓库的 `extensions/copilot/`）。对应的初次同步是本项目提交 `571ca90`。VS Code 的
-基线：`52073a464821e207fc0510f2b6ccdba47f706aad`（2026-11-12）。
+基线：`4daf8f5c819d69f7014870ccd8478f74a64bd000`（2026-11-13）。
 
 VS Code 仓库很大，用浅克隆放到 `.local/vscode-src`：
 
@@ -193,7 +220,7 @@ git -C .local/vscode-src log -1 --format='%H %cs %s'
 浅克隆没有提交历史，`log` 不能列出区间内的提交；把基线也按提交号浅取下来，再比较两棵树：
 
 ```sh
-VSCODE_BASE=52073a464821e207fc0510f2b6ccdba47f706aad
+VSCODE_BASE=4daf8f5c819d69f7014870ccd8478f74a64bd000
 git -C .local/vscode-src fetch --depth=1 origin "${VSCODE_BASE}"
 git -C .local/vscode-src diff "${VSCODE_BASE}" HEAD -- \
   extensions/copilot/src/platform/chat/common/chatQuotaServiceImpl.ts \

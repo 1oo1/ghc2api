@@ -390,9 +390,10 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 		return
 	}
 	model := *request.Model
-	// Copilot 的 Gemini 对部分工具 schema 整个请求返回 400，转发前适配（见 geminitools.go）。
+	// Copilot 的 Gemini 对部分工具 schema 整个请求返回 400，转发前依次适配：required 与重名工具（geminitools.go）、
+	// 几种形状的 schema（geminishapes.go）、缺 type 的节点（geminitypes.go，须在形状改写之后：补出的 items 等也要补 type）。
 	if path == "/chat/completions" && geminiModel(model) {
-		body = geminiToolUnions(geminiToolsFit(body))
+		body = geminiToolTypes(geminiToolShapes(geminiToolsFit(body)))
 	}
 	// Copilot 前面的 Grok 对自定义工具、namespace 工具与根联合的参数返回裸的 400/422，转发前改写（见 groktools.go）；
 	// 有改名或自定义调用时，2xx 回复里模型的调用要还原（见 grokreply.go）。其后的重试请求体基于改写后的请求体。
