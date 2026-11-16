@@ -12,7 +12,6 @@ import (
 	"io"
 	"net/http"
 	"reflect"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,9 +19,9 @@ import (
 
 const (
 	// 只有 GET /models 使用的版本。
-	modelsListAPIVersion = "2026-08-01"
+	wantModelsVersion = "2026-08-01"
 	// 生成请求与其他 Copilot API 请求使用的版本。
-	defaultAPIVersion = "2026-01-09"
+	wantChatVersion = "2026-01-09"
 )
 
 // apiVersionCall 记录假上游收到的一次 Copilot API 请求及其版本头。
@@ -92,8 +91,8 @@ func TestModelsListUsesModelsAPIVersion(t *testing.T) {
 	if len(versions) != 1 {
 		t.Fatalf("上游 GET /models 次数 = %d, want 1", len(versions))
 	}
-	if versions[0] != modelsListAPIVersion {
-		t.Errorf("GET /models 的 X-GitHub-Api-Version = %q, want %q", versions[0], modelsListAPIVersion)
+	if versions[0] != wantModelsVersion {
+		t.Errorf("GET /models 的 X-GitHub-Api-Version = %q, want %q", versions[0], wantModelsVersion)
 	}
 }
 
@@ -115,11 +114,11 @@ func TestOnlyModelsListUsesNewAPIVersion(t *testing.T) {
 	}
 
 	for _, tc := range []struct{ method, path, want string }{
-		{http.MethodGet, "/models", modelsListAPIVersion},
-		{http.MethodPost, "/models/terms-model/policy", defaultAPIVersion},
-		{http.MethodPost, "/chat/completions", defaultAPIVersion},
-		{http.MethodPost, "/responses", defaultAPIVersion},
-		{http.MethodPost, "/v1/messages", defaultAPIVersion},
+		{http.MethodGet, "/models", wantModelsVersion},
+		{http.MethodPost, "/models/terms-model/policy", wantChatVersion},
+		{http.MethodPost, "/chat/completions", wantChatVersion},
+		{http.MethodPost, "/responses", wantChatVersion},
+		{http.MethodPost, "/v1/messages", wantChatVersion},
 	} {
 		versions := upstream.versionsOf(tc.method, tc.path)
 		if len(versions) == 0 {
@@ -189,33 +188,6 @@ func TestModels20260801ShapePassedThrough(t *testing.T) {
 	want["object"], want["owned_by"] = "model", "github-copilot"
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("模型元数据未原样透传\n got=%v\nwant=%v", got, want)
-	}
-
-	// 关键字段单独断言：完整窗口与两档价格。
-	numberAt := func(root map[string]any, path ...string) any {
-		var cur any = root
-		for _, key := range path {
-			obj, ok := cur.(map[string]any)
-			if !ok {
-				return nil
-			}
-			cur = obj[key]
-		}
-		return cur
-	}
-	for _, tc := range []struct {
-		path []string
-		want float64
-	}{
-		{[]string{"capabilities", "limits", "max_prompt_tokens"}, 1000000},
-		{[]string{"billing", "token_prices", "default", "max_prompt_tokens"}, 200000},
-		{[]string{"billing", "token_prices", "long_context", "max_prompt_tokens"}, 1000000},
-		{[]string{"billing", "token_prices", "default", "input_price"}, 400},
-		{[]string{"billing", "token_prices", "long_context", "cache_read_price"}, 20},
-	} {
-		if v := numberAt(got, tc.path...); v != tc.want {
-			t.Errorf("%s = %v, want %v", strings.Join(tc.path, "."), v, tc.want)
-		}
 	}
 
 	// endpoints 判断正常：模型支持 /v1/messages，请求能转发到上游；且 enabled 策略不触发条款接受。
