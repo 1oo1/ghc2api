@@ -28,6 +28,11 @@ func arrayBody(raw []byte) int {
 // 参数是 raw 中该对象的子切片，fn 不得保留它。数字、字符串、null、数组等非对象元素只按字节跳过，不做解析。
 // raw 不是数组时什么也不做。输入非法时（如 [}]、[1,}）遍历在无法前进处停止，不会死循环，也不会越界。
 func eachObject(raw json.RawMessage, fn func(object []byte) bool) {
+	eachObjectAt(raw, func(object []byte, _ int) bool { return fn(object) })
+}
+
+// eachObjectAt 同 eachObject，并传入对象在 raw 中的位置。
+func eachObjectAt(raw []byte, fn func(object []byte, at int) bool) {
 	i := arrayBody(raw)
 	if i < 0 {
 		return
@@ -41,7 +46,7 @@ func eachObject(raw json.RawMessage, fn func(object []byte) bool) {
 		if end <= i {
 			return // 值的位置没有前进，只可能是非法输入，停止遍历以免死循环
 		}
-		if raw[i] == '{' && !fn(raw[i:end]) {
+		if raw[i] == '{' && !fn(raw[i:end], i) {
 			return
 		}
 		i = skipJSONSpace(raw, end)
@@ -183,30 +188,37 @@ type jsonMember struct {
 // jsonMembers 按顺序返回 JSON 对象 raw 的成员，位置相对 raw 的起点；raw 不是对象时返回 nil。
 // 重复的键都会返回。值按 valueEnd 定界，不解析容器内部；输入非法时在无法前进处停止。
 func jsonMembers(raw []byte) []jsonMember {
+	var members []jsonMember
+	eachJSONMember(raw, func(key, value []byte, at int) {
+		members = append(members, jsonMember{name: decodeKey(key), value: value, valueAt: at})
+	})
+	return members
+}
+
+// eachJSONMember 扫描对象成员，仅传入键和值的原文及值的位置，不分配成员切片。
+func eachJSONMember(raw []byte, visit func(key, value []byte, at int)) {
 	i := skipJSONSpace(raw, 0)
 	if i >= len(raw) || raw[i] != '{' {
-		return nil
+		return
 	}
 	i++
-	var members []jsonMember
 	for {
 		i = skipJSONSpace(raw, i)
 		if i >= len(raw) || raw[i] != '"' {
-			return members // 对象结束，或非法输入
+			return // 对象结束，或非法输入
 		}
 		end := jsonStringEnd(raw, i)
-		member := jsonMember{name: decodeKey(raw[i : end+1])}
+		key := raw[i : end+1]
 		i = skipJSONSpace(raw, end+1)
 		if i >= len(raw) || raw[i] != ':' {
-			return members
+			return
 		}
 		i = skipJSONSpace(raw, i+1)
 		end = valueEnd(raw, i)
 		if end <= i {
-			return members
+			return
 		}
-		member.value, member.valueAt = raw[i:end], i
-		members = append(members, member)
+		visit(key, raw[i:end], i)
 		i = skipJSONSpace(raw, end)
 		if i < len(raw) && raw[i] == ',' {
 			i++

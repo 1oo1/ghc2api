@@ -24,7 +24,7 @@ JSON 名为小驼峰（如 `remainingFraction`、`observedAt`），完整定义�
 
 ## 响应头额度快照合并
 
-生成请求的上游响应携带额度快照头，`poolAccount.applyQuotaHeaders(header)`（`quota_header.go`）把它合并进缓存额度，使额度在两次轮询之间也能更新（语义参照 VS Code）。接线：`Service.onResponseHeaders` 钩子由 `newPoolAccount` 装配为 `applyQuotaHeaders`，`handleGeneration` 拿到上游响应后（400 分支与流式透传之前，一次调用覆盖两个出口）调用。所有状态码的生成响应（含 4xx/5xx，它们走 `streamResponse` 原样透传而非 `handleError`）都会合并额度头，与 VS Code 失败路径也解析的行为一致；`handleError` 只处理网络错误与 session 交换失败，没有生成响应头可解析（`retryStaleItems` 中被丢弃的第一次响应不合并，无影响）。
+生成请求的上游响应携带额度快照头，`poolAccount.applyQuotaHeaders(header)`（`quota_header.go`）把它合并进缓存额度，使额度在两次轮询之间也能更新（语义参照 VS Code）。接线：`Service.onResponseHeaders` 钩子由 `newPoolAccount` 装配为 `applyQuotaHeaders`，`handleGeneration` 拿到上游响应后（400 分支与流式透传之前，一次调用覆盖两个出口）调用。各状态码的最终生成响应都会合并额度头，与 VS Code 失败路径也解析的行为一致；若发生失效输出项或 Gemini 图片超限重试，只合并最终响应的额度头。`handleError` 处理网络错误与 session 交换失败，不合并额度头。
 
 - 头名：Copilot Free（缓存额度 `Subscription.Plan == "Copilot Free"`）只认 `x-quota-snapshot-chat`；其余账号（含计划未知）优先 `x-quota-snapshot-premium_models`，该头缺失时回退 `x-quota-snapshot-premium_interactions`（头存在但值为空串或非法时不再回退，按 `header.Values` 判断存在性）。
 - 头值是 URL 编码键值对（`parseQuotaHeader` → `quotaHeaderSnapshot`）：`rem`（剩余百分比）、`ov`（overage_count）、`rst`（RFC3339 重置时间）、`ent`（`strconv.Atoi` 解析为 `-1` 时标记 `unlimited`，对应 VS Code 的 `unlimited: entitlement === -1`；缺失、非法或其他值为 false）；`ovPerm` 等其他键忽略。`url.ParseQuery` 的错误被忽略，坏键值对只丢弃自身，其余部分照常使用；`rem`/`ov` 非数字、NaN、Inf、负数或 `rst` 非 RFC3339 时只丢弃该字段。

@@ -57,6 +57,9 @@ type Service struct {
 	// refusalSeq 在锁内递增，删除记录后也不重置，避免不同拒绝的版本相同。
 	refusalSeq uint64
 
+	imageCapsMu sync.Mutex
+	imageCaps   map[string]int
+
 	// onResponseHeaders 是可选钩子：生成请求拿到上游响应后（400 分支与流式透传之前）以响应头调用，
 	// 由 newPoolAccount 装配为账号的额度头合并（applyQuotaHeaders）；为 nil 时跳过。创建后只读，无需加锁。
 	// 任何状态码的生成响应（含走 streamResponse 透传的 4xx/5xx）都会经过它；handleError 路径没有生成响应头，不调用。
@@ -395,7 +398,8 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 	model := *request.Model
 	// Copilot 的 Gemini 对部分工具 schema 整个请求返回 400，转发前依次适配：required 与重名工具（geminitools.go）、
 	// 几种形状的 schema（geminishapes.go）、缺 type 的节点（geminitypes.go，须在形状改写之后：补出的 items 等也要补 type）。
-	if path == "/chat/completions" && geminiModel(model) {
+	geminiChat := path == "/chat/completions" && geminiModel(model)
+	if geminiChat {
 		body = geminiToolTypes(geminiToolShapes(geminiToolsFit(body)))
 	}
 	// Copilot 前面的 Grok 对自定义工具、namespace 工具与根联合的参数返回裸的 400/422，转发前改写（见 groktools.go）；
@@ -418,6 +422,9 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 	// X-Initiator 与 Copilot-Vision-Request 取决于（/responses 改写后的）请求体；改写删去的字段不影响这两项判断。
 	xInitiator := initiator(body)
 	vision := hasVision(body)
+	if geminiChat && vision {
+		body, _ = fitGeminiImages(body, s.imageCap(model))
+	}
 	s.log(r.Context(), slog.LevelInfo, "开始处理生成请求", "model", model, "upstream_path", path, "request_bytes", len(body))
 	current, err := s.getSession(r.Context())
 	if err != nil {
@@ -444,7 +451,7 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 		}
 	}
 	s.acceptTerms(r.Context(), current, model)
-	// send 向上游发送一次生成请求；同一账号、session 与模型的重发（见 retryStaleItems）只替换请求体。
+	// send 向上游发送一次生成请求；同一账号、session 与模型的重发只替换请求体。
 	send := func(payload []byte) (*http.Response, error) {
 		req, err := s.apiRequest(r.Context(), current, http.MethodPost, path, payload)
 		if err != nil {
@@ -470,6 +477,9 @@ func (s *Service) handleGeneration(w http.ResponseWriter, r *http.Request, path 
 	if err == nil && path == "/responses" {
 		// 输入项绑定在原连接上被上游拒绝：清理后重发一次，仍失败则返回上游响应（401 改为 500）且不惩罚账号。
 		res, err = s.retryStaleItems(r.Context(), w, res, body, model, send)
+	}
+	if err == nil && geminiChat && vision {
+		res, err = s.retryGeminiImageCap(r.Context(), res, body, model, send)
 	}
 	if err != nil {
 		s.handleError(r.Context(), w, err)
